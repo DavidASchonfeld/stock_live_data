@@ -18,4 +18,4 @@ open_weather = {
 
 
 
-https://api.openweathermap.org/data/3.0/onecall?lat=33.44&lon=-94.04&appid={API key}
+# https://api.openweathermap.org/data/3.0/onecall?lat=33.44&lon=-94.04&appid={API key}
