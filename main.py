@@ -15,30 +15,20 @@ from pandas import DataFrame
 
 
 # My Files
-from api_key import open_weather
+from api_key import api_keys
 from api_urls import open_weather
 
 
-# http://api.openweathermap.org/geo/1.0/direct?q={city name},{state code},{country code}&limit={limit}&appid={API key}
-
-
-def sendRequest(endStringRequest : str) -> Dict[Any, Any]:
-    
-
-    params = copy.deepcopy(open_weather["current_weather"]["params"])
-    params["lat"] = 33.44
-    params["lon"] = -94.04
-
-    params_formatted : str = urlencode(params)
-
-    # Merge End String
-    endUrlRequest :str = os.path.join(open_weather["current_weather"]["base"], params_formatted)
-
-    requestToSend_full : str = urljoin(open_weather["base_url"], endUrlRequest)
-
-    
+def sendRequest_openMeteo():
+    base_url = "https://api.open-meteo.com/v1/forecast"
+    parameters = {
+        "latitude": 40,
+        "longitude" : 40,
+        "hourly" : "temperature_2m",
+        "temperature_unit" : "fahrenheit"
+    }
     try:
-        response : requests.Response = requests.get(requestToSend_full)
+        response : requests.Response = requests.get(base_url, params = parameters)
         response.raise_for_status()
     except requests.exceptions.HTTPError:
         print("response.status_code: "+str(response.status_code))
@@ -48,6 +38,12 @@ def sendRequest(endStringRequest : str) -> Dict[Any, Any]:
 
     responseContent_dict : dict = json.loads(response.content)
 
+
+
     return responseContent_dict
 
-sendRequest("Test. This string's value is not yet implemented")
+dictGotten : dict = sendRequest_openMeteo()
+print(dictGotten)
+DataFrameGotten : pd.DataFrame = pd.DataFrame(dictGotten)
+print("--------")
+print(DataFrameGotten)
