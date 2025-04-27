@@ -47,3 +47,30 @@ print(dictGotten)
 DataFrameGotten : pd.DataFrame = pd.DataFrame(dictGotten)
 print("--------")
 print(DataFrameGotten)
+
+### Kafka.
+#### On server, use the follow command: 
+## Start the Kafka handler/system/server Zookeeper
+# bin/kafka-topics.sh --create -zookeeper localhost:2181 --replication-factor 1 --partitions 1 --topic topic-name
+
+## Start a topic (like a Stack) to handle data
+
+## Get List of Topics:
+# bin/kafka-topics.sh --list --zookeeper localhost:2181
+
+
+from confluent_kafka import Producer
+
+def errorMessage_produce(inError, inMessage):
+    if (inError):
+        print("Produce: Message Failed. inMessage: "+str(inMessage))
+    else:
+        print("Produce: Topic "+str(inMessage.topic())+"Message Sent: "+str(inMessage))
+        pass
+    print(inMessage.topic())
+
+
+p = Producer({'bootstrap.servers':'localhost:9092'})
+
+p.produce('weather_info_testing', key='someKey', value='Test1', callback = errorMessage_produce)
+p.flush()
