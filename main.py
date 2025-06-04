@@ -72,5 +72,10 @@ def errorMessage_produce(inError, inMessage):
 
 p = Producer({'bootstrap.servers':'localhost:9092'})
 
-p.produce('weather_info_testing', key='someKey', value='Test1', callback = errorMessage_produce)
-p.flush()
+try :
+    p.produce('weather_info_testing', key='someKey', value='Test1', callback = errorMessage_produce)
+    p.flush(10)  # 10 Second Timeout
+except Exception as e:
+    print("Connection to Kafka failed")
+finally:
+    p.flush(1) #Ensure messages are sent....

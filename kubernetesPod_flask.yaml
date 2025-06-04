@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-kuber-pod-flask # The pod name, I choose
+  labels:
+    app: dancing-flask-pod # I made this up. Maybe adding a label will help with exposing this pod to be accessible to the internet
+spec:
+  containers:
+  - name: flask-container-inside-pod # The container name, I choose it here (you can put multiple containers in 1 pod if you want)
+    image: my-flask-app:latest # The app name I chose when I created the Docker image
+    imagePullPolicy: Never  # Only use local image (aka use Docker image created on my instance locally, instead of the defualt, which would be pulling from the an account I would need to create and upload/store Docker images in the officially supported Docker Hub website)
