@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-service
+  namespace: default
+spec:
+  selector:
+    # app: my-kuber-pod-flask  # Before I was using labels # Must match the pod’s label in kubernetesPod_flask.yaml, in metadata section, in "name:" section
+    app: dancing-flask-pod
+  ports:
+  - protocol: TCP
+    port: 80       # External port
+    targetPort: 5000  # Pod’s Flask port
+  type: NodePort   # Exposes on a high port (30000-32767) on the node’s IP
