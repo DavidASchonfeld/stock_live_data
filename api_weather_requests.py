@@ -15,7 +15,7 @@ from pandas import DataFrame
 
 
 # My Files
-from api_key import api_keys
+from api_key import api_keys  # My api_key Python file is in .gitignore
 from api_urls import open_weather
 
 
