@@ -4,7 +4,7 @@ import json
 
 import pendulum
 
-from airflow.sdk import dag, task
+from airflow.decorators import dag, task
 from airflow.models.xcom_arg import XComArg
 
 from typing import Annotated, Any
