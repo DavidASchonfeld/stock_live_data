@@ -11,13 +11,13 @@ class OutputTextWriter:
 
     outputTextFileName : str
 
-    def __init__(self):
+    def __init__(self, inPath : str = outputTextsFolder_folderPath):
         try:
-            if (os.access(outputTextsFolder_folderPath, os.W_OK) == False):
+            if (os.access(inPath, os.W_OK) == False):
                 raise PermissionError
         except PermissionError as e:
-            raise PermissionError("outputTextWriter.py does not have permisison to create/write a folder for and/or the text file in the target location.")
-        self.outputTextFileName : str = os.path.join(outputTextsFolder_folderPath, str(datetime.now())+".txt")
+            raise PermissionError("outputTextWriter.py does not have permission to create/write a folder for and/or the text file in the target location ("+inPath+").")
+        self.outputTextFileName : str = os.path.join(inPath, str(datetime.now())+".txt")
 
     def print(self, inString: str) -> str:
         print(inString)
