@@ -11,6 +11,7 @@ import copy
 
 import pandas as pd
 from pandas import DataFrame
+from outputTextWriter import OutputTextWriter
 
 
 
@@ -53,6 +54,8 @@ if __name__ == "__main__":
     DataFrameGotten : pd.DataFrame = pd.DataFrame(dictGotten)
     print("--------")
     print(DataFrameGotten)
+    inputTextWriter : OutputTextWriter = OutputTextWriter()
+    inputTextWriter.print_dict(dictGotten, True)
 
     ### Kafka.
     #### On server, use the follow command: 
