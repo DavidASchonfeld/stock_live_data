@@ -21,7 +21,7 @@ from api_weather_requests import sendRequest_openMeteo
     catchup=False,
     tags=["learning"]
 )
-def someThing():
+def zero_nameThatAirflowUIsees():
     """
     # TODO: Comment
     """
@@ -67,4 +67,4 @@ def someThing():
     order_data : XComArg = extract()
     order_summary : XComArg = transform(order_data)
     load(order_summary)
-someThing()
+zero_nameThatAirflowUIsees()
