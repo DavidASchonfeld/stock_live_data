@@ -20,7 +20,7 @@ writer : OutputTextWriter = OutputTextWriter()
 # default_args = 
 
 @dag(  # type:ignore
-    "Zero_BLAH_BLAH",
+    "API Weather-Pull Data",
     default_args={
         # Brought these "default_args" section from Airflow tutorial codes
         # [START default_args]
@@ -51,7 +51,7 @@ writer : OutputTextWriter = OutputTextWriter()
     tags=["learning","weather","external api pull"]
 )
 
-def zero_nameThatAirflowUIsees():
+def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a name in the @dag section above
     """
     # TODO: Comment
     """
