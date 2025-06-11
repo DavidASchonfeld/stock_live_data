@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-service-expose-ui-port
+  namespace: airflow-my-namespace
+spec:
+  type: NodePort
+  ports:
+   - protocol: TCP
+     port: 8080  # Port exposed in the internal cluster
+     targetPort: 8080  # Port exposed in the actual pod/container
+     nodePort: 30080  # External port to expose publicly (# Note: Default potential exposed Kubernetes ports: Between 30000 and 32767)
+  selector:
+    component: webserver
+    release: airflow
+    # Using 2 labels to make it easier to only select airflow and only select the airflow's webserver
