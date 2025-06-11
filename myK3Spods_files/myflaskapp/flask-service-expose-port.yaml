@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: flask-service
+  name: flask-service-expose-port
   namespace: default
 spec:
   selector:
@@ -9,6 +9,7 @@ spec:
     app: dancing-flask-pod
   ports:
   - protocol: TCP
-    port: 80       # External port
+    port: 80       # Port exposed in the internal cluster
     targetPort: 5000  # Pod’s Flask port
+    nodePort: 32147  # External port to expose publicly (# Note: Default potential exposed Kubernetes ports: Between 30000 and 32767)
   type: NodePort   # Exposes on a high port (30000-32767) on the node’s IP
