@@ -12,13 +12,23 @@ env:
 
 env:
  - name: AIRFLOW__CORE__DAGS_FOLDER
-   value: {{.Values.dagFolderPath}} 
+   value: /opt/airflow/dags  
+   # The folder that airflow looks at to find dags aka task flows
+   # This (/opt/airflow/dags) is already the default value for AIRFLOW__CORE__DAGS_FOLDER
+   # I'm mentioning it here so the section in "Volume Mounts" makes sense below.
+   # I'm importing the dags in my custom folder (located in "Host Path Volume")
+   # to the dags folder that Airflow looks at.
+   # The "Volume Mounts for DAGs" in the destination for where I import
+   # the dags folder from my custom folder (myK3Spods_files/myAirflow/dags)
+   # to 
+   
+
 
 # -------- Volume Mounts for DAGs -------- 
 dags:
   volumeMounts:
    - name: host-dags
-     mountPath: {{.Values.dagFolderPath }}  # Must match AIRFLOW__CORE__DAGS_FOLDER
+     mountPath: /opt/airflow/dags  # Must match AIRFLOW__CORE__DAGS_FOLDER
 
 #  -------- Host Path Volume  -------- 
 # We need to mount the folder in our ec2 instance
@@ -27,7 +37,7 @@ dags:
 extraVolumes:
  - name: host-dags
    hostPath:
-     path: /home/ec2-user/airflow-dags  # Folder on the ec2-instance
+     path: /home/ec2-user/myK3Spods_files/myAirflow/dags  # Folder on the ec2-instance
      type: Directory
 
 
