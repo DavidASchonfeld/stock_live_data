@@ -27,7 +27,7 @@ dags:
 extraVolumes:
  - name: host-dags
    hostPath:
-     path: /home/ec2-user/myK3spods_files/myAirflow/dags  # Folder on the ec2-instance
+     path: /home/ec2-user/myK3Spods_files/myAirflow/dags  # Folder on the ec2-instance
      type: Directory
 
 
