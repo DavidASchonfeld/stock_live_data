@@ -8,11 +8,12 @@ executor: LocalExecutor
 env:
  - name: AIRFLOW__CORE__LOAD_EXAMPLES
    value: "False"
-
-
-env:
  - name: AIRFLOW__CORE__DAGS_FOLDER
-   value: /opt/airflow/dags  
+   value: /opt/airflow/dags  # /home/ec2-user/myK3Spods_files/myAirflow/dags  # Folder on the ec2-instance  #/opt/airflow/dags  
+   # When I install airflow, this file path is NOT automatically created, so I need to manually create this folder Path=
+   # aka in /opt/, create a folder "airflow"
+   # then, in /opt/airflow, create a folder called "dags" ()
+
    # The folder that airflow looks at to find dags aka task flows
    # This (/opt/airflow/dags) is already the default value for AIRFLOW__CORE__DAGS_FOLDER
    # I'm mentioning it here so the section in "Volume Mounts" makes sense below.
@@ -26,10 +27,16 @@ env:
 
 # -------- Volume Mounts for DAGs -------- 
 dags:
-  volumeMounts:
-   - name: host-dags
-     mountPath: /opt/airflow/dags  # Must match AIRFLOW__CORE__DAGS_FOLDER
+  persistence:
+    enabled: false
+    # enabled: true
+    # size: 1Gi
 
+  # volumeMounts:
+  #  - name: host-dags
+  #    mountPath: /opt/airflow/dags  # Must match AIRFLOW__CORE__DAGS_FOLDER
+
+  ## Adding for limiting space
 #  -------- Host Path Volume  -------- 
 # We need to mount the folder in our ec2 instance
 # into the K3S Kubernetes pod for airflow so airflow can access it
@@ -39,6 +46,10 @@ extraVolumes:
    hostPath:
      path: /home/ec2-user/myK3Spods_files/myAirflow/dags  # Folder on the ec2-instance
      type: Directory
+
+extraVolumeMounts:
+  - name: host-dags
+    mountPath: /opt/airflow/dags  # Path inside pod, must match AIRFLOW__CORE__DAGS_FOLDER
 
 
 # -------- Limiting Resources -------- 
@@ -85,10 +96,6 @@ postgresql:
         memory: 512Mi
         cpu: 200m
 
-dags:
-  persistence:
-    enabled: true
-    size: 1Gi
 
 logs:
   persistence:
