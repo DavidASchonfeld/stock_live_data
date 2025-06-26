@@ -1,0 +1,40 @@
+executor: LocalExecutor
+
+airflow:
+  loadExamples: false
+  extraEnvVars:
+    - name: AIRFLOW__CORE__DAGS_FOLDER
+      value: /opt/airflow/dags
+
+scheduler:
+  enabled: true
+  extraVolumeMounts:
+    - name: host-dags
+      mountPath: /opt/airflow/dags
+
+web:
+  extraVolumeMounts:
+    - name: host-dags
+      mountPath: /opt/airflow/dags
+
+triggerer:
+  extraVolumeMounts:
+    - name: host-dags
+      mountPath: /opt/airflow/dags
+
+extraVolumes:
+  - name: host-dags
+    hostPath:
+      path: /home/ec2-user/myK3Spods_files/myAirflow/dags
+      type: Directory
+
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: airflow
+    username: airflow
+    password: airflow
+    database: airflow
+
+redis:
+  enabled: false

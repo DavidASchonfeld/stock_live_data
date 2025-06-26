@@ -1,0 +1,50 @@
+executor: LocalExecutor
+
+dags:
+  persistence:
+    enabled: true
+    existingClaim: dag-pvc
+
+logs:
+  persistence:
+    enabled: true
+    existingClaim: log-pvc  # optional; or let Helm manage
+
+persistence:
+  enabled: true
+  storageClass: local-path
+  accessMode: ReadWriteOnce
+  size: 1Gi
+
+airflow:
+  config:
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+
+
+
+# Adding things below to be able to print via my outputTextWriter outside of K3S Kubernetes pods
+
+workers:
+  # Link the folder specified in my pvc-outputtextwriter
+  # (the external folder, in my ec2 instance)
+  # To this folder specified here inside my K3S Kubernetes pod
+  extraVolumes:
+   - name: out-volume
+     persistentVolumeClaim:
+       claimName:  pvc-outputtextwriter
+  extraVolumeMounts:
+   - name: out-volume
+     mountPath: /opt/airflow/out
+     
+scheduler:
+  # Same as in workers section
+  # Link the folder specified in my pvc-outputtextwriter
+  # (the external folder, in my ec2 instance)
+  # To this folder specified here inside my K3S Kubernetes pod
+  extraVolumes:
+   - name: out-volume
+     persistentVolumeClaim:
+       claimName: pvc-outputtextwriter
+  extraVolumeMounts:
+   - name: out-volume
+     mountPath: /opt/airflow/out

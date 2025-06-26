@@ -1,0 +1,44 @@
+executor: LocalExecutor
+
+# Disable default PVC for DAGs so we can mount our own host path
+dags:
+  persistence:
+    enabled: false
+
+# Mount your custom DAG folder from your EC2 instance
+extraVolumes:
+  - name: my-dags
+    hostPath:
+      path: /home/ec2-user/myK3Spods_files/myAirflow/dags
+
+extraVolumeMounts:
+  - name: my-dags
+    mountPath: /opt/airflow/dags
+    readOnly: true
+
+web:
+  enabled: true
+  port: 8080
+
+scheduler:
+  enabled: true
+
+triggerer:
+  enabled: false
+
+flower:
+  enabled: false
+
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: airflow
+    password: airflow
+    username: airflow
+    database: airflow
+
+webserver:
+  defaultUser:
+    enabled: true
+    username: admin
+    password: admin

@@ -1,0 +1,51 @@
+airflow:
+  extraEnvVars:
+  - name: AIRFLOW__CORE__DAGS_FOLDER
+    value: /opt/airflow/dags
+  loadExamples: false
+executor: LocalExecutor
+extraVolumes:
+- hostPath:
+    path: /home/ec2-user/myK3Spods_files/myAirflow/dags
+    type: Directory
+  name: host-dags
+logs:
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: local-path
+postgresql:
+  auth:
+    database: airflow
+    password: airflow
+    postgresPassword: airflow
+    username: airflow
+  enabled: true
+redis:
+  enabled: false
+scheduler:
+  enabled: true
+  extraVolumeMounts:
+  - mountPath: /opt/airflow/dags
+    name: host-dags
+  tolerations:
+  - key: "node.kubernetes.io/disk-pressure"
+    operator: "Exists"
+    effect: "NoSchedule"
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+      ephemeral-storage: "500Mi"
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+      ephemeral-storage: "100Mi"
+triggerer:
+  extraVolumeMounts:
+  - mountPath: /opt/airflow/dags
+    name: host-dags
+web:
+  extraVolumeMounts:
+  - mountPath: /opt/airflow/dags
+    name: host-dags

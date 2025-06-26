@@ -11,16 +11,11 @@ from airflow.models.xcom_arg import XComArg
 
 
 
-# My Files
-from api_weather_requests import sendRequest_openMeteo
-from outputTextWriter import OutputTextWriter
-
-
 
 # default_args = 
 
 @dag(  # type:ignore
-    "API_Weather-Pull_Data",
+    "TESTDaveJune122025",
     default_args={
         # Brought these "default_args" section from Airflow tutorial codes
         # [START default_args]
@@ -45,8 +40,7 @@ from outputTextWriter import OutputTextWriter
     },
     description="Pulling weather info from Meteo Weather API",
     schedule=timedelta(minutes=2,days=0),   #timedelta(days=1),
-    # start_date=pendulum.datetime(2025, 6, 22, 13, 10, tz="America/New_York"),
-    start_date=pendulum.now("America/New_York").subtract(minutes=3),
+    start_date=pendulum.datetime(2025, 6, 7, 19, 29, tz="America/New_York"),
     # Note: start_date has to be in the past if you want it to run today/later
     catchup=False,
     tags=["learning","weather","external api pull"]
@@ -64,9 +58,9 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         Pull information from Meteo Website
         """
 
-        dictGotten : dict = sendRequest_openMeteo(inLatitude=40, inLongitude=40, inFarenheit=True)
-        print(dictGotten)
-        return dictGotten
+        result : dict[str, str] = {"Data": "To implement"}
+        print(result)
+        return result
     
     
     # @task(multiple_outputs=True) 
@@ -90,19 +84,8 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         the data from the kafka topic
         and put it into the SQL database))
         """
-        # Location of Logs
-        # writer : OutputTextWriter = OutputTextWriter("/home/ec2-user/myK3Spods_files/myAirflow/dag-mylogs")
-
-        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push 
-        writer : OutputTextWriter = OutputTextWriter("/opt/airflow/out")
-
-
-        # NOTE: I must declare this inside a @task object so the task only connects to that folder when the task runs.
-        # If I had declared this constructor in the main area (outside of a task method etc.), it would run whe nthe DAG is initalized,
-        # which would cause issues.
 
         print(str(inData))
-        writer.print_dict(inData, True)
     
     # Airflow auomatically converts all tsak method outputs to XComArg objects.
     # If I want the objects treated as the types I want 
@@ -110,4 +93,5 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
     order_data : XComArg = extract()
     order_summary : XComArg = transform(order_data)
     load(order_summary)
-zero_nameThatAirflowUIsees()
+# zero_nameThatAirflowUIsees()
+dag = zero_nameThatAirflowUIsees() 
