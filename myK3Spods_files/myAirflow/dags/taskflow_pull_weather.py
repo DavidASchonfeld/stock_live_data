@@ -10,6 +10,10 @@ from airflow.decorators import dag, task
 from airflow.models.xcom_arg import XComArg
 
 
+import pandas as pd
+from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
+
 
 # My Files
 from api_weather_requests import sendRequest_openMeteo
@@ -103,6 +107,33 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
 
         print(str(inData))
         writer.print_dict(inData, True)
+
+        #TODO: Move this conversion to Pandas Dataframe object
+        myDataFrameThing = pd.DataFrame([inData])
+
+        ## Testing/Learning about Python to SQL (with Pandas)
+        sql_username = "root"
+        sql_password = ""
+        sql_database = "test"  # Default MariaDB Value
+        sql_urlLocation = "localhost:3306"  # Default MariaDB Value (This Command in "Command Line" confirms this: "sudo netstat -tulnp | grep 3306")
+
+        try:
+            # engine = create_engine("mysql+pymysql://USERNAME:PASSWORD@localhost:3306/mydatabase")
+            engine = create_engine("mysql+pymysql://"+sql_username+":"+sql_password+"@"+sql_urlLocation+"/"+sql_database)
+            with engine.connect() as connection:
+                result_one = connection.execute("SELECT 1")
+                print("Success! "+result_one.scalar())
+        except SQLAlchemyError as e:
+            print("Connection failed. Error: "+str(e))
+        # Still have to install MySQL etc. the d
+        # Would need "pip install pymysql"
+        # Also, URL for SQL might be different since this script will be in kuberentes pod
+        # and my SQL db will be outside the Kubernetes pod
+        myDataFrameThing.to_sql("nameForTable", con = engine, if_exists="append", index=False)
+        # index = False means: don't write the Pandas Dataframe's index into the SQL table
+
+
+
     
     # Airflow auomatically converts all tsak method outputs to XComArg objects.
     # If I want the objects treated as the types I want 
