@@ -1,0 +1,30 @@
+{'elevation': 1989.0,
+ 'generationtime_ms': 0.037550926208496094,
+ 'hourly': {'temperature_2m': [61.1,
+                               60.2],
+            'time': ['2025-08-02T00:00',
+                     '2025-08-02T01:00']},
+ 'hourly_units': {'temperature_2m': '°F', 'time': 'iso8601'},
+ 'latitude': 40.0,
+ 'longitude': 40.0,
+ 'timezone': 'GMT',
+ 'timezone_abbreviation': 'GMT',
+ 'utc_offset_seconds': 0}
+
+----AAA----
+                latitude  ...                                             hourly
+time                40.0  ...  [2025-08-02T00:00, 2025-08-02T01:00, 2025-08-0...
+temperature_2m      40.0  ...  [61.1, 60.2, 59.8, 59.0, 63.1, 69.7, 73.2, 76....
+
+[2 rows x 9 columns]
+latitude                 float64
+longitude                float64
+generationtime_ms        float64
+utc_offset_seconds         int64
+timezone                  object
+timezone_abbreviation     object
+elevation                float64
+hourly_units              object
+hourly                    object
+dtype: object
+----BBB----

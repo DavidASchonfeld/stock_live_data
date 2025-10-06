@@ -1,7 +1,7 @@
 # General Libraries
 
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 from datetime import datetime, timedelta
 
 import pendulum
@@ -78,12 +78,52 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
     #   Returns a dictioanry-like object, separating top level key-value pairs into different XComArg objects
     #   To access the results, it would be similar to accessing dictionary values. For example: load(stuff, transformed["timestamp"])
     @task
-    def transform(theData: Annotated[XComArg, dict[str, Any]]):
+    # def transform(inData: Annotated[XComArg, dict[str, Any]]):
+    def transform(inData):
+        # Not adding type hinting since type hinting for
+        # XComArg causes issues when importing the data into a Pandas dataframe
+        inData = cast(dict[str, Any], inData)
         """
         ### Transform task. aka clean/format the data
         """
 
-        return theData
+        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push 
+        writer : OutputTextWriter = OutputTextWriter("/opt/airflow/out")
+
+        # Transform the incoming JSON into a SQL table, each with a different row for each time (and therfore smae or different temperature)
+        # I will need to add
+        # --- a primary key
+        # --- time of import
+        # --- MAYBE: If the input is only about latitude/longitude, maybe I can add a city name?...
+        # ------But maybe a city is larger than 1 latitude/longitude
+        inData_dataframe = pd.DataFrame(inData)
+
+
+        newDataFrame : pd.DataFrame = pd.json_normalize(
+            inData_dataframe,
+
+            # Currently Editing
+            record_path = ['hourly', 'temperature_2m'],
+            record_path = ['hourly', 'time'],
+
+            meta = [
+                'elevation',
+                'generationtime_ms',
+                'hourly_units' <-2 JSON objects,
+                'latitude',
+                'longitude',
+                'timezone',
+                'timezone_abbreviation',
+                'utc_offset_seconds'
+            ]
+        )
+
+        datetime.now()
+
+
+
+
+        return inData
     @task()
     def load(inData):
         """
@@ -109,27 +149,50 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         writer.print_dict(inData, True)
 
         #TODO: Move this conversion to Pandas Dataframe object
-        myDataFrameThing = pd.DataFrame([inData])
+        # myDataFrameThing = pd.DataFrame([inData])
+        myDataFrameThing = pd.DataFrame(inData)
 
         ## Testing/Learning about Python to SQL (with Pandas)
-        sql_username = "root"
-        sql_password = ""
-        sql_database = "test"  # Default MariaDB Value
-        sql_urlLocation = "localhost:3306"  # Default MariaDB Value (This Command in "Command Line" confirms this: "sudo netstat -tulnp | grep 3306")
+        
+        
 
         try:
             # engine = create_engine("mysql+pymysql://USERNAME:PASSWORD@localhost:3306/mydatabase")
+            # If Apache Airflow was not inside Kubernetes pod, since MariaDB is already outside a pod: "localhost:3306"  # Default MariaDB Value (This Command in "Command Line" confirms this: "sudo netstat -tulnp | grep 3306")
+
+            sql_username = "airflow_user"
+            sql_password = "8*Gorilla*8"
+            sql_database = "database_one"  # Default MariaDB Value
+            sql_urlLocation = "172.31.23.236" #"local IP"
+        
             engine = create_engine("mysql+pymysql://"+sql_username+":"+sql_password+"@"+sql_urlLocation+"/"+sql_database)
+            
             with engine.connect() as connection:
                 result_one = connection.execute("SELECT 1")
-                print("Success! "+result_one.scalar())
+                print("Success! "+str(result_one.scalar()))
         except SQLAlchemyError as e:
             print("Connection failed. Error: "+str(e))
+
+        # def flattenDictIntoJSON(inCell):
+        #     return "horshoe"
+        # myDataFrameThing : pd.DataFrame = myDataFrameThing.applymap(flattenDictIntoJSON)
+
+        
         # Still have to install MySQL etc. the d
         # Would need "pip install pymysql"
         # Also, URL for SQL might be different since this script will be in kuberentes pod
         # and my SQL db will be outside the Kubernetes pod
-        myDataFrameThing.to_sql("nameForTable", con = engine, if_exists="append", index=False)
+
+
+        writer.print("----AAA----")
+        writer.print(str(myDataFrameThing.head()))
+        writer.print(str(myDataFrameThing.dtypes))
+        writer.print("----BBB----")
+
+        ### TODO: UNCOMMENT THIS.
+        ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOAMTICALLY CONVERTING IT INTO A SQL OBJECT
+        # myDataFrameThing.to_sql("nameForTable", con = engine, if_exists="append", index=False)
+
         # index = False means: don't write the Pandas Dataframe's index into the SQL table
 
 
