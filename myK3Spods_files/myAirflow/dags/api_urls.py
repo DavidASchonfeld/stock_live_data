@@ -17,5 +17,6 @@ open_weather = {
 }
 
 
-
+# One Call API 3.0
+# Info: https://openweathermap.org/api/one-call-3
 # https://api.openweathermap.org/data/3.0/onecall?lat=33.44&lon=-94.04&appid={API key}
