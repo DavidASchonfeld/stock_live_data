@@ -106,6 +106,7 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
             record_path = ['hourly', 'temperature_2m'],
             record_path = ['hourly', 'time'],
 
+
             meta = [
                 'elevation',
                 'generationtime_ms',
