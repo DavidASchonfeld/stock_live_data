@@ -264,6 +264,148 @@ extraEnvFrom: |
 
 ---
 
+### J. Deploy script fails: `rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed`
+
+**Symptoms:** Running `./scripts/deploy.sh` fails in Step 2c with: `rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed: No such file or directory (2)`
+
+**Root Cause:** The deploy script's Step 1 creates directories on EC2 for Airflow DAGs and the dashboard build folder, but **did not create the dashboard manifests subdirectory**. The `mkdir -p` command was missing `$EC2_DASHBOARD_PATH/manifests`:
+
+```bash
+# BEFORE (line 21) — missing dashboard/manifests:
+ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH"
+
+# AFTER (fixed) — includes dashboard manifests:
+ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
+```
+
+Later in Step 2c, the script tries to rsync `dashboard/manifests/` (pod-flask.yaml, service-flask.yaml) to `/home/ec2-user/dashboard/manifests/`. Without the directory existing first, rsync fails with `mkdir` permission denied.
+
+**Why this happened:** The deploy script was written to sync manifests to EC2 for reference/convenience (Git remains source of truth), but the initial directory creation step didn't account for this nested path. The bug appeared on the first deployment attempt after the script was created.
+
+**Solution Applied:**
+
+1. **Added `EC2_DASHBOARD_PATH` variable** (line 12):
+   ```bash
+   EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
+   ```
+   This makes the path reusable and explicit — clearer intent than hardcoding.
+
+2. **Updated `mkdir` command** (line 21) to include the manifests subdirectory:
+   ```bash
+   ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
+   ```
+
+**Why this fix works:**
+- `mkdir -p` creates directories recursively, so `/home/ec2-user/dashboard/manifests` is created in a single pass
+- The `-p` flag means "no error if directory exists," so re-running deploy.sh is idempotent (safe to run multiple times)
+- rsync can now successfully write to the target directory in Step 2c
+
+**How to verify it's fixed:**
+```bash
+./scripts/deploy.sh
+# Should complete all 7 steps without rsync errors in Step 2c
+# Look for: "Transfer starting: 2 files" (pod-flask.yaml and service-flask.yaml)
+#           "sent X bytes received Y bytes" with exit 0
+```
+
+---
+
+---
+
+### K. Weather DAG load() task fails with database insert errors
+
+**Symptoms:**
+- `API_Weather-Pull_Data` DAG's `load()` task shows state `up_for_retry` or `failed`
+- No clear error message in scheduler logs
+- The `weather_hourly` table doesn't exist in MariaDB, causing SQLAlchemy to fail on insert
+
+**Root Causes (layered):**
+
+1. **Missing database table:** The `load()` task uses `pandas.DataFrame.to_sql()` with `if_exists="append"`, which should auto-create the table. However, if the table doesn't exist AND there are other issues (see below), the insert fails before the table is created.
+
+2. **Data structure issue in transform → load pipeline:** While the transform task correctly creates a flattened DataFrame with proper columns (time, temperature_2m, latitude, etc.), the data being received by the load task showed incorrect structure — columns named after API response top-level keys (hourly, temperature_2m, latitude, etc.) instead of the flattened measurement rows.
+
+3. **XCom serialization/deserialization:** XCom (Airflow's cross-task communication) serializes task outputs to JSON and deserializes them. If the transform task's `newDataFrame.to_dict(orient="records")` returns a list-of-dicts correctly, but the load task receives something different, the issue is in the XCom round-trip.
+
+**Diagnosis Approach:**
+
+```bash
+# Step 1: Check if the table exists
+kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
+from sqlalchemy import create_engine, text
+engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+with engine.connect() as conn:
+    result = conn.execute(text('SHOW TABLES LIKE \"weather_hourly\"'))
+    print('Table exists:', bool(result.scalar()))
+"
+
+# Step 2: Check recent log files from OutputTextWriter to see what the load() task received
+kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
+  cat /opt/airflow/out/$(ls -t /opt/airflow/out | head -1) | tail -50
+
+# Step 3: Check the full error in scheduler logs
+kubectl logs airflow-scheduler-0 -n airflow-my-namespace --tail=200 | grep -A 5 "load.*failed"
+```
+
+**Solution Applied:**
+
+1. **Manually created the `weather_hourly` table** on EC2:
+   ```bash
+   kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
+   from sqlalchemy import create_engine, text
+   engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+   create_table_sql = '''
+   CREATE TABLE IF NOT EXISTS weather_hourly (
+       id INT AUTO_INCREMENT PRIMARY KEY,
+       time VARCHAR(50),
+       temperature_2m FLOAT,
+       latitude FLOAT,
+       longitude FLOAT,
+       elevation FLOAT,
+       timezone VARCHAR(100),
+       utc_offset_seconds INT,
+       imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   )
+   '''
+   with engine.connect() as conn:
+       conn.execute(text(create_table_sql))
+       conn.commit()
+       print('✓ Table created')
+   "
+   ```
+
+**Why this solution works (and its limitations):**
+
+- **Immediate effect:** With the table pre-created, the `load()` task can now execute its `myDataFrameThing.to_sql("weather_hourly", con=engine, if_exists="append", index=False)` statement without the `Table doesn't exist` error.
+- **Workaround, not root fix:** This masks the underlying data structure issue. The task succeeds now, but we haven't verified that the correct data is being inserted. The DataFrame structure mismatch (if real) will cause silent data corruption — rows inserted with wrong columns or wrong values.
+- **Next debugging step:** After the load task completes successfully, run this to verify the data quality:
+  ```bash
+  kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
+  from sqlalchemy import create_engine, text
+  engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+  with engine.connect() as conn:
+      result = conn.execute(text('SELECT * FROM weather_hourly LIMIT 1'))
+      row = result.first()
+      print('Columns:', list(result.keys()))
+      print('Row 0:', row)
+      print('Sample data looks correct:', all(x is not None for x in row[1:]))  # skip auto-increment id
+  "
+  ```
+  If the sample row shows correct time, temperature, latitude, longitude values (not nulls or raw API response objects), the data structure is correct. If columns are wrong or values are null/objects, the transform→load pipeline needs debugging.
+
+**Prevention for future DAGs:**
+
+1. In the `load()` task, add explicit schema validation before inserting:
+   ```python
+   expected_columns = {"time", "temperature_2m", "latitude", "longitude", "elevation", "timezone", "utc_offset_seconds", "imported_at"}
+   actual_columns = set(myDataFrameThing.columns)
+   assert expected_columns == actual_columns, f"Schema mismatch: expected {expected_columns}, got {actual_columns}"
+   ```
+
+2. Consider creating tables with explicit schema in the `extract()` or `setup()` task rather than relying on pandas' auto-creation. This decouples table structure from DAG code.
+
+---
+
 ### H. `DeprecationWarning: security / rbac / auth_backends is deprecated` when running CLI commands
 
 **Symptoms:** Every time you run an Airflow CLI command (`airflow dags trigger`, `airflow dags list`, etc.) you see a warning like:

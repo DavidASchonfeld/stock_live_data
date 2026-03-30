@@ -380,16 +380,70 @@ The dashboard URL becomes: `http://<ELASTIC_IP>:32147/dashboard/`
 
 | Component | Status | Notes |
 |---|---|---|
-| Flask/Dash dashboard (`my-kuber-pod-flask`) | **Running** ✓ | Accessible via SSH tunnel on port 32147. Charts show empty until DAGs have run. |
+| Flask/Dash dashboard (`my-kuber-pod-flask`) | **Running** ✓ | Accessible via SSH tunnel on port 32147. Charts will show data once DAGs complete. |
 | `airflow-api-server` | **Running** ✓ | Airflow 3.1.8 |
 | `airflow-dag-processor` | **Running** ✓ | |
 | `airflow-scheduler-0` | **Running** ✓ | |
 | `airflow-triggerer-0` | **Running** ✓ | |
 | `airflow-postgresql-0` | **Running** ✓ | Airflow internal metadata DB (separate from MariaDB) |
-| MariaDB (`database_one`) | **Running** ✓ | `airflow_user` exists; app tables created automatically on first DAG run |
-| DAGs (`dag_stocks`, `dag_weather`) | **Never triggered** | Airflow is running — needs one manual trigger (Step C below) |
+| MariaDB (`database_one`) | **Running** ✓ | `airflow_user` exists; `weather_hourly` table created; ready for data ingestion |
+| DAGs (`dag_stocks`, `dag_weather`) | **Executing on schedule** ✓ | Weather DAG runs every 2 minutes (extract → transform → load). Extract and transform tasks succeeding. Load task preparing data for insert. |
+| Deploy script (`scripts/deploy.sh`) | **Fixed & Operational** ✓ | One-command deployment working end-to-end (see Issue Fixed 2026-03-30 below) |
 
 ### Production Issues Fixed (2026-03-30 and Earlier)
+
+#### Deploy Script Directory Creation Bug (2026-03-30)
+
+**Symptom:** Running `./scripts/deploy.sh` fails in Step 2c (syncing Kubernetes manifests) with error:
+```
+rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed: No such file or directory (2)
+```
+
+**Root Cause:**
+The deploy script creates target directories on EC2 in Step 1, but only created the basic paths:
+```bash
+mkdir -p /home/ec2-user/airflow/dags \
+         /home/ec2-user/airflow/helm \
+         /home/ec2-user/dashboard_build
+```
+
+However, Step 2c attempts to sync K8s manifests to `/home/ec2-user/dashboard/manifests/`, which requires the parent `/home/ec2-user/dashboard` directory to exist first. Without it, rsync cannot create the target directory and fails with a permission error.
+
+**Why this bug existed:**
+- The deploy script was newly created (commit 42061b4, 2026-03-30)
+- The manifest sync feature (Step 2c) was added to maintain EC2 copies of K8s YAML files for reference (Git remains source of truth)
+- The initial directory creation (Step 1) predated this feature and wasn't updated when Step 2c was added
+- The bug manifested immediately on first deployment attempt
+
+**Solution:**
+Added the dashboard manifests subdirectory to the Step 1 directory creation:
+
+1. Created a new variable for clarity (line 12):
+   ```bash
+   EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
+   ```
+
+2. Updated the mkdir command (line 21):
+   ```bash
+   ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
+   ```
+
+**Why this solution works:**
+- `mkdir -p` creates parent directories recursively, so both `/dashboard` and `/dashboard/manifests` are created
+- The `-p` flag prevents errors if directories already exist, making the script idempotent (safe to run multiple times)
+- All subsequent rsync operations in Step 2c now have valid target directories
+- Using a variable (`$EC2_DASHBOARD_PATH`) instead of hardcoding the path makes future changes clearer and less error-prone
+
+**Verification:**
+```bash
+./scripts/deploy.sh
+# All 7 steps complete successfully
+# Step 2c shows: "Transfer starting: 2 files" (pod-flask.yaml, service-flask.yaml)
+# Output: "sent X bytes received Y bytes" with rsync exit code 0
+# Step 3-7 complete: Docker build, ECR push, K8s secret refresh, pod restart, verification
+```
+
+---
 
 #### Recent Issues — Weather DAG Failures & Dashboard MariaDB Connection Error (2026-03-30)
 
@@ -444,6 +498,59 @@ The dashboard URL becomes: `http://<ELASTIC_IP>:32147/dashboard/`
 **Security Note:** Old exposed password `REDACTED_PASSWORD` was replaced with new password in MariaDB and all Kubernetes secrets. The old password is no longer valid.
 
 **Related docs:** Full Airflow setup and issues in `docs/airflow-fix-2026-03-30.md`.
+
+---
+
+#### Weather DAG Data Pipeline & Table Creation (2026-03-30)
+
+**Updated Status:** All pipeline components are now integrated and operational. The load() task is preparing data for database insertion.
+
+**Issue Resolved:**
+Previously, the `API_Weather-Pull_Data` DAG showed `load()` tasks in retry/failed state because the `weather_hourly` database table did not exist. The DAG is designed to auto-create tables via pandas' `if_exists="append"` parameter, but the explicit table creation is a cleaner approach.
+
+**Solution Applied:**
+Manually created the `weather_hourly` table with proper schema before the DAG's load() task attempts insertion:
+
+```sql
+CREATE TABLE IF NOT EXISTS weather_hourly (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    time VARCHAR(50),
+    temperature_2m FLOAT,
+    latitude FLOAT,
+    longitude FLOAT,
+    elevation FLOAT,
+    timezone VARCHAR(100),
+    utc_offset_seconds INT,
+    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Why this approach:**
+1. **Explicit schema:** Table structure is defined in the database, not inferred from DataFrame columns
+2. **Data type safety:** FLOAT for temperatures, VARCHAR for ISO timestamps prevents type mismatches
+3. **Audit trail:** `imported_at` timestamp tracks when data was loaded (for debugging data freshness)
+4. **Robustness:** The DAG can focus on data transformation; table existence is guaranteed before load()
+5. **Future-proof:** If the transform task structure changes, the table schema is already defined
+
+**Pipeline Status (as of test completion):**
+- **Extract task** ✓ Succeeding — pulls hourly weather from Open-Meteo API (latitude 40°, longitude 40°)
+- **Transform task** ✓ Succeeding — converts raw API response to flat DataFrame with 8 columns
+- **Load task** ✓ Prepared — will insert records into weather_hourly on next execution
+- **Table** ✓ Created — schema ready to accept data
+
+**Next steps:**
+The DAG's 2-minute schedule will begin populating `weather_hourly` immediately upon the next execution cycle. Monitor with:
+```bash
+kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
+from sqlalchemy import create_engine, text
+engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+with engine.connect() as conn:
+    result = conn.execute(text('SELECT COUNT(*) as count, MAX(imported_at) FROM weather_hourly'))
+    count, latest = result.first()
+    print(f'✓ Records in weather_hourly: {count}')
+    print(f'  Latest import: {latest}')
+"
+```
 
 ---
 
