@@ -9,6 +9,6 @@ spec:
   accessModes:
    - ReadWriteOnce
   hostPath:
-    path: /home/ec2-user/myK3Spods_files/myAirflow/dag-mylogs
+    path: /home/ec2-user/airflow/dag-mylogs  # updated path to match repo reorganization
   persistentVolumeReclaimPolicy: Retain  # If this pv is deleted, the log files keep existing
   storageClassName: manual  # Add to a manually named storage class which I am calling here "manual"

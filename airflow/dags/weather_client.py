@@ -11,19 +11,48 @@ import copy
 
 import pandas as pd
 from pandas import DataFrame
-from outputTextWriter import OutputTextWriter
+from file_logger import OutputTextWriter  # renamed from outputTextWriter
 
 
 
 # My Files
+# Note: api_keys is imported here but Open-Meteo doesn't require an API key.
+# This import is a leftover from when this file also handled OpenWeatherMap
+# (which did need a key). Kept for reference; would be used if a keyed API is added.
 from api_key import api_keys  # My api_key Python file is in .gitignore
-from api_urls import open_weather
+# Removed: from api_urls import open_weather — api_urls.py is archived; open_weather was never used by sendRequest_openMeteo
 
 
+# ── Why Open-Meteo? ───────────────────────────────────────────────────────────
+# Open-Meteo is a free, open-source weather API that requires no API key.
+# It returns 7 days of hourly forecasts by default (168 rows: 7 days × 24 hours).
+# The response shape used downstream:
+#   {
+#     "latitude": ..., "longitude": ..., "elevation": ...,
+#     "timezone": ..., "utc_offset_seconds": ...,
+#     "hourly": {
+#       "time": ["2025-01-01T00:00", ...],      # ISO-8601 timestamps, one per hour
+#       "temperature_2m": [32.5, 31.0, ...]     # temperature at 2 metres height
+#     }
+#   }
+# ─────────────────────────────────────────────────────────────────────────────
 def sendRequest_openMeteo(inLatitude : int, inLongitude: int, inFarenheit : bool) -> dict:
+    """
+    ### Fetch hourly weather forecast from Open-Meteo (free, no API key needed).
+
+    Parameters
+    ----------
+    inLatitude  : Latitude of the location to query (decimal degrees)
+    inLongitude : Longitude of the location to query (decimal degrees)
+    inFarenheit : True = return temperatures in Fahrenheit, False = Celsius
+
+    Returns
+    -------
+    Raw JSON response as a dict (see shape in the block comment above).
+    """
     base_url = "https://api.open-meteo.com/v1/forecast"
 
-    measurement_tool : str = "fahrenheit" if inFarenheit else "celcius"
+    measurement_tool : str = "fahrenheit" if inFarenheit else "celsius"
     parameters = {
         "latitude": inLatitude,
         "longitude" : inLongitude,
@@ -33,11 +62,12 @@ def sendRequest_openMeteo(inLatitude : int, inLongitude: int, inFarenheit : bool
     try:
         response : requests.Response = requests.get(base_url, params = parameters)
         response.raise_for_status()
-    except requests.exceptions.HTTPError:
+    except requests.exceptions.HTTPError as error:
         print("response.status_code: "+str(response.status_code))
         raise requests.exceptions.HTTPError("Response Status Code: "+str(response.status_code))
     except Exception as error:
-        pass
+        print(f"API request failed: {str(error)}")
+        raise
 
     responseContent_dict : dict = json.loads(response.content)
 

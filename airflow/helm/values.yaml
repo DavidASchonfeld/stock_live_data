@@ -1,5 +1,10 @@
 executor: LocalExecutor
 
+# Inject all DB credentials and API keys into every Airflow pod from the db-credentials secret
+extraEnvFrom: |
+  - secretRef:
+      name: db-credentials
+
 dags:
   persistence:
     enabled: true

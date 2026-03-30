@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-kuber-pod-flask
+  namespace: default  # Must match service-flask.yaml namespace so the service selector can find this pod
+  labels:
+    app: dancing-flask-pod
+spec:
+  imagePullSecrets:
+  - name: ecr-credentials  # K8s secret created/refreshed by deploy.sh Step 5; allows containerd to pull from ECR
+  containers:
+  - name: flask-container-inside-pod
+    image: REDACTED_AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/my-flask-app:latest
+    imagePullPolicy: IfNotPresent  # Pull from ECR on first use (new deploy); use cached image on pod restarts
+    envFrom:
+    - secretRef:
+        name: db-credentials  # injects DB_USER, DB_PASSWORD, DB_HOST, DB_NAME

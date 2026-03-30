@@ -1,21 +1,21 @@
-# Python Libraries
-import os
-from typing import Any, Dict
+## Python Libraries
+# import os
+# from typing import Any, Dict
 
-import requests
-import json
+# import requests
+# import json
 
-from urllib.parse import urlencode, urljoin
-import copy
+# from urllib.parse import urlencode, urljoin
+# import copy
 
-import pandas as pd
-from pandas import DataFrame
+# import pandas as pd
+# from pandas import DataFrame
 
 
 
-# My Files
-from api_key import api_keys  # My api_key Python file is in .gitignore
-from api_urls import open_weather
+# # My Files
+# from api_key import api_keys  # My api_key Python file is in .gitignore
+# from api_urls import open_weather
 
 
 # http://api.openweathermap.org/geo/1.0/direct?q={city name},{state code},{country code}&limit={limit}&appid={API key}

@@ -8,7 +8,7 @@ spec:
   accessModes:
     - ReadOnlyMany
   hostPath:
-    path: /home/ec2-user/myK3Spods_files/myAirflow/dags
+    path: /home/ec2-user/airflow/dags  # updated path to match repo reorganization
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

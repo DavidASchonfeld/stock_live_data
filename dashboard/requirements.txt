@@ -1,0 +1,16 @@
+Flask==2.3.3
+gunicorn==22.0.0
+python-dotenv==1.0.1
+
+# Dash — data visualization framework built on Flask + Plotly
+dash==2.17.1
+plotly==5.22.0
+
+# Data + database
+pandas==2.2.2
+SQLAlchemy==2.0.30    # 2.x required — uses text() wrapper for raw SQL
+pymysql==1.1.1        # MariaDB/MySQL driver for SQLAlchemy
+
+# TODO (Step 2 of career plan): uncomment when switching load target to Snowflake
+# snowflake-connector-python==3.10.1
+# snowflake-sqlalchemy==1.5.3

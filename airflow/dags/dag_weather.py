@@ -11,17 +11,31 @@ from airflow.models.xcom_arg import XComArg
 
 
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text  # text() required for raw SQL in SQLAlchemy 2.x
 from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
-from api_weather_requests import sendRequest_openMeteo
-from outputTextWriter import OutputTextWriter
+from weather_client import sendRequest_openMeteo  # renamed from api_weather_requests
+from file_logger import OutputTextWriter  # renamed from outputTextWriter
+from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
 
 
+# ── Why Open-Meteo instead of OpenWeatherMap? ────────────────────────────────
+# Open-Meteo (api.open-meteo.com) is completely free with no API key required.
+# The original version used OpenWeatherMap (archived in _archive/old_openWeatherMap.py),
+# but it required a paid plan for hourly data. Open-Meteo provides hourly forecasts
+# at no cost and with no rate limits — ideal for learning and practice.
+#
+# Schedule: every 2 minutes (vs. daily for stocks) because:
+#   1. Open-Meteo has no rate limit, so frequent polling is fine
+#   2. Provides a fast feedback loop for testing the Airflow → MariaDB path
+#   3. Exercises Airflow's sub-hourly scheduling for learning purposes
+#   (Weather itself only updates every hour, so rows will repeat — that's OK for now)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# default_args = 
+
+# default_args =
 
 @dag(  # type:ignore
     "API_Weather-Pull_Data",
@@ -48,7 +62,7 @@ from outputTextWriter import OutputTextWriter
         # [END default_args]
     },
     description="Pulling weather info from Meteo Weather API",
-    schedule=timedelta(minutes=2,days=0),   #timedelta(days=1),
+    schedule=timedelta(minutes=0, hours = 1, days=0),  # This DAG will run every 1 hour
     # start_date=pendulum.datetime(2025, 6, 22, 13, 10, tz="America/New_York"),
     start_date=pendulum.now("America/New_York").subtract(minutes=3),
     # Note: start_date has to be in the past if you want it to run today/later
@@ -58,7 +72,17 @@ from outputTextWriter import OutputTextWriter
 
 def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a name in the @dag section above
     """
-    # TODO: Comment
+    ### Weather Data Pipeline
+
+    Pulls hourly temperature forecasts from Open-Meteo for a fixed lat/lon point
+    (latitude=40, longitude=40 — Black Sea coast, Turkey) and loads them into
+    the `weather_hourly` table in MariaDB.
+
+    The fixed coordinates are arbitrary — chosen for learning purposes.
+    In a real deployment you would parameterize these or pull from a config file.
+
+    #### Pipeline stages:
+    extract()  →  transform()  →  load()
     """
 
     @task()
@@ -70,6 +94,11 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
 
         dictGotten : dict = sendRequest_openMeteo(inLatitude=40, inLongitude=40, inFarenheit=True)
         print(dictGotten)
+        # Validate API response structure
+        if not all(key in dictGotten for key in ["hourly", "hourly_units"]):
+            raise ValueError("API response missing required keys: 'hourly', 'hourly_units'")
+        if "temperature_2m" not in dictGotten["hourly"]:
+            raise ValueError("API response missing 'temperature_2m' in hourly data")
         return dictGotten
     
     
@@ -82,6 +111,9 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
     def transform(inData):
         # Not adding type hinting since type hinting for
         # XComArg causes issues when importing the data into a Pandas dataframe
+        # cast() is a no-op at runtime — it only tells the type-checker that inData
+        # is a dict. XComArg deserialization returns a plain Python object, not XComArg,
+        # so the cast helps IDEs and mypy understand the actual shape.
         inData = cast(dict[str, Any], inData)
         """
         ### Transform task. aka clean/format the data
@@ -96,35 +128,25 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         # --- time of import
         # --- MAYBE: If the input is only about latitude/longitude, maybe I can add a city name?...
         # ------But maybe a city is larger than 1 latitude/longitude
-        inData_dataframe = pd.DataFrame(inData)
 
+        # Open-Meteo returns paired arrays under "hourly" — zip them into one row per hour
+        newDataFrame : pd.DataFrame = pd.DataFrame({
+            "time"            : inData["hourly"]["time"],
+            "temperature_2m"  : inData["hourly"]["temperature_2m"],
+            "latitude"        : inData["latitude"],
+            "longitude"       : inData["longitude"],
+            "elevation"       : inData["elevation"],
+            "timezone"        : inData["timezone"],
+            "utc_offset_seconds": inData["utc_offset_seconds"],
+            "imported_at"     : datetime.now().isoformat(),  # audit column: when this row was loaded
+        })
 
-        newDataFrame : pd.DataFrame = pd.json_normalize(
-            inData_dataframe,
+        writer.print("----Transform Preview----")
+        writer.print(str(newDataFrame.head()))
+        writer.print(str(newDataFrame.dtypes))
 
-            # Currently Editing
-            record_path = ['hourly', 'temperature_2m'],
-            record_path = ['hourly', 'time'],
-
-
-            meta = [
-                'elevation',
-                'generationtime_ms',
-                'hourly_units' <-2 JSON objects,
-                'latitude',
-                'longitude',
-                'timezone',
-                'timezone_abbreviation',
-                'utc_offset_seconds'
-            ]
-        )
-
-        datetime.now()
-
-
-
-
-        return inData
+        # Convert to list-of-dicts so Airflow XCom can serialize it as JSON
+        return newDataFrame.to_dict(orient="records")
     @task()
     def load(inData):
         """
@@ -147,61 +169,61 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         # which would cause issues.
 
         print(str(inData))
-        writer.print_dict(inData, True)
+        writer.print(str(inData))  # inData is now a list of row-dicts from transform()
 
         #TODO: Move this conversion to Pandas Dataframe object
         # myDataFrameThing = pd.DataFrame([inData])
-        myDataFrameThing = pd.DataFrame(inData)
+        myDataFrameThing = pd.DataFrame(inData)  # list-of-dicts → flat DataFrame ready for SQL
 
         ## Testing/Learning about Python to SQL (with Pandas)
-        
-        
+
+
 
         try:
             # engine = create_engine("mysql+pymysql://USERNAME:PASSWORD@localhost:3306/mydatabase")
             # If Apache Airflow was not inside Kubernetes pod, since MariaDB is already outside a pod: "localhost:3306"  # Default MariaDB Value (This Command in "Command Line" confirms this: "sudo netstat -tulnp | grep 3306")
 
-            sql_username = "airflow_user"
-            sql_password = "REDACTED_PASSWORD"
-            sql_database = "database_one"  # Default MariaDB Value
-            sql_urlLocation = "172.31.23.236" #"local IP"
-        
-            engine = create_engine("mysql+pymysql://"+sql_username+":"+sql_password+"@"+sql_urlLocation+"/"+sql_database)
-            
+            engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
+
             with engine.connect() as connection:
-                result_one = connection.execute("SELECT 1")
+                result_one = connection.execute(text("SELECT 1"))  # text() wrapper required by SQLAlchemy 2.x
                 print("Success! "+str(result_one.scalar()))
+
+            writer.print("----AAA----")
+            writer.print(str(myDataFrameThing.head()))
+            writer.print(str(myDataFrameThing.dtypes))
+            writer.print("----BBB----")
+
+            ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOAMTICALLY CONVERTING IT INTO A SQL OBJECT
+            myDataFrameThing.to_sql("weather_hourly", con=engine, if_exists="append", index=False)
+
+            # index = False means: don't write the Pandas Dataframe's index into the SQL table
+            writer.print(f"Loaded {len(myDataFrameThing)} rows into weather_hourly table")  # confirm row count written
+
         except SQLAlchemyError as e:
             print("Connection failed. Error: "+str(e))
+            raise
 
         # def flattenDictIntoJSON(inCell):
         #     return "horshoe"
         # myDataFrameThing : pd.DataFrame = myDataFrameThing.applymap(flattenDictIntoJSON)
 
-        
+
         # Still have to install MySQL etc. the d
         # Would need "pip install pymysql"
         # Also, URL for SQL might be different since this script will be in kuberentes pod
         # and my SQL db will be outside the Kubernetes pod
 
 
-        writer.print("----AAA----")
-        writer.print(str(myDataFrameThing.head()))
-        writer.print(str(myDataFrameThing.dtypes))
-        writer.print("----BBB----")
-
-        ### TODO: UNCOMMENT THIS.
-        ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOAMTICALLY CONVERTING IT INTO A SQL OBJECT
-        # myDataFrameThing.to_sql("nameForTable", con = engine, if_exists="append", index=False)
-
-        # index = False means: don't write the Pandas Dataframe's index into the SQL table
-
-
 
     
     # Airflow auomatically converts all tsak method outputs to XComArg objects.
-    # If I want the objects treated as the types I want 
+    # If I want the objects treated as the types I want
 
+    # ── Wiring the pipeline ───────────────────────────────────────────────────
+    # Calling the @task functions here defines the execution order for Airflow.
+    # Airflow reads these at parse time to build the DAG graph; the functions
+    # themselves run later at scheduled execution time.
     order_data : XComArg = extract()
     order_summary : XComArg = transform(order_data)
     load(order_summary)
