@@ -79,7 +79,8 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]
     description="Daily stock market pipeline: Alpha Vantage → MariaDB (→ Snowflake in Step 2)",
     schedule=timedelta(days=1),  # run once per day — matches market data cadence
     # start_date must be in the past for Airflow to schedule the first run immediately
-    start_date=pendulum.now("America/New_York").subtract(days=1),
+    # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
+    start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York"),
     # catchup=False: without this, Airflow would try to run one instance per day
     # starting from start_date until today, creating dozens of queued runs on
     # first deploy. We skip that because Alpha Vantage "compact" already returns
@@ -136,6 +137,11 @@ def stock_market_pipeline():
                 api_key=api_keys.alpha_vantage["key"],
                 outputsize="compact",  # last 100 trading days — saves API quota
             )
+            # Validate response structure before storing (fail fast on API failures)
+            if not raw_response or "Time Series (Daily)" not in raw_response:
+                raise ValueError(f"Invalid API response for {ticker}: missing 'Time Series (Daily)' field")
+            if not raw_response.get("Time Series (Daily)"):
+                raise ValueError(f"No data returned for {ticker} from Alpha Vantage")
             # Store ticker alongside its raw response so transform() knows which symbol it belongs to
             results.append({"ticker": ticker, "raw": raw_response})
             writer.print(f"  ✓ {ticker}: {len(raw_response.get('Time Series (Daily)', {}))} days received")
@@ -237,7 +243,9 @@ def stock_market_pipeline():
             writer.print(f"Loaded {len(myDataFrameThing)} rows into stock_daily_prices table")  # confirm row count written
 
         except SQLAlchemyError as e:
-            print("Connection failed. Error: "+str(e))
+            # Re-raise so task fails and Airflow can retry (instead of silent failure)
+            writer.print(f"Database error loading records: {e}")
+            raise
 
         # Still have to install MySQL etc. the d
         # Would need "pip install pymysql"
