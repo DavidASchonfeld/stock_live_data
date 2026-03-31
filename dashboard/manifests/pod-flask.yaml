@@ -11,7 +11,27 @@ spec:
   containers:
   - name: flask-container-inside-pod
     image: REDACTED_AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com/my-flask-app:latest
-    imagePullPolicy: IfNotPresent  # Pull from ECR on first use (new deploy); use cached image on pod restarts
+    imagePullPolicy: Always  # Always pull latest image from ECR to ensure up-to-date code
     envFrom:
     - secretRef:
         name: db-credentials  # injects DB_USER, DB_PASSWORD, DB_HOST, DB_NAME
+    # Liveness probe: restart pod if health endpoint fails (prevents hung processes)
+    # Detects "zombie" processes that appear running but are actually stuck; auto-heals via restart
+    livenessProbe:
+      httpGet:
+        path: /health  # Calls Flask /health endpoint; expects 200 status + response
+        port: 5000    # Flask port inside pod
+      initialDelaySeconds: 30  # Wait 30s after pod starts before first check (allow startup)
+      periodSeconds: 10        # Check every 10 seconds
+      timeoutSeconds: 5        # Fail probe if no response within 5 seconds (indicates freeze)
+      failureThreshold: 3      # Restart pod after 3 consecutive failures (30s hung = restart)
+    # Readiness probe: don't route traffic until pod is ready (prevents 502 errors)
+    # Removes pod from load balancer while initializing; re-adds once healthy
+    readinessProbe:
+      httpGet:
+        path: /health  # Same health check endpoint
+        port: 5000
+      initialDelaySeconds: 10  # Wait 10s before first check (faster than liveness)
+      periodSeconds: 5         # Check every 5 seconds (frequent, catches issues quickly)
+      timeoutSeconds: 3        # Fail probe if no response within 3 seconds
+      failureThreshold: 2      # Remove from service after 2 failures (10s unresponsive = offline)

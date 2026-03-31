@@ -21,6 +21,44 @@ AWS_REGION="us-west-2"
 echo "=== Step 1: Ensuring target directories exist on EC2 ==="
 ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
 
+echo "=== Step 1b: Pre-flight validation ==="
+
+# Validate Python syntax in all DAG files (catches typos, indentation errors, missing colons)
+echo "Checking Python syntax in DAG files..."
+if ! python3 -m py_compile airflow/dags/*.py 2>&1 | grep -q "error"; then
+    echo "✓ All DAG files have valid Python syntax"
+else
+    echo "✗ Syntax error in DAG files. Fix before deploying."
+    python3 -m py_compile airflow/dags/*.py
+    exit 1
+fi
+
+# Validate that all DAG imports work (catches missing modules, missing secrets, etc.)
+echo "Validating module imports..."
+cd airflow/dags
+python3 << 'VALIDATION_EOF'
+import sys
+sys.path.insert(0, '.')  # Simulate /opt/airflow/dags in the pod
+
+# Try importing all DAG files
+dag_files = ['dag_stocks', 'dag_weather']
+for dag_file in dag_files:
+    try:
+        __import__(dag_file)
+        print(f"✓ {dag_file} imports successfully")
+    except ImportError as e:
+        print(f"✗ Import error in {dag_file}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"✗ Runtime error in {dag_file}: {e}")
+        sys.exit(1)
+
+print("✓ All DAG files import successfully")
+VALIDATION_EOF
+cd ../..
+
+echo ""
+
 echo "=== Step 2: Syncing DAG files to EC2 ==="
 # rsync <- Unix/Mac/Linux command to transfer data/files.
 # Compares source/destination so it only transfers what was changed.

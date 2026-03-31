@@ -9,7 +9,7 @@ spec:
   capacity:
     storage: 1Gi
   hostPath:
-    path: /home/ec2-user/airflow/dags  # updated path to match repo reorganization
+    path: /home/ec2-user/airflow/dags  # updated path to match deploy.sh sync destination
   persistentVolumeReclaimPolicy: Retain
   storageClassName: local-path
   claimRef:

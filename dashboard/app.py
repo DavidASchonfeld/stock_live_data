@@ -259,7 +259,61 @@ def hello():
 @app.route('/health')
 def health():
     # Health-check endpoint — useful for Kubernetes liveness probes
+    # No DB call needed; fast, reliable signal that pod process is running
     return {"status": "ok"}, 200
+
+
+@app.route('/validation')
+def validation():
+    # Data validation endpoint — shows table schemas, row counts, and freshness
+    # Used for monitoring: detect when DAGs fail or data stops flowing
+    try:
+        validation_info = {
+            "status": "ok",
+            # Include timestamp so caller knows when data was sampled
+            "timestamp": pd.Timestamp.now().isoformat(),
+            "tables": {}
+        }
+
+        with DB_ENGINE.connect() as conn:
+            # Validate stock_daily_prices table
+            # COUNT(*) detects if data is flowing in; row count trends indicate pipeline health
+            stock_count = conn.execute(text("SELECT COUNT(*) FROM stock_daily_prices")).scalar()
+            # MAX(date) shows data freshness; stale dates indicate pipeline failure
+            stock_latest = conn.execute(text("SELECT MAX(date) FROM stock_daily_prices")).scalar()
+            # Sample 5 rows to catch schema changes or data corruption (bad prices, wrong formats)
+            stock_sample = pd.read_sql(
+                text("SELECT * FROM stock_daily_prices ORDER BY date DESC LIMIT 5"),
+                conn
+            )
+            # Convert count to int (SQL returns generic object); dates/data to string for JSON serialization
+            validation_info["tables"]["stock_daily_prices"] = {
+                "row_count": int(stock_count),
+                "latest_date": str(stock_latest),
+                # to_dict('records') converts DataFrame rows to list of dicts (JSON-friendly format)
+                "sample_data": stock_sample.to_dict('records') if len(stock_sample) > 0 else []
+            }
+
+            # Validate weather_hourly table
+            # Same checks as stocks, but MAX(time) instead of MAX(date) for hourly data
+            weather_count = conn.execute(text("SELECT COUNT(*) FROM weather_hourly")).scalar()
+            weather_latest = conn.execute(text("SELECT MAX(time) FROM weather_hourly")).scalar()
+            # Sample shows recent hourly data; helps spot missing hours or corrupted records
+            weather_sample = pd.read_sql(
+                text("SELECT * FROM weather_hourly ORDER BY time DESC LIMIT 5"),
+                conn
+            )
+            validation_info["tables"]["weather_hourly"] = {
+                "row_count": int(weather_count),
+                "latest_time": str(weather_latest),
+                "sample_data": weather_sample.to_dict('records') if len(weather_sample) > 0 else []
+            }
+
+        return validation_info, 200
+
+    # Catch DB connection errors, table-not-found, query errors; return diagnostic message
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
 # ─────────────────────────────────────────────────────────────────────────────
 
 

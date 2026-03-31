@@ -21,6 +21,14 @@ from file_logger import OutputTextWriter  # renamed from outputTextWriter
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
 
 
+# Validate required environment variables are available (fail fast if Kubernetes secrets not injected)
+import os
+_required_secrets = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"]
+_missing_secrets = [k for k in _required_secrets if not os.getenv(k)]
+if _missing_secrets:
+    raise RuntimeError(f"Missing Kubernetes secrets (environment variables): {_missing_secrets}. Ensure db-credentials secret is mounted.")
+
+
 # ── Why Open-Meteo instead of OpenWeatherMap? ────────────────────────────────
 # Open-Meteo (api.open-meteo.com) is completely free with no API key required.
 # The original version used OpenWeatherMap (archived in _archive/old_openWeatherMap.py),

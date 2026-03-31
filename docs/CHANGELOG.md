@@ -1,5 +1,47 @@
 # Changelog — What Was Fixed
 
+---
+
+## 2026-03-31: Documented Task State Synchronization Error
+
+**What Was Done**:
+- 📝 Documented Airflow task state synchronization race condition encountered in scheduler logs
+- 📝 Added troubleshooting section to TROUBLESHOOTING.md with diagnosis and mitigation steps
+- 📝 Error reference: "Executor reported that the task instance finished with state success, but the task instance's state attribute is running"
+
+**Why It Matters**:
+- Non-critical but recurring error can be confusing during monitoring
+- Now documented so future occurrences can be quickly diagnosed
+- Provides mitigation strategies (reduce parallelism, monitor completion, restart pod)
+
+**Reference**: See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — "Issue: Task State Synchronization Error"
+
+---
+
+## 2026-03-31: Validation & Monitoring Setup — COMPLETE ✅
+
+**What Was Done**:
+- ✅ Deployed Flask `/health` endpoint (Kubernetes liveness/readiness probes)
+- ✅ Deployed Flask `/validation` endpoint (real-time data monitoring dashboard)
+- ✅ Deployed validation script (`validate_database.py`) for schema + freshness checks
+- ✅ Configured K8s health probes in pod-flask.yaml
+- ✅ Added concise explanatory comments to all new code
+- ✅ All code deployed to EC2 and running successfully
+
+**How to Monitor**:
+- Browser: `http://localhost:32147/validation` (requires SSH tunnel)
+- CLI: `kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- python3 /opt/airflow/dags/validate_database.py`
+
+**What This Enables**:
+- Early detection when DAGs fail or data stops flowing
+- Real-time visibility into table row counts and data freshness
+- Automatic pod restarts if Flask process becomes unresponsive
+- Quick diagnosis of schema changes or data quality issues
+
+---
+
+## 2026-03-30: Airflow Infrastructure & DAG Discovery — COMPLETE ✅
+
 **Date**: March 30, 2026
 **Time Invested**: Debugging PersistentVolume path mismatch + Stock DAG discovery
 **Status**: ✅ **COMPLETE** — Both DAGs now fully functional

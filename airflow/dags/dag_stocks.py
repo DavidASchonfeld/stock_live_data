@@ -1,6 +1,7 @@
 # General Libraries
 
 import json
+import time
 from typing import Any
 from datetime import timedelta
 
@@ -19,6 +20,14 @@ from stock_client import sendRequest_alphavantage_daily, flatten_daily_timeserie
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
 from api_key import api_keys  # api_key.py is in .gitignore — never commit secrets
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
+
+
+# Validate required environment variables are available (fail fast if Kubernetes secrets not injected)
+import os
+_required_secrets = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"]
+_missing_secrets = [k for k in _required_secrets if not os.getenv(k)]
+if _missing_secrets:
+    raise RuntimeError(f"Missing Kubernetes secrets (environment variables): {_missing_secrets}. Ensure db-credentials secret is mounted.")
 
 
 # ── Why TaskFlow API (@dag / @task) instead of classic Airflow Operators? ─────
@@ -130,6 +139,7 @@ def stock_market_pipeline():
             # Store ticker alongside its raw response so transform() knows which symbol it belongs to
             results.append({"ticker": ticker, "raw": raw_response})
             writer.print(f"  ✓ {ticker}: {len(raw_response.get('Time Series (Daily)', {}))} days received")
+            time.sleep(1)  # Alpha Vantage free tier requires minimum 1 second between requests
 
         return results
 

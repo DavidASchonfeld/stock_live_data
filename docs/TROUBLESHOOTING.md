@@ -57,17 +57,70 @@ dag = my_dag_function()  # Assigned to module variable
    ./scripts/deploy.sh
    ```
 
-4. **Force Airflow to reload DAGs**:
+4. **Force Airflow to reload DAGs** (re-scan /opt/airflow/dags/ and rebuild the DAG database):
    ```bash
    ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
      airflow dags reserialize
    ```
+   **Why this step is needed:**
+   - Airflow caches DAG metadata in its database (PostgreSQL)
+   - When you deploy a new DAG file, the scheduler scans `/opt/airflow/dags/` periodically (default: every 30 seconds)
+   - If the scheduler is slow to discover the new DAG, reserialize forces an immediate scan and database update
+   - **Expected output**: `Setting next_dagrun for Stock_Market_Pipeline to...` (DAG is now registered)
 
 5. **Verify DAG is discovered**:
    ```bash
    ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
      airflow dags list | grep "Stock_Market_Pipeline"
    ```
+   Should return:
+   ```
+   Stock_Market_Pipeline | /opt/airflow/dags/dag_stocks.py | airflow | False | dags-folder | None
+   ```
+
+---
+
+## How Deploy.sh Validates DAG Files (Deployment Best Practices)
+
+### Pre-flight Checks
+
+When you run `./scripts/deploy.sh`, **before syncing to EC2**, it validates:
+
+1. **Python syntax** — Catches typos, indentation errors, missing colons
+   ```bash
+   ✓ All DAG files have valid Python syntax
+   ```
+
+2. **Module imports** — Catches missing local modules (stock_client, file_logger, etc.)
+   ```bash
+   ✓ dag_stocks imports successfully
+   ✓ dag_weather imports successfully
+   ```
+
+3. **Secret injection** — Each DAG validates that required Kubernetes secrets are available:
+   ```python
+   # In dag_stocks.py and dag_weather.py (added after imports):
+   _required_secrets = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"]
+   _missing_secrets = [k for k in _required_secrets if not os.getenv(k)]
+   if _missing_secrets:
+       raise RuntimeError(f"Missing Kubernetes secrets: {_missing_secrets}")
+   ```
+
+### Why This Matters
+
+**Without validation:**
+- Deploy file → pod starts but crashes → CrashLoopBackOff → read 200 lines of logs → find typo → fix locally → redeploy → repeat
+
+**With validation:**
+- Deploy file → validation fails locally → see 5-line error → fix → redeploy → success
+
+This shifts debugging from "hours in logs" to "minutes locally".
+
+### If Validation Fails
+
+1. **Syntax error** — Check the Python file for typos, mismatched quotes, indentation
+2. **Import error** — Verify the missing module exists in `airflow/dags/`
+3. **Secret error** — Kubernetes secret not mounted; run in pod: `kubectl describe pod airflow-scheduler-0 -n airflow-my-namespace` and check environment variables section
 
 ---
 
@@ -173,6 +226,83 @@ ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
    ```bash
    ssh ec2-stock kubectl rollout restart statefulset/airflow-scheduler -n airflow-my-namespace
    ```
+
+---
+
+## Issue: Task State Synchronization Error
+
+### Symptoms
+
+- Scheduler logs show error: "Executor reported that the task instance finished with state success, but the task instance's state attribute is running"
+- Task may appear to complete successfully in Airflow UI despite the error message
+- Error appears in scheduler logs but doesn't necessarily cause task failure
+- Occurs intermittently, often under high parallelism or rapid task completion
+
+### Example Error Message
+
+```
+[error] Executor LocalExecutor(parallelism=32) reported that the task instance
+<TaskInstance: API_Weather-Pull_Data.extract scheduled__2026-03-31T02:18:51.659191+00:00 [running]>
+finished with state success, but the task instance's state attribute is running.
+Learn more: https://airflow.apache.org/docs/apache-airflow/stable/troubleshooting.html#task-state-changed-externally
+[airflow.task] loc=taskinstance.py:1526
+```
+
+### Root Cause
+
+This is a known Airflow issue related to task state synchronization. A race condition occurs between:
+- The executor reporting task completion (success)
+- The task instance state manager updating the task's state
+
+Under high parallelism or when tasks complete very quickly, the state synchronization can lag, causing the executor and task instance to temporarily disagree on state.
+
+### Current Status
+
+**Non-critical**: Tasks usually complete successfully despite the error message. The error is a logging artifact rather than a functional failure.
+
+### Diagnostic Steps
+
+1. **Check scheduler logs for this specific error**:
+   ```bash
+   kubectl logs airflow-scheduler-0 -n airflow-my-namespace --tail=100 | \
+     grep "finished with state success.*is running"
+   ```
+
+2. **Verify the affected task actually completed**:
+   ```bash
+   # Check Airflow UI: Task should show success status
+   # Or check task logs: Look for successful execution output
+   ```
+
+3. **Monitor if it recurs**:
+   ```bash
+   # Watch logs continuously
+   kubectl logs -f airflow-scheduler-0 -n airflow-my-namespace | \
+     grep "finished with state success.*is running"
+   ```
+
+### Mitigation Steps
+
+If this error recurs frequently:
+
+1. **Reduce LocalExecutor parallelism** (if applicable):
+   - Edit `airflow/manifests/` configuration
+   - Reduce `parallelism` from 32 to 16-24
+   - Restart scheduler pod to apply
+
+2. **Monitor task completion**:
+   - Verify tasks are completing (not hanging)
+   - Check Airflow UI task logs for actual errors
+   - Use validation endpoint to verify data is being inserted
+
+3. **Restart scheduler pod** (if tasks appear stuck):
+   ```bash
+   kubectl rollout restart statefulset/airflow-scheduler -n airflow-my-namespace
+   ```
+
+### References
+
+- Airflow Documentation: https://airflow.apache.org/docs/apache-airflow/stable/troubleshooting.html#task-state-changed-externally
 
 ---
 
