@@ -8,4 +8,4 @@ airflow_env/
 # prevent timestamped log files from being committed
 *.txt
 # local infra secrets (IPs, key file, credentials) — never commit
-infra_local.md
+infra_local.md__pycache__/
