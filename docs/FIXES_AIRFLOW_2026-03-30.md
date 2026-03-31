@@ -1,5 +1,13 @@
 # Airflow Production Fix — 2026-03-30
 
+**Quick Navigation**
+- Want to understand Helm or Airflow? See [ARCHITECTURE.md](ARCHITECTURE.md)
+- Need debugging guidance? See [DEBUGGING.md](DEBUGGING.md)
+- Want term definitions (ImagePullBackOff, Helm, etc.)? See [GLOSSARY.md](GLOSSARY.md)
+- Looking for command reference? See [COMMANDS.md](COMMANDS.md)
+
+---
+
 ## What was broken and why
 
 Airflow had **never successfully started** on EC2. The root cause was a cascade of three issues:

@@ -2,6 +2,12 @@
 
 A learning-oriented reference for debugging this project's stack: **K3s + Airflow + Flask on EC2**.
 
+**Quick Navigation**
+- Need to understand what `ss -tlnp`, `kubectl`, or `rsync` do? See [COMMANDS.md](COMMANDS.md)
+- Want to understand system architecture? See [ARCHITECTURE.md](ARCHITECTURE.md)
+- Looking for a specific term definition? See [GLOSSARY.md](GLOSSARY.md) (iptables, XCom, inode, etc.)
+- Need help with a specific issue? Jump to [Common Issues & Fixes](#3-common-issues--fixes)
+
 ---
 
 ## 1. Mental Model — How the Stack Connects
@@ -17,7 +23,7 @@ Your Mac (SSH tunnel)
 
 **Key things that trip you up:**
 
-- **`ss -tlnp` returns nothing for NodePorts** — k3s uses iptables rules, not bound sockets. The port "exists" in the iptables firewall, not as a listening process. `ss` only shows bound sockets, so it will always look empty for k3s NodePorts.
+- **`ss -tlnp` returns nothing for NodePorts** — k3s uses iptables rules, not bound sockets. The port "exists" in the iptables firewall, not as a listening process. `ss` only shows bound sockets, so it will always look empty for k3s NodePorts. See [COMMANDS.md#ss--tlnp](COMMANDS.md#ss--tlnp) for full explanation of this command.
 
 - **`docker ps` shows `k8s_` prefixed containers** — that means containerd is running the pods, not Docker Compose. You're in Kubernetes. Use `kubectl`, not `docker`.
 

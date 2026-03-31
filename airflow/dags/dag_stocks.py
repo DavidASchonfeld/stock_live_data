@@ -248,4 +248,4 @@ def stock_market_pipeline():
     load(transformed)                             # type: ignore[arg-type]
 
 
-stock_market_pipeline()
+dag = stock_market_pipeline()

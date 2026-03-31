@@ -1,5 +1,14 @@
 # Stock Live Data — Project Overview
 
+**Quick Navigation**
+- **[docs/INDEX.md](docs/INDEX.md)** — Complete documentation hub (find any topic here)
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Why K3S? How Kubernetes/Docker/ETL work?
+- **[docs/GLOSSARY.md](docs/GLOSSARY.md)** — Define technical terms (SMA, PV, PVC, DAG, K3S, etc.)
+- **[docs/DEBUGGING.md](docs/DEBUGGING.md)** — Troubleshooting guide (systematic approach)
+- **[docs/COMMANDS.md](docs/COMMANDS.md)** — Explain cryptic shell commands (`ss -tlnp`, `kubectl`, etc.)
+
+---
+
 ## Project Summary
 
 A production-deployed, end-to-end data pipeline that pulls daily stock prices (AAPL, MSFT, GOOGL) and hourly weather data from public APIs, stores them in a MariaDB database, and serves an interactive Plotly/Dash dashboard — all orchestrated by Apache Airflow and hosted on AWS EC2 via K3S Kubernetes.
