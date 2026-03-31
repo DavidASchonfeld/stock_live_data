@@ -4,8 +4,13 @@ notes.txt
 constants.py
 logs
 .env
+.env.deploy
 airflow_env/
 # prevent timestamped log files from being committed
 *.txt
 # local infra secrets (IPs, key file, credentials) — never commit
-infra_local.md__pycache__/
+infra_local.md
+# compiled Python bytecode
+__pycache__/
+# local development notes
+dev_notes_private.md

@@ -52,7 +52,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_USER=airflow_user \
   --from-literal=DB_PASSWORD=<password> \
   --from-literal=DB_NAME=database_one \
-  --from-literal=DB_HOST=172.31.23.236 \
+  --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
   --from-literal=ALPHA_VANTAGE_KEY=<key> \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
@@ -122,7 +122,7 @@ Airflow is running and credentials are injected, but **the DAGs have never been 
    ```bash
    ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
    ```
-2. Open `http://localhost:30080` — login `admin` / `admin`
+2. Open `http://localhost:30080` — login with Airflow credentials (see `infra_local.md`)
 3. Trigger `dag_stocks` and `dag_weather` manually once each
 4. Confirm both tasks complete green (especially the `load()` task — that's where DB connection happens)
 5. Open the dashboard at `http://localhost:32147/dashboard/` — the candlestick chart should now show real OHLCV data for AAPL, MSFT, GOOGL
@@ -131,7 +131,7 @@ Airflow is running and credentials are injected, but **the DAGs have never been 
 The Flask/Dash pod (`my-kuber-pod-flask`) is healthy and serving. However, because `stock_daily_prices` doesn't exist yet, it currently shows an error or empty charts. It will show real data as soon as step C above is completed.
 
 ### MariaDB
-`database_one` and `airflow_user` exist and are healthy. The `airflow_user` is granted access from the K8s pod subnet (`10.42.%`) and the EC2 private IP (`172.31.23.236`). No action needed here.
+`database_one` and `airflow_user` exist and are healthy. The `airflow_user` is granted access from the K8s pod subnet (`10.42.%`) and the EC2 private IP (`<MARIADB_PRIVATE_IP>`). No action needed here.
 
 ### `deploy.sh`
 The deploy script is now complete and handles all syncing automatically. Running `./scripts/deploy.sh` from the project root will sync DAGs, Helm values, rebuild the Flask Docker image, push to ECR, and restart the Flask pod. The Airflow pods do not need to be restarted when only DAG files change — the PVC mount makes new files visible to the scheduler immediately.

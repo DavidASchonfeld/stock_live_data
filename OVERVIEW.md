@@ -41,7 +41,7 @@ AWS EC2 t3.xlarge  (Elastic IP <YOUR_EC2_IP>)
     │       extract() → transform() → load()   [Open-Meteo hourly temp]
     │           │ SQLAlchemy/pymysql
     │           ▼
-    ├── MariaDB (172.31.23.236 / mariadb_private_ip / database_one)
+    ├── MariaDB (<MARIADB_PRIVATE_IP> / database_one)
     │     ├── stock_daily_prices
     │     └── weather_hourly
     │           │ SQLAlchemy query
@@ -88,6 +88,8 @@ stock_live_data/
 ├── README.md                            # High-level architecture sketch
 ├── notes.txt                            # Detailed setup/deployment notes (~69KB)
 ├── .gitignore
+├── .env.deploy.example                  # Template for deploy secrets — copy to .env.deploy and fill in
+├── .env.deploy                          # Real AWS values for deploy.sh (NOT committed — gitignored)
 ├── scripts/
 │   └── deploy.sh                        # One-command deploy: syncs files, rebuilds Docker image, restarts pod
 │
@@ -119,7 +121,7 @@ stock_live_data/
 │   ├── Dockerfile                       # Builds my-flask-app:latest (python:3.12-slim, Gunicorn)
 │   ├── requirements.txt                 # Python deps for the Docker image
 │   └── manifests/
-│       ├── pod-flask.yaml               # K8s Pod manifest (image: ECR URI, IfNotPresent pull, imagePullSecrets, namespace: default)
+│       ├── pod-flask.yaml               # K8s Pod manifest (image: ${ECR_REGISTRY} placeholder — deploy.sh substitutes real URI)
 │       └── service-flask.yaml           # NodePort service: exposes dashboard on port 32147
 │
 ├── logs/                                # OutputTextWriter log files (local dev only, gitignored)
@@ -225,13 +227,13 @@ Create this file at `airflow/dags/db_config.py` (never commit to git — it's gi
 DB_USER     = "airflow_user"
 DB_PASSWORD = "YOUR_DB_PASSWORD"   # password you chose in step 1
 DB_NAME     = "database_one"
-DB_HOST     = "localhost"           # for dev mode on Mac (production uses 172.31.23.236 / mariadb_private_ip)
+DB_HOST     = "localhost"           # for dev mode on Mac (production uses the MariaDB private IP from infra_local.md)
 ```
 
 For the Flask dashboard, update `dashboard/app.py` line 42:
 ```python
 SQL_URL = "localhost"   # for dev mode
-# Production will use 172.31.23.236 (mariadb_private_ip) from the db-credentials Kubernetes Secret
+# Production will use the MariaDB private IP from the db-credentials Kubernetes Secret
 ```
 
 ### 4. Create local `api_key.py` with API keys
@@ -265,7 +267,7 @@ pip install apache-airflow pandas sqlalchemy pymysql requests
 
 export AIRFLOW_HOME=$(pwd)
 airflow db migrate        # replaces deprecated "airflow db init"
-airflow users create --username admin --password admin \
+airflow users create --username <AIRFLOW_USER> --password <AIRFLOW_PASSWORD> \
   --firstname Air --lastname Flow --role Admin --email admin@example.com
 
 airflow webserver &        # http://localhost:8080
@@ -286,6 +288,25 @@ airflow scheduler
 3. `curl -sfL https://get.k3s.io | sh -`  (installs K3S)
 4. Install Helm, add Airflow repo: `helm repo add apache-airflow https://airflow.apache.org`
 
+### First-time setup: create `.env.deploy`
+
+`deploy.sh` reads AWS-specific values (ECR registry URI, region) from a gitignored file called `.env.deploy`. This keeps your AWS account ID out of version control.
+
+```bash
+cp .env.deploy.example .env.deploy
+# Edit .env.deploy and fill in your real AWS account ID and region
+```
+
+The file looks like:
+```bash
+ECR_REGISTRY="<AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com"
+AWS_REGION="us-west-2"
+```
+
+`deploy.sh` will refuse to run if `.env.deploy` is missing or incomplete.
+
+**How it works with pod-flask.yaml:** The pod manifest in git contains `${ECR_REGISTRY}` as a placeholder for the container image URI. At deploy time, `deploy.sh` uses `envsubst` to substitute the real ECR registry from `.env.deploy` into a temporary copy of the manifest, then applies that rendered copy to Kubernetes. This way the AWS account ID never appears in any committed file.
+
 ### Deploying Updates (DAGs and/or Dashboard)
 
 All updates are deployed with a single command from the project root on your Mac:
@@ -294,8 +315,9 @@ All updates are deployed with a single command from the project root on your Mac
 ./scripts/deploy.sh
 ```
 
-**First time only** — make the script executable before running:
+**First time only** — make the script executable and create `.env.deploy`:
 ```bash
+cp .env.deploy.example .env.deploy   # then edit with your real AWS values
 chmod +x scripts/deploy.sh
 ./scripts/deploy.sh
 ```
@@ -355,7 +377,7 @@ Keep that terminal open (the tunnel lives as long as the SSH session). Then in y
 
 | Service | URL | Login |
 |---|---|---|
-| Airflow UI | http://localhost:30080 | admin / admin |
+| Airflow UI | http://localhost:30080 | `<AIRFLOW_USER>` / `<AIRFLOW_PASSWORD>` |
 | Flask/Dash Dashboard | http://localhost:32147/dashboard/ | (none) |
 
 **Tip — prevent idle disconnects:** Add `ServerAliveInterval 60` to the `ec2-stock` entry in `~/.ssh/config` so the SSH connection doesn't drop after a few minutes of inactivity:
@@ -469,7 +491,7 @@ Added the dashboard manifests subdirectory to the Step 1 directory creation:
    - Missing response validation: Code assumed Open-Meteo API response had required keys without checking, failing with cryptic KeyError if schema changed
 
 2. **Database credentials not injected:**
-   - Kubernetes Secret `db-credentials` didn't exist in the K3S cluster (or contained template placeholder `<mariadb_private_ip>` instead of actual value `172.31.23.236`)
+   - Kubernetes Secret `db-credentials` didn't exist in the K3S cluster (or contained template placeholder instead of the actual MariaDB private IP)
    - Both Flask and Airflow pods reference this secret to populate environment variables (`DB_HOST`, `DB_USER`, `DB_PASSWORD`)
    - Without the secret, pods defaulted to missing credentials and couldn't connect to MariaDB
 
@@ -488,23 +510,23 @@ Added the dashboard manifests subdirectory to the Step 1 directory creation:
      kubectl create secret generic db-credentials \
        -n airflow-my-namespace \
        --from-literal=DB_USER=airflow_user \
-       --from-literal=DB_PASSWORD=<new_password> \
+       --from-literal=DB_PASSWORD=<DB_PASSWORD> \
        --from-literal=DB_NAME=database_one \
-       --from-literal=DB_HOST=172.31.23.236 \
-       --from-literal=ALPHA_VANTAGE_KEY=<api_key>
+       --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
+       --from-literal=ALPHA_VANTAGE_KEY=<ALPHA_VANTAGE_KEY>
 
      # In default namespace (for Flask)
      kubectl create secret generic db-credentials \
        -n default \
        --from-literal=DB_USER=airflow_user \
-       --from-literal=DB_PASSWORD=<new_password> \
+       --from-literal=DB_PASSWORD=<DB_PASSWORD> \
        --from-literal=DB_NAME=database_one \
-       --from-literal=DB_HOST=172.31.23.236 \
-       --from-literal=ALPHA_VANTAGE_KEY=<api_key>
+       --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
+       --from-literal=ALPHA_VANTAGE_KEY=<ALPHA_VANTAGE_KEY>
      ```
    - Restarted all pods to pick up the new secret
 
-**Security Note:** Old exposed password `REDACTED_PASSWORD` was replaced with new password in MariaDB and all Kubernetes secrets. The old password is no longer valid.
+**Security Note:** The original database password was rotated after accidental exposure. The old password is no longer valid. All Kubernetes secrets and MariaDB credentials have been updated.
 
 **Related docs:** Full Airflow setup and issues in `docs/airflow-fix-2026-03-30.md`.
 
@@ -552,7 +574,7 @@ The DAG's 2-minute schedule will begin populating `weather_hourly` immediately u
 ```bash
 kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
 from sqlalchemy import create_engine, text
-engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+engine = create_engine('mysql+pymysql://airflow_user:<DB_PASSWORD>@<MARIADB_PRIVATE_IP>/database_one')
 with engine.connect() as conn:
     result = conn.execute(text('SELECT COUNT(*) as count, MAX(imported_at) FROM weather_hourly'))
     count, latest = result.first()
@@ -589,25 +611,25 @@ The Airflow Helm chart bundles its own PostgreSQL pod for internal metadata (DAG
 
 **Fix (two parts):**
 
-1. Created a Kubernetes Secret on EC2 with the actual MariaDB private IP (172.31.23.236 / mariadb_private_ip):
+1. Created a Kubernetes Secret on EC2 with the actual MariaDB private IP (see `infra_local.md` for real values):
 ```bash
 kubectl create secret generic db-credentials \
   -n airflow-my-namespace \
   --from-literal=DB_USER=airflow_user \
-  --from-literal=DB_PASSWORD=YOUR_DB_PASSWORD \
+  --from-literal=DB_PASSWORD=<DB_PASSWORD> \
   --from-literal=DB_NAME=database_one \
-  --from-literal=DB_HOST=172.31.23.236 \
-  --from-literal=ALPHA_VANTAGE_KEY=YOUR_ALPHA_VANTAGE_KEY \
+  --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
+  --from-literal=ALPHA_VANTAGE_KEY=<ALPHA_VANTAGE_KEY> \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Also create the same secret in the default namespace for Flask pod:
 kubectl create secret generic db-credentials \
   -n default \
   --from-literal=DB_USER=airflow_user \
-  --from-literal=DB_PASSWORD=YOUR_DB_PASSWORD \
+  --from-literal=DB_PASSWORD=<DB_PASSWORD> \
   --from-literal=DB_NAME=database_one \
-  --from-literal=DB_HOST=172.31.23.236 \
-  --from-literal=ALPHA_VANTAGE_KEY=YOUR_ALPHA_VANTAGE_KEY \
+  --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
+  --from-literal=ALPHA_VANTAGE_KEY=<ALPHA_VANTAGE_KEY> \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -629,7 +651,7 @@ Airflow is running and credentials are injected. The application tables (`stock_
 # Open SSH tunnel on your Mac:
 ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
 ```
-1. Open `http://localhost:30080` — login `admin` / `admin`
+1. Open `http://localhost:30080` — login with Airflow credentials (see `infra_local.md`)
 2. Trigger `dag_stocks` and `dag_weather` manually once each
 3. Confirm both tasks complete green (especially `load()` — that's where the DB connection happens)
 4. Open `http://localhost:32147/dashboard/` — candlestick chart should now show real OHLCV data

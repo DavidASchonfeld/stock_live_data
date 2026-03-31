@@ -2,9 +2,11 @@
 
 **Quick Navigation**
 - Looking for general debugging approach? See [DEBUGGING.md](DEBUGGING.md)
-- Need command explanations? See [COMMANDS.md](COMMANDS.md)
-- Want to understand Airflow or ETL? See [ARCHITECTURE.md](ARCHITECTURE.md)
-- Looking for term definitions? See [GLOSSARY.md](GLOSSARY.md)
+- Need command explanations? See [../reference/COMMANDS.md](../reference/COMMANDS.md)
+- Want to understand Airflow or ETL? See [../architecture/SYSTEM_OVERVIEW.md](../architecture/SYSTEM_OVERVIEW.md)
+- Looking for term definitions? See [../reference/GLOSSARY.md](../reference/GLOSSARY.md)
+- Failure mode catalog? See [../architecture/FAILURE_MODE_MAP.md](../architecture/FAILURE_MODE_MAP.md)
+- Prevention checklists? See [PREVENTION_CHECKLIST.md](PREVENTION_CHECKLIST.md)
 
 ---
 
@@ -196,6 +198,185 @@ ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
 
 ---
 
+## Issue: DAG Appears After Deploy, Then Disappears ~90 Seconds Later (Processor Cache Stale)
+
+### Symptoms
+- DAG is visible in `airflow dags list` and Airflow UI immediately after deploying
+- After ~90 seconds (exact timing varies), DAG disappears or marks `is_stale: True`
+- Only affects newly deployed DAGs, not existing ones
+- Weather/other DAGs in same folder work fine
+- Scheduler logs show DAG is parsed successfully
+- Running `airflow dags reserialize` brings it back temporarily, but it disappears again after 90s
+
+### Root Cause: Kubernetes Filesystem Cache
+
+When you deploy new DAG files to EC2 and K8s syncs them, **both Scheduler and Processor pods should see the same files**. However, on shared K8s volumes, the Processor pod may cache an old directory view:
+
+```
+Scheduler sees:   /opt/airflow/dags/dag_stocks.py    (inode 84268967, current)
+Processor sees:   /opt/airflow/dags/ (inode 142630362, from June 2025, no dag_stocks.py)
+```
+
+When Airflow's sync cycle checks if the DAG file exists, it queries the Processor's stale view and can't find it → marks DAG stale.
+
+### Diagnosis
+
+1. **Verify Scheduler can see the file**:
+   ```bash
+   kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
+     ls /opt/airflow/dags/dag_stocks.py
+   ```
+   Should show: `/opt/airflow/dags/dag_stocks.py` ✅
+
+2. **Check if Processor sees the file**:
+   ```bash
+   # Get the processor pod name
+   PROC_POD=$(kubectl get pod -l component=dag-processor -n airflow-my-namespace -o jsonpath='{.items[0].metadata.name}')
+
+   # Try to list the file
+   kubectl exec $PROC_POD -n airflow-my-namespace -- \
+     ls /opt/airflow/dags/ | grep dag_stocks
+   ```
+   If nothing returns → processor has stale cache ❌
+
+3. **Check DAG staleness status**:
+   ```bash
+   kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
+     airflow dags details Stock_Market_Pipeline | grep is_stale
+   ```
+
+### Solution: Restart Processor Pod (Clear Cache)
+
+```bash
+# Delete all processor pods
+kubectl delete pod -l component=dag-processor -n airflow-my-namespace
+
+# K8s will automatically restart them with fresh filesystem view
+# Wait 30-60 seconds for pod to restart
+sleep 60
+
+# Verify fix
+PROC_POD=$(kubectl get pod -l component=dag-processor -n airflow-my-namespace -o jsonpath='{.items[0].metadata.name}')
+kubectl exec $PROC_POD -n airflow-my-namespace -- \
+  ls /opt/airflow/dags/dag_stocks.py
+# Should now show the file ✅
+```
+
+### Prevention
+
+**When deploying new DAG files**, restart both Scheduler and Processor pods to guarantee fresh filesystem views:
+
+```bash
+# Restart Scheduler
+kubectl delete pod airflow-scheduler-0 -n airflow-my-namespace
+
+# Restart Processors
+kubectl delete pod -l component=dag-processor -n airflow-my-namespace
+
+# Wait for both to come back up
+sleep 60
+kubectl get pods -n airflow-my-namespace
+```
+
+Or, alternatively, deploy to a ConfigMap instead of a shared volume (more complex but avoids cache issues entirely).
+
+---
+
+## Issue: DAG Appears Briefly, Then Disappears from Airflow UI
+
+### Symptoms
+- DAG shows up in `airflow dags list` and Airflow UI after deploying or running `reserialize`
+- After ~1 minute (next scheduler parse cycle), DAG vanishes from UI
+- Status shows "Failed" when visible
+- But tasks may have executed successfully (Flask dashboard or database shows data)
+
+### Root Cause: Dynamic DAG Configuration
+
+The most common cause is a **dynamic `start_date`** that changes on every Airflow parse cycle:
+
+```python
+# ✗ WRONG - start_date changes every parse cycle
+start_date=pendulum.now("America/New_York").subtract(days=1)
+
+# Why it breaks:
+# - pendulum.now() evaluates at parse time (~5 second intervals)
+# - Each evaluation produces a different timestamp
+# - Airflow detects "configuration drift" and rejects DAG as invalid
+# - DAG appears → parse again → config changed → reject → disappear
+```
+
+### Solution: Use Fixed Past Date
+
+1. **Identify the problem**:
+   ```bash
+   # Check DAG's start_date in the pod:
+   ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- python3 << 'EOF'
+   import sys
+   sys.path.insert(0, '/opt/airflow/dags')
+   from dag_stocks import dag
+   print(f"start_date: {dag.start_date}")
+   EOF
+
+   # If the timestamp changes on each run, it's the dynamic start_date issue
+   ```
+
+2. **Replace dynamic date with fixed past date**:
+   ```python
+   # Change from:
+   start_date=pendulum.now("America/New_York").subtract(days=1)
+
+   # To:
+   start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York")
+   ```
+
+3. **Deploy and rediscover**:
+   ```bash
+   # Deploy fix
+   ./scripts/deploy.sh
+
+   # Force scheduler to re-parse DAGs
+   ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+     airflow dags reserialize
+   ```
+
+4. **Verify DAG is stable**:
+   ```bash
+   # Wait 35+ seconds (one parse cycle)
+   sleep 35
+
+   # Check if DAG is still visible
+   ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+     airflow dags list | grep "Stock_Market_Pipeline"
+
+   # Should show the DAG (doesn't disappear anymore)
+   ```
+
+### Why This Matters
+
+Airflow's **immutability principle** requires that a DAG's configuration stay the same across parse cycles. Dynamic values like `pendulum.now()` violate this, causing the scheduler to:
+1. Accept the DAG on first parse
+2. Detect "configuration changed" on second parse
+3. Reject it as invalid
+4. Remove it from the UI
+
+**Fixed past dates** satisfy the "must be in the past" requirement without changing on each parse.
+
+### Examples of Correct start_dates
+
+```python
+# All of these are correct (immutable):
+start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York")
+start_date=datetime(2025, 3, 29, 0, 0, 0)
+start_date=pendulum.parse("2025-03-29")
+
+# All of these are WRONG (dynamic):
+start_date=pendulum.now()                              # ✗
+start_date=pendulum.now().subtract(days=1)            # ✗
+start_date=datetime.now() - timedelta(days=1)         # ✗
+```
+
+---
+
 ## Issue: DAG Tasks Failing (Generic)
 
 ### Quick Diagnosis
@@ -215,7 +396,7 @@ ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
    ```bash
    # Test database connection
    ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
-     bash -c 'python3 -c "import socket; socket.create_connection((\"172.31.23.236\", 3306), timeout=5); print(\"✓ DB reachable\")"'
+     bash -c 'python3 -c "import socket; socket.create_connection((\"<MARIADB_PRIVATE_IP>\", 3306), timeout=5); print(\"✓ DB reachable\")"'
 
    # Test API connectivity
    ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
@@ -352,7 +533,7 @@ Host ec2-stock
    # deploy.sh handles this automatically, but you can refresh manually:
    ssh ec2-stock "
    aws ecr get-login-password --region us-west-2 \
-     | docker login --username AWS --password-stdin REDACTED_AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com
+     | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com
    "
    ```
 
@@ -389,11 +570,11 @@ ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
 
 ```bash
 # From EC2 MariaDB
-ssh ec2-stock "mariadb -u airflow_user -p'[PASSWORD]' -h 172.31.23.236 -e 'SHOW TABLES;'"
+ssh ec2-stock "mariadb -u airflow_user -p'[PASSWORD]' -h <MARIADB_PRIVATE_IP> -e 'SHOW TABLES;'"
 
 # From pod (if mariadb-client installed)
 ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
-  mariadb -u airflow_user -p'[PASSWORD]' -h 172.31.23.236 -e 'SHOW TABLES;'"
+  mariadb -u airflow_user -p'[PASSWORD]' -h <MARIADB_PRIVATE_IP> -e 'SHOW TABLES;'"
 ```
 
 ---

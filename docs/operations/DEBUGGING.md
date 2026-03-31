@@ -3,9 +3,11 @@
 A learning-oriented reference for debugging this project's stack: **K3s + Airflow + Flask on EC2**.
 
 **Quick Navigation**
-- Need to understand what `ss -tlnp`, `kubectl`, or `rsync` do? See [COMMANDS.md](COMMANDS.md)
-- Want to understand system architecture? See [ARCHITECTURE.md](ARCHITECTURE.md)
-- Looking for a specific term definition? See [GLOSSARY.md](GLOSSARY.md) (iptables, XCom, inode, etc.)
+- Need to understand what `ss -tlnp`, `kubectl`, or `rsync` do? See [../reference/COMMANDS.md](../reference/COMMANDS.md)
+- Want to understand system architecture? See [../architecture/SYSTEM_OVERVIEW.md](../architecture/SYSTEM_OVERVIEW.md)
+- Looking for a specific term definition? See [../reference/GLOSSARY.md](../reference/GLOSSARY.md) (iptables, XCom, inode, etc.)
+- Failure mode catalog? See [../architecture/FAILURE_MODE_MAP.md](../architecture/FAILURE_MODE_MAP.md)
+- Prevention checklists? See [PREVENTION_CHECKLIST.md](PREVENTION_CHECKLIST.md)
 - Need help with a specific issue? Jump to [Common Issues & Fixes](#3-common-issues--fixes)
 
 ---
@@ -200,7 +202,7 @@ First, verify/set the database password in MariaDB:
 sudo mysql -u root
 # In MariaDB:
 ALTER USER 'airflow_user'@'10.42.%' IDENTIFIED BY 'YOUR_NEW_PASSWORD';
-ALTER USER 'airflow_user'@'172.31.23.236' IDENTIFIED BY 'YOUR_NEW_PASSWORD';
+ALTER USER 'airflow_user'@'<MARIADB_PRIVATE_IP>' IDENTIFIED BY 'YOUR_NEW_PASSWORD';
 FLUSH PRIVILEGES;
 EXIT;
 ```
@@ -213,7 +215,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_USER=airflow_user \
   --from-literal=DB_PASSWORD=YOUR_NEW_PASSWORD \
   --from-literal=DB_NAME=database_one \
-  --from-literal=DB_HOST=172.31.23.236 \
+  --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
   --from-literal=ALPHA_VANTAGE_KEY=YOUR_API_KEY \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -223,7 +225,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_USER=airflow_user \
   --from-literal=DB_PASSWORD=YOUR_NEW_PASSWORD \
   --from-literal=DB_NAME=database_one \
-  --from-literal=DB_HOST=172.31.23.236 \
+  --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
   --from-literal=ALPHA_VANTAGE_KEY=YOUR_API_KEY \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -339,7 +341,7 @@ Later in Step 2c, the script tries to rsync `dashboard/manifests/` (pod-flask.ya
 # Step 1: Check if the table exists
 kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
 from sqlalchemy import create_engine, text
-engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@<MARIADB_PRIVATE_IP>/database_one')
 with engine.connect() as conn:
     result = conn.execute(text('SHOW TABLES LIKE \"weather_hourly\"'))
     print('Table exists:', bool(result.scalar()))
@@ -359,7 +361,7 @@ kubectl logs airflow-scheduler-0 -n airflow-my-namespace --tail=200 | grep -A 5 
    ```bash
    kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
    from sqlalchemy import create_engine, text
-   engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+   engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@<MARIADB_PRIVATE_IP>/database_one')
    create_table_sql = '''
    CREATE TABLE IF NOT EXISTS weather_hourly (
        id INT AUTO_INCREMENT PRIMARY KEY,
@@ -388,7 +390,7 @@ kubectl logs airflow-scheduler-0 -n airflow-my-namespace --tail=200 | grep -A 5 
   ```bash
   kubectl exec -it airflow-scheduler-0 -n airflow-my-namespace -- python3 -c "
   from sqlalchemy import create_engine, text
-  engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@172.31.23.236/database_one')
+  engine = create_engine('mysql+pymysql://airflow_user:PASSWORD@<MARIADB_PRIVATE_IP>/database_one')
   with engine.connect() as conn:
       result = conn.execute(text('SELECT * FROM weather_hourly LIMIT 1'))
       row = result.first()

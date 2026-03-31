@@ -4,6 +4,32 @@
 # Exit immediately if any command fails, unset variable is used, or pipe fails
 set -euo pipefail
 
+# ── Load deploy secrets from .env.deploy ─────────────────────────────────────
+# .env.deploy is gitignored and contains real AWS values (ECR registry, region).
+# See .env.deploy.example for the template. This keeps AWS account IDs out of git.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+ENV_DEPLOY="$PROJECT_ROOT/.env.deploy"
+
+if [ ! -f "$ENV_DEPLOY" ]; then
+    echo "ERROR: $ENV_DEPLOY not found."
+    echo "Copy .env.deploy.example to .env.deploy and fill in your AWS values."
+    echo "  cp .env.deploy.example .env.deploy"
+    exit 1
+fi
+
+# shellcheck source=../.env.deploy
+source "$ENV_DEPLOY"
+
+# Validate required variables are set (catches empty .env.deploy)
+for var in ECR_REGISTRY AWS_REGION; do
+    if [ -z "${!var:-}" ]; then
+        echo "ERROR: $var is not set in .env.deploy"
+        exit 1
+    fi
+done
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Note: SSH config for ec2-stock (including .pem key path) lives in ~/.ssh/config
 EC2_HOST="ec2-stock"
 EC2_DAG_PATH="/home/ec2-user/airflow/dags"
@@ -12,11 +38,7 @@ EC2_BUILD_PATH="/home/ec2-user/dashboard_build"
 EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
 FLASK_IMAGE="my-flask-app:latest"
 FLASK_POD="my-kuber-pod-flask"
-# ECR_REGISTRY="<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com"  # fill in your AWS account ID and region
-ECR_REGISTRY="REDACTED_AWS_ACCOUNT_ID.dkr.ecr.us-west-2.amazonaws.com"
 ECR_IMAGE="$ECR_REGISTRY/my-flask-app:latest"
-# AWS_REGION="<REGION>"  # e.g. us-east-1
-AWS_REGION="us-west-2"
 
 echo "=== Step 1: Ensuring target directories exist on EC2 ==="
 ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
@@ -165,8 +187,13 @@ ssh "$EC2_HOST" "kubectl delete pod $FLASK_POD -n default --ignore-not-found=tru
 # This is called declarative configuration — you describe WHAT you want, not HOW to build it.
 # Best practice: define all infrastructure in YAML files committed to git, so your entire
 # cluster setup is version-controlled, reviewable, and reproducible from scratch.
-# We rsync the manifest to /tmp on EC2 first because kubectl runs there and needs a local path.
-rsync -avz dashboard/manifests/pod-flask.yaml dashboard/manifests/service-flask.yaml "$EC2_HOST:/tmp/"
+# pod-flask.yaml in git contains ${ECR_REGISTRY} as a placeholder for the ECR image URI.
+# We substitute the real value from .env.deploy before applying, so the AWS account ID
+# stays out of version control. envsubst replaces ${ECR_REGISTRY} with the actual URI.
+# service-flask.yaml has no secrets, so it's applied as-is.
+ECR_REGISTRY="$ECR_REGISTRY" envsubst '${ECR_REGISTRY}' < dashboard/manifests/pod-flask.yaml > /tmp/pod-flask-rendered.yaml
+rsync -avz /tmp/pod-flask-rendered.yaml "$EC2_HOST:/tmp/pod-flask.yaml"
+rsync -avz dashboard/manifests/service-flask.yaml "$EC2_HOST:/tmp/"
 ssh "$EC2_HOST" "kubectl apply -f /tmp/service-flask.yaml && kubectl apply -f /tmp/pod-flask.yaml"
 
 echo "=== Step 7: Verifying deployment ==="

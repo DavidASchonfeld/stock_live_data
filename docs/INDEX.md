@@ -1,182 +1,128 @@
 # Documentation Index
 
-Complete navigation guide for all project documentation. Start with your goal, then follow the links.
+Complete navigation guide for all project documentation.
 
 ---
 
-## 🚀 Getting Started
+## Quick Start
 
-**New to this project?**
-
-1. **README.md** (in root) — Quick overview, architecture summary, links to all guides
-2. **OVERVIEW.md** (in root) — Comprehensive setup guide; read this before deploying
-3. **ARCHITECTURE.md** — Understand why K3S, how Kubernetes works, how data flows
+1. **README.md** (project root) — Overview and entry point
+2. **OVERVIEW.md** (project root) — Setup guide, read before deploying
+3. **[architecture/SYSTEM_OVERVIEW.md](architecture/SYSTEM_OVERVIEW.md)** — How K3s, Airflow, MariaDB, and Flask connect
 
 ---
 
-## 📚 Understanding the System
+## Architecture (How the system works and fails)
 
-### Conceptual Guides
-- **ARCHITECTURE.md** — Deep dive into:
-  - Why K3S (cost efficiency, lightweight Kubernetes)
-  - Docker vs containerd (container runtimes)
-  - Kubernetes concepts (Pods, Services, PersistentVolumes)
-  - Your ETL pipeline (extract → transform → load)
-  - How Airflow, MariaDB, and Flask connect
-
-### Glossary & Reference
-- **GLOSSARY.md** — Define technical terms:
-  - Abbreviations: SMA, ETL, DAG, PV, PVC, K3S, etc.
-  - Tools: Kubernetes, Helm, containerd, Docker, MariaDB
-  - Concepts: Namespaces, NodePorts, health probes, etc.
-
-- **COMMANDS.md** — Understand cryptic shell commands:
-  - `ss -tlnp` — Port/socket debugging
-  - `rsync -avz` — File synchronization
-  - `kubectl get pods -w` — Real-time pod monitoring
-  - Docker build/push workflow
-
-- **KUBECTL_COMMANDS.md** — Complete Kubernetes CLI reference
+| Document | What it covers |
+|----------|---------------|
+| [SYSTEM_OVERVIEW.md](architecture/SYSTEM_OVERVIEW.md) | K3s, containerd, pods, services, PVs, ETL data flow, Helm |
+| [FAILURE_MODE_MAP.md](architecture/FAILURE_MODE_MAP.md) | Top 5 failure modes per component, symptoms, root causes, blast radius |
+| [COMPONENT_INTERACTIONS.md](architecture/COMPONENT_INTERACTIONS.md) | Dependency graph, blast radius analysis, cascade failure chains |
+| [DATA_FLOW.md](architecture/DATA_FLOW.md) | Validation gates at each pipeline stage, XCom transport risks |
 
 ---
 
-## 🔧 Operations & Troubleshooting
+## Operations (Running and maintaining the system)
 
-### Debugging
-- **DEBUGGING.md** — Systematic debugging approach:
-  - Mental model of the system
-  - Common issue categories (A–I)
-  - Diagnostic sequences
-  - Pod crash troubleshooting
-  - API error resolution
-
-- **TROUBLESHOOTING.md** — Solutions to specific problems:
-  - DAG discovery issues
-  - Module-level variable problems
-  - Airflow UI access issues
-
-### Infrastructure & Deployment
-- **ECR_SETUP.md** — AWS Elastic Container Registry:
-  - One-time ECR configuration
-  - Docker image push workflow
-  - Authentication to ECR from EC2
-
-- **COMMANDS.md** (referenced above) — Command reference for debugging and ops
+| Document | What it covers |
+|----------|---------------|
+| [RUNBOOKS.md](operations/RUNBOOKS.md) | Step-by-step playbooks: deploy, add DAG, rotate secrets, rollback, recover |
+| [PREVENTION_CHECKLIST.md](operations/PREVENTION_CHECKLIST.md) | Pre-deploy, post-deploy, weekly health, DAG authoring checklists |
+| [DEBUGGING.md](operations/DEBUGGING.md) | Systematic debugging approach, diagnostic sequences, common issues A-K |
+| [TROUBLESHOOTING.md](operations/TROUBLESHOOTING.md) | Specific issue solutions: DAG discovery, PV mismatch, staleness, deploy failures |
 
 ---
 
-## 📋 Incidents & History
+## Infrastructure (K3s, AWS, storage)
 
-- **FIXES_AIRFLOW_2026-03-30.md** — Airflow pod failures analysis:
-  - Root cause: PostgreSQL image, values.yaml config, DB credentials
-  - Resolution steps
-
-- **STATUS_2026-03-30.md** — Operational snapshot as of 2026-03-30:
-  - What was deployed
-  - Known issues
-  - Next steps
-
-- **CHANGELOG.md** — All fixes and changes over time
+| Document | What it covers |
+|----------|---------------|
+| [K3S_RISKS.md](infrastructure/K3S_RISKS.md) | Single-node tradeoffs, containerd vs Docker, Helm state, resource contention, security |
+| [PERSISTENCE.md](infrastructure/PERSISTENCE.md) | PV/PVC deep dive: hostPath risks, filesystem cache, reclaim policy, debugging |
+| [ECR_SETUP.md](infrastructure/ECR_SETUP.md) | AWS ECR configuration, image push workflow, authentication |
+| [refactor-ecr-migration.md](infrastructure/refactor-ecr-migration.md) | Why containerd + ECR replaced Docker mode |
 
 ---
 
-## 🏗️ Architecture & Infrastructure Files
+## Reference (Commands, terms, tools)
 
-**In project root (Git-tracked):**
-- `airflow/manifests/` — Kubernetes manifests for Airflow
-  - `pv-dags.yaml` — PersistentVolume for DAG files
-  - Helm values for Airflow deployment
-
-- `dashboard/manifests/` — Flask + Dash pod configuration
-  - `pod-flask.yaml` — Pod definition
-
-- `airflow/dags/` — Your ETL workflows
-  - `dag_stocks.py` — Stock data pipeline
-  - `dag_weather.py` — Weather data pipeline
-
-- `scripts/` — Extraction scripts
-  - `stock_client.py` — Fetch from Alpha Vantage API
-  - `weather_client.py` — Fetch from Open-Meteo API
-
-**In project root (NOT Git-tracked):**
-- `infra_local.md` — Local EC2 secrets and IP restrictions (gitignored)
+| Document | What it covers |
+|----------|---------------|
+| [COMMANDS.md](reference/COMMANDS.md) | Shell command explanations: ss, rsync, kubectl, docker |
+| [KUBECTL_COMMANDS.md](reference/KUBECTL_COMMANDS.md) | Kubernetes CLI reference |
+| [GLOSSARY.md](reference/GLOSSARY.md) | Technical terms: SMA, ETL, DAG, PV, PVC, K3S, XCom, etc. |
 
 ---
 
-## 🎯 Common Questions
+## Incidents (Historical record)
 
-### "What is K3S and why do we use it?"
-→ [ARCHITECTURE.md](ARCHITECTURE.md#why-k3s)
-
-### "What is a PersistentVolume?"
-→ [GLOSSARY.md](GLOSSARY.md#persistentvolume-pv) or [ARCHITECTURE.md](ARCHITECTURE.md#persistentvolumes-pv-and-persistentvolumeclaims-pvc)
-
-### "How do Docker, containerd, and Kubernetes relate?"
-→ [ARCHITECTURE.md](ARCHITECTURE.md#container-runtime-docker-vs-containerd)
-
-### "How does my data flow through the system?"
-→ [ARCHITECTURE.md](ARCHITECTURE.md#etl-data-flow-extract-transform-load)
-
-### "What does `ss -tlnp` show? Why don't NodePorts appear?"
-→ [COMMANDS.md](COMMANDS.md#ss--tlnp)
-
-### "How do I debug a pod crash?"
-→ [DEBUGGING.md](DEBUGGING.md)
-
-### "How do I connect to EC2 or run commands on it?"
-→ [COMMANDS.md](COMMANDS.md#ssh-remote-access) or [DEBUGGING.md](DEBUGGING.md)
-
-### "How do I push a Docker image to ECR?"
-→ [ECR_SETUP.md](ECR_SETUP.md)
-
-### "What Kubernetes commands do I need to know?"
-→ [KUBECTL_COMMANDS.md](KUBECTL_COMMANDS.md) or [COMMANDS.md](COMMANDS.md#kubernetes-operations)
-
-### "What was that incident with Airflow? What happened?"
-→ [FIXES_AIRFLOW_2026-03-30.md](FIXES_AIRFLOW_2026-03-30.md)
+| Document | What it covers |
+|----------|---------------|
+| [CHANGELOG.md](incidents/CHANGELOG.md) | All fixes and changes over time |
+| [2026-03-31/](incidents/2026-03-31/) | Stock DAG disappearance: config drift, processor cache staleness, root cause analysis |
+| [2026-03-30/](incidents/2026-03-30/) | Airflow infra fixes: PostgreSQL image deletion, PV path mismatch, DB credential injection |
 
 ---
 
-## 📖 Documentation Organization
+## File Tree
 
 ```
-stock_live_data/
-├── README.md                   ← START HERE (entry point)
-├── OVERVIEW.md                 ← Comprehensive setup guide
-├── infra_local.md              ← Secrets (gitignored)
+docs/
+├── INDEX.md                          ← You are here
 │
-└── docs/
-    ├── INDEX.md                ← You are here
-    ├── ARCHITECTURE.md         ← System design & concepts
-    ├── GLOSSARY.md             ← Definitions & terms
-    ├── COMMANDS.md             ← Command reference
-    ├── DEBUGGING.md            ← Systematic troubleshooting
-    ├── TROUBLESHOOTING.md      ← Specific solutions
-    ├── ECR_SETUP.md            ← AWS image registry
-    ├── FIXES_AIRFLOW_2026-03-30.md ← Incident analysis
-    ├── STATUS_2026-03-30.md    ← Operational snapshot
-    ├── CHANGELOG.md            ← History of changes
-    ├── KUBECTL_COMMANDS.md     ← Kubernetes CLI reference
-    └── refactor-ecr-migration.md ← Why we changed container setup
+├── architecture/
+│   ├── SYSTEM_OVERVIEW.md            ← System design & concepts (was ARCHITECTURE.md)
+│   ├── FAILURE_MODE_MAP.md           ← Proactive failure catalog
+│   ├── COMPONENT_INTERACTIONS.md     ← Dependency graph & cascade failures
+│   └── DATA_FLOW.md                  ← Validation gates per pipeline stage
+│
+├── operations/
+│   ├── RUNBOOKS.md                   ← Step-by-step operational playbooks
+│   ├── PREVENTION_CHECKLIST.md       ← Checklists for deploy, infra, secrets
+│   ├── DEBUGGING.md                  ← Systematic debugging approach
+│   └── TROUBLESHOOTING.md           ← Specific issue solutions
+│
+├── infrastructure/
+│   ├── K3S_RISKS.md                  ← Hidden K3s complexity
+│   ├── PERSISTENCE.md               ← PV/PVC deep dive
+│   ├── ECR_SETUP.md                  ← AWS ECR setup
+│   └── refactor-ecr-migration.md     ← ECR migration rationale
+│
+├── reference/
+│   ├── COMMANDS.md                   ← Shell command reference
+│   ├── KUBECTL_COMMANDS.md           ← Kubernetes CLI reference
+│   └── GLOSSARY.md                   ← Technical terms
+│
+└── incidents/
+    ├── CHANGELOG.md                  ← History of all changes
+    ├── 2026-03-30/
+    │   ├── FIXES_AIRFLOW.md          ← PostgreSQL + PV + secrets incident
+    │   └── STATUS.md                 ← Operational snapshot
+    └── 2026-03-31/
+        ├── INVESTIGATION.md          ← Stock DAG persistence investigation
+        ├── ROOT_CAUSE.md             ← Root cause analysis
+        ├── STATUS.md                 ← Operational snapshot
+        └── SESSION_SUMMARY.md        ← Full session summary
 ```
 
 ---
 
-## 🔗 Cross-References
+## Common Questions
 
-Each documentation file includes a "Quick Navigation" section at the top with links to related guides. Use these to jump between related topics.
+| Question | Go to |
+|----------|-------|
+| "What is K3S and why do we use it?" | [architecture/SYSTEM_OVERVIEW.md](architecture/SYSTEM_OVERVIEW.md#why-k3s) |
+| "What can go wrong with my pipeline?" | [architecture/FAILURE_MODE_MAP.md](architecture/FAILURE_MODE_MAP.md) |
+| "If MariaDB goes down, what else breaks?" | [architecture/COMPONENT_INTERACTIONS.md](architecture/COMPONENT_INTERACTIONS.md) |
+| "Where should I validate data?" | [architecture/DATA_FLOW.md](architecture/DATA_FLOW.md) |
+| "How do I deploy code changes?" | [operations/RUNBOOKS.md](operations/RUNBOOKS.md#1-deploy-code-changes) |
+| "What should I check before deploying?" | [operations/PREVENTION_CHECKLIST.md](operations/PREVENTION_CHECKLIST.md) |
+| "Something broke, how do I debug it?" | [operations/DEBUGGING.md](operations/DEBUGGING.md) |
+| "What are the hidden risks of K3s?" | [infrastructure/K3S_RISKS.md](infrastructure/K3S_RISKS.md) |
+| "How do PersistentVolumes actually work?" | [infrastructure/PERSISTENCE.md](infrastructure/PERSISTENCE.md) |
+| "What happened on 2026-03-31?" | [incidents/2026-03-31/](incidents/2026-03-31/) |
 
 ---
 
-## 📝 Contributing to Documentation
-
-When adding documentation:
-1. Use clear section headings (H2, H3)
-2. Add code examples where helpful
-3. Link to related guides
-4. Define abbreviations in [GLOSSARY.md](GLOSSARY.md)
-5. Reference [COMMANDS.md](COMMANDS.md) for command examples
-
----
-
-**Last updated:** 2026-03-30
+**Last updated:** 2026-03-31

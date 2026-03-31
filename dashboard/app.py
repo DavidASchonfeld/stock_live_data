@@ -39,7 +39,7 @@ load_dotenv()
 SQL_USERNAME = os.environ.get("DB_USER",     "airflow_user")
 SQL_PASSWORD = os.environ.get("DB_PASSWORD", "")
 SQL_DATABASE = os.environ.get("DB_NAME",     "database_one")
-SQL_URL      = os.environ.get("DB_HOST",     "172.31.23.236")
+SQL_URL      = os.environ.get("DB_HOST",     "")
 
 DB_ENGINE = create_engine(
     f"mysql+pymysql://{SQL_USERNAME}:{SQL_PASSWORD}@{SQL_URL}/{SQL_DATABASE}"
