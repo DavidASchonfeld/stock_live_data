@@ -296,6 +296,36 @@ In your project, Helm is used to deploy Airflow with various configurations (ima
 
 ---
 
+## Alerting & Monitoring
+
+The pipeline includes an alerting layer that notifies you when things go wrong or data goes stale.
+
+### How It Works
+
+**Failure/Retry Alerts** — Both data DAGs (`Stock_Market_Pipeline`, `API_Weather-Pull_Data`) have Airflow callbacks (`on_failure_callback`, `on_retry_callback`) that fire when a task fails or retries. These callbacks log to the PVC and send a Slack message via webhook.
+
+**Data Staleness Monitor** — A separate DAG (`Data_Staleness_Monitor`) runs every 30 minutes, queries `MAX(filed_date)` and `MAX(imported_at)` from the data tables, and alerts if data exceeds freshness thresholds (168h for financials, 2h for weather).
+
+**Notification Channels:**
+- **Slack webhook** (primary) — Slack is a messaging app (install at slack.com); a "webhook" is a secret URL Slack gives you that, when your pipeline POSTs a message to it, delivers that message to a Slack channel on your phone or Mac. Configured via `SLACK_WEBHOOK_URL` env var / K8s Secret. See [Runbook #12](../operations/RUNBOOKS.md#12-configure-slack-alerting).
+- **Log-only fallback** — when no webhook URL is set (the default), alerts are printed to stdout + PVC log files; no external account needed
+
+> **Current status (as of 2026-03-31):** A Slack webhook URL was generated and the alerting code is fully wired up, but it has **not been connected to a Slack account or workspace**. The system is currently in **log-only mode** — no Slack notifications are actively being received.
+
+**Vacation Mode Integration:**
+- Failure/retry callbacks **always fire** — if a DAG somehow fails during vacation mode (instead of being cleanly skipped), that indicates vacation mode is broken, which you'd want to know about
+- The staleness monitor **respects vacation mode** — calls `check_vacation_mode()` before checking, since stale data is expected when pipelines are paused
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `airflow/dags/alerting.py` | Core module: callbacks, staleness checker, Slack sender |
+| `airflow/dags/alert_config.py` | Configuration: webhook URL, staleness thresholds (gitignored) |
+| `airflow/dags/dag_staleness_check.py` | Staleness monitoring DAG (runs every 30 min) |
+
+---
+
 ## Summary: How It All Connects
 
 1. **EC2 Instance** runs K3S (lightweight Kubernetes)
@@ -308,6 +338,7 @@ In your project, Helm is used to deploy Airflow with various configurations (ima
 8. **Flask pod** reads from MariaDB and exposes a REST API
 9. **Dash** in the browser consumes the Flask API and visualizes stock/weather data
 10. **PersistentVolumes** ensure data survives pod crashes and restarts
+11. **Alerting** notifies you via Slack (or logs) when tasks fail, retry, or data goes stale
 
 All components communicate via **Kubernetes Services** (internal networking) and **NodePorts** (external access to the Airflow UI and Flask API).
 

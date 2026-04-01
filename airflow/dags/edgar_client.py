@@ -1,5 +1,6 @@
 # Python Libraries
 import json
+import os
 import time
 import threading
 from typing import Any
@@ -26,8 +27,11 @@ import requests
 # Docs: https://www.sec.gov/search-filings/edgar-application-programming-interfaces
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Contact email for SEC User-Agent — loaded from env so it stays out of git history
+EDGAR_CONTACT_EMAIL = os.environ.get("EDGAR_CONTACT_EMAIL", "contact@stocklivedata.dev")
+
 # SEC requires a descriptive User-Agent so they can contact you if your script misbehaves
-EDGAR_USER_AGENT = "StockLiveData Portfolio Project contact@stocklivedata.dev"
+EDGAR_USER_AGENT = f"StockLiveData Portfolio Project {EDGAR_CONTACT_EMAIL}"
 
 # Base URLs for the two SEC EDGAR endpoints we use
 EDGAR_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"

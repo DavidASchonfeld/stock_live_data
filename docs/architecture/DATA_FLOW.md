@@ -66,7 +66,7 @@ Gate 1 Checklist:
 
 **On failure:** Raise an exception with a clear message identifying which check failed and including relevant response details (status code, first 200 chars of body). Do NOT return partial or error data downstream.
 
-**Current state:** Stock DAG validates response structure (checks for `facts` and `us-gaap` keys). Rate limiting handled by `RateLimiter` class in `edgar_client.py` (8 req/sec, token-bucket). Weather DAG needs the same treatment.
+**Current state:** Stock DAG validates response structure (checks for `facts` and `us-gaap` keys). Rate limiting handled by `RateLimiter` class in `edgar_client.py` (8 req/sec, token-bucket). SEC User-Agent contact email loaded from `EDGAR_CONTACT_EMAIL` env var (K8s `db-credentials` secret). Weather DAG needs the same treatment.
 
 ---
 
@@ -280,6 +280,20 @@ Based on risk (likelihood x impact) and current gaps:
 | 3 | Gate 3 (Load) | Duplicate detection + post-insert row count | Duplicate data or silent zero inserts |
 | 4 | Gate 5 (Serve) | Freshness indicator in API response | Users see stale data without knowing it |
 | 5 | Gate 4 (Storage) | Periodic health check (extend validate_database.py) | Slow-burn issues undetected |
+
+---
+
+## Alerting Layer
+
+Failures at any gate now trigger notifications via `alerting.py`:
+
+- **Task failure** → `on_failure_alert` callback fires → Slack message + PVC log (red circle)
+- **Task retry** → `on_retry_alert` callback fires → Slack message + PVC log (yellow circle)
+- **Data staleness** → `dag_staleness_check.py` runs every 30 min → queries `MAX(filed_date)` and `MAX(imported_at)` → alerts if data exceeds freshness thresholds
+
+When no `SLACK_WEBHOOK_URL` is configured, all alerts fall back to log-only mode (stdout + PVC files). See [RUNBOOKS.md: Configure Slack Alerting](../operations/RUNBOOKS.md#12-configure-slack-alerting) for setup.
+
+> **Current status (as of 2026-03-31):** A Slack webhook URL was generated and the alerting code is fully wired up, but it has **not been connected to a Slack account or workspace**. The system is currently in **log-only mode** — no Slack notifications are actively being received.
 
 ---
 

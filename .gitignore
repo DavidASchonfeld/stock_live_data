@@ -1,4 +1,5 @@
 api_key.py
+alert_config.py
 db_config.py
 notes.txt
 constants.py

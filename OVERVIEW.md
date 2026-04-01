@@ -36,13 +36,13 @@ AWS EC2 t3.xlarge  (Elastic IP <YOUR_EC2_IP>)
     │
     ├── Pod 1: Apache Airflow
     │     DAG: Stock_Market_Pipeline
-    │       extract() → transform() → load()   [Alpha Vantage daily OHLCV]
+    │       extract() → transform() → load()   [SEC EDGAR XBRL financials]
     │     DAG: API_Weather-Pull_Data
     │       extract() → transform() → load()   [Open-Meteo hourly temp]
     │           │ SQLAlchemy/pymysql
     │           ▼
     ├── MariaDB (<MARIADB_PRIVATE_IP> / database_one)
-    │     ├── stock_daily_prices
+    │     ├── company_financials
     │     └── weather_hourly
     │           │ SQLAlchemy query
     │           ▼
@@ -73,7 +73,7 @@ AWS EC2 t3.xlarge  (Elastic IP <YOUR_EC2_IP>)
 | Containerization | Docker (python:3.12-slim) + AWS ECR (private image registry) |
 | Kubernetes | K3S (lightweight K8s, default containerd runtime) |
 | Cloud | AWS EC2 t3.xlarge, 100 GiB EBS gp3 |
-| Stock API | Alpha Vantage (TIME_SERIES_DAILY, 25 calls/day free) |
+| Stock / Financials API | SEC EDGAR XBRL (free U.S. government data — no API key, no rate cap) |
 | Weather API | Open-Meteo (free, no key required) |
 | Helm | Used for Airflow deployment on K3S |
 | Planned | Snowflake (data warehouse), Apache Kafka (streaming) |
@@ -95,12 +95,13 @@ stock_live_data/
 │
 ├── airflow/
 │   ├── dags/                            # Airflow DAG files — mounted into pods via PVC
-│   │   ├── dag_stocks.py                # Main DAG: Alpha Vantage daily OHLCV → MariaDB
+│   │   ├── dag_stocks.py                # Main DAG: SEC EDGAR XBRL financials → MariaDB
 │   │   ├── dag_weather.py               # Secondary DAG: Open-Meteo hourly temp → MariaDB
-│   │   ├── stock_client.py              # Alpha Vantage API client (request + flatten)
+│   │   ├── edgar_client.py              # SEC EDGAR API client (RateLimiter, CIK resolution, XBRL parsing)
+│   │   ├── stock_client.py              # Thin re-export layer pointing to edgar_client.py
 │   │   ├── weather_client.py            # Open-Meteo API client (free, no key needed)
 │   │   ├── file_logger.py               # OutputTextWriter: logs to PVC + stdout
-│   │   ├── api_key.py                   # API keys (NOT committed — gitignored)
+│   │   ├── api_key.py                   # Legacy file — no longer used (SEC EDGAR needs no API key); gitignored
 │   │   ├── db_config.py                 # DB credentials from env vars (NOT committed — gitignored)
 │   │   └── constants.py                 # Local dev log path constant (NOT committed — gitignored)
 │   ├── manifests/                       # Kubernetes resource definitions for Airflow
@@ -156,7 +157,7 @@ A **namespace** is Kubernetes' way of logically partitioning a cluster into isol
 | `pv-dags` / `pvc-dags` | PersistentVolume + Claim | `airflow/manifests/pv-dags.yaml`, `pvc-dags.yaml` |
 | `pv-airflow-logs` / `pvc-airflow-logs` | PersistentVolume + Claim | `airflow/manifests/pv-airflow-logs.yaml`, `pvc-airflow-logs.yaml` |
 | `pv-output-logs` / `pvc-output-logs` | PersistentVolume + Claim | `airflow/manifests/pv-output-logs.yaml`, `pvc-output-logs.yaml` |
-| `db-credentials` | Secret | Created via `kubectl create secret` on EC2 (not a YAML file — contains DB password, API key) |
+| `db-credentials` | Secret | Created via `kubectl create secret` on EC2 (not a YAML file — contains `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_NAME`, `EDGAR_CONTACT_EMAIL`) |
 
 **`default`** — managed manually with `kubectl apply`
 
@@ -202,13 +203,18 @@ EXIT;
 
 ### 2. Create secret files (never commit these)
 
-Both files are in `.gitignore` and must be created locally — they are **never pushed to the public repo**.
+These files are in `.gitignore` and must be created locally — they are **never pushed to the public repo**.
 
-**`airflow/dags/api_key.py`** — 3rd-party API keys:
-```python
-class api_keys:
-    alpha_vantage = {"key": "YOUR_ALPHA_VANTAGE_KEY"}  # 25 free calls/day
-    open_weather   = {"key": "YOUR_OPEN_WEATHER_KEY"}
+**`.env`** — all local secrets in one place *(at `stock_live_data/.env`)*:
+```bash
+DB_USER=airflow_user
+DB_PASSWORD=YOUR_DB_PASSWORD
+DB_NAME=database_one
+DB_HOST=localhost
+
+# SEC EDGAR User-Agent contact email — loaded by edgar_client.py via os.environ
+# Production: also add this key to the K8s db-credentials secret (see Runbook #3)
+EDGAR_CONTACT_EMAIL=your.email@gmail.com
 ```
 
 **`airflow/dags/db_config.py`** — database credentials
@@ -219,6 +225,8 @@ DB_PASSWORD = "YOUR_DB_PASSWORD"   # password you chose in step 1
 ```
 
 The DAG files and `flask_main.py` import `DB_USER` and `DB_PASSWORD` from `db_config` when building the SQLAlchemy connection string.
+
+> **Note on `api_key.py`:** SEC EDGAR requires no API key — `api_key.py` is a legacy file from the Alpha Vantage era. It is still gitignored but no longer needed for normal operation.
 
 ### 3. Create local `db_config.py` with database credentials
 
@@ -236,13 +244,9 @@ SQL_URL = "localhost"   # for dev mode
 # Production will use the MariaDB private IP from the db-credentials Kubernetes Secret
 ```
 
-### 4. Create local `api_key.py` with API keys
+### 4. `api_key.py` (legacy — no longer required)
 
-Create this file at `airflow/dags/api_key.py` (never commit to git — it's gitignored):
-```python
-class api_keys:
-    alpha_vantage = {"key": "YOUR_ALPHA_VANTAGE_KEY"}  # 25 free calls/day
-```
+SEC EDGAR requires no API key. `api_key.py` is a leftover from the Alpha Vantage era and is still gitignored but not imported by any active code. You can skip creating it.
 
 ### 5. Update the logs path in `constants.py`
 ```python

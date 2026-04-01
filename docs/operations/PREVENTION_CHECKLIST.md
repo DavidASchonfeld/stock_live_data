@@ -128,14 +128,15 @@ When changing database passwords, API keys, or other credentials.
 - [ ] **Update credential at the source** (e.g., MariaDB `ALTER USER`)
 - [ ] **Recreate K8s Secret in `airflow-my-namespace`**
   ```bash
+  # EDGAR_CONTACT_EMAIL is required — SEC blocks requests without a valid User-Agent contact
   kubectl create secret generic db-credentials \
     -n airflow-my-namespace \
     --from-literal=DB_USER=... --from-literal=DB_PASSWORD=... \
     --from-literal=DB_NAME=... --from-literal=DB_HOST=... \
-    \
+    --from-literal=EDGAR_CONTACT_EMAIL=davedevportfolio@gmail.com \
     --dry-run=client -o yaml | kubectl apply -f -
   ```
-- [ ] **Recreate K8s Secret in `default` namespace** (same command, `-n default`)
+- [ ] **Recreate K8s Secret in `default` namespace** (same command with `-n default`, include `EDGAR_CONTACT_EMAIL`)
 - [ ] **Restart ALL pods that use the secret**
   ```bash
   # Airflow pods
@@ -164,6 +165,33 @@ When working from a new location (home, office, travel).
 - [ ] **Test SSH** — `ssh ec2-stock` connects
 - [ ] **Re-establish SSH tunnel** — `ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock`
 - [ ] **Update `infra_local.md`** — Record new IP (gitignored)
+
+---
+
+## Pre-Vacation Checklist
+
+Run this before leaving when you won't have reliable laptop access.
+
+- [ ] **Deploy latest code** — ensure `dag_utils.py` is on EC2 and in the K8s pod
+  ```bash
+  ./scripts/deploy.sh
+  ```
+- [ ] **Set `VACATION_MODE = true`** — Airflow UI → Admin → Variables → "+" → Key: `VACATION_MODE`, Value: `true`
+- [ ] **Pause `Stock_Market_Pipeline`** — Airflow UI → DAGs → toggle the switch (grayed out = paused)
+- [ ] **Pause `API_Weather-Pull_Data`** — same as above
+- [ ] **Verify both DAGs are paused**
+  ```bash
+  ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- airflow dags list
+  # Both should show paused=True
+  ```
+- [ ] **Verify the Variable is set**
+  ```bash
+  ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- airflow variables get VACATION_MODE
+  # Should print: true
+  ```
+- [ ] **Confirm no runs are currently in-flight** — Airflow UI → DAGs → check for any "running" state
+
+**To re-enable when you return:** See [Runbook #11](RUNBOOKS.md#11-enable--disable-vacation-mode).
 
 ---
 

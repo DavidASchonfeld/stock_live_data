@@ -21,6 +21,8 @@ Step-by-step playbooks for common operations. Each runbook is a complete procedu
 8. [Change Working Location (IP Update)](#8-change-working-location-ip-update)
 9. [Investigate Stale Data](#9-investigate-stale-data)
 10. [Add a New API Data Source](#10-add-a-new-api-data-source)
+11. [Enable / Disable Vacation Mode](#11-enable--disable-vacation-mode)
+12. [Configure Slack Alerting](#12-configure-slack-alerting)
 
 ---
 
@@ -136,13 +138,14 @@ FLUSH PRIVILEGES;
 EXIT;
 
 # 2. Update K8s Secret in airflow namespace
+# Note: EDGAR_CONTACT_EMAIL is also stored here (kept out of git)
 kubectl create secret generic db-credentials \
   -n airflow-my-namespace \
   --from-literal=DB_USER=airflow_user \
   --from-literal=DB_PASSWORD=NEW_PASSWORD_HERE \
   --from-literal=DB_NAME=database_one \
   --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
-  \
+  --from-literal=EDGAR_CONTACT_EMAIL=davedevportfolio@gmail.com \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 3. Update K8s Secret in default namespace (for Flask)
@@ -152,7 +155,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_PASSWORD=NEW_PASSWORD_HERE \
   --from-literal=DB_NAME=database_one \
   --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
-  \
+  --from-literal=EDGAR_CONTACT_EMAIL=davedevportfolio@gmail.com \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 4. Restart ALL pods (secrets don't hot-reload)
@@ -487,6 +490,190 @@ ssh ec2-stock kubectl logs airflow-scheduler-0 -n airflow-my-namespace --tail=10
    - Add Flask endpoint to query new table
    - Add Dash visualization
    - Update Flask image (Runbook #7)
+
+---
+
+---
+
+## 11. Enable / Disable Vacation Mode
+
+**When:** You're leaving and want to stop all DAGs from calling external APIs, or you're back and want to resume normal operation.
+
+### Two-layer protection
+
+| Layer | Mechanism | Where to set | Survives DB wipe? |
+|-------|-----------|--------------|-------------------|
+| Primary | Airflow native **pause** | Airflow UI toggle | No |
+| Guard | `VACATION_MODE` **Airflow Variable** | Admin → Variables | Yes (in code) |
+
+Always enable **both** for maximum safety.
+
+### Enable vacation mode (before leaving)
+
+```bash
+# Step 1 — Set the Airflow Variable (no SSH needed; use the UI)
+# Airflow UI → Admin → Variables → "+" button
+# Key: VACATION_MODE
+# Value: true
+
+# Step 2 — Pause both DAGs in the Airflow UI
+# Airflow UI → DAGs list → click the toggle left of each DAG name
+# Stock_Market_Pipeline   → paused (grayed out)
+# API_Weather-Pull_Data   → paused (grayed out)
+
+# Step 3 — Verify (optional, via SSH tunnel)
+ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  airflow dags list
+# Both DAGs should show paused=True
+
+# Step 4 — Verify the Variable is set
+ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  airflow variables get VACATION_MODE
+# Should print: true
+```
+
+**What happens when enabled:** Any scheduled run that starts will reach `extract()`, call `check_vacation_mode()`, and raise `AirflowSkipException`. The task (and all downstream tasks) are marked **Skipped** — not Failed. No API calls are made. No DB writes happen.
+
+### Test that vacation mode is working
+
+After enabling, verify the skip cascade fires correctly before you leave:
+
+```bash
+# Trigger a manual run on any DAG
+# Airflow UI → Stock_Market_Pipeline → Trigger DAG ▶
+# (or via CLI)
+ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  airflow dags trigger Stock_Market_Pipeline
+```
+
+**Expected result in the Airflow UI task grid:**
+- `extract` → **Skipped** (pink badge)
+- `transform` → **Skipped** (pink badge)
+- `load` → **Skipped** (pink badge)
+- Overall run status → **Success** (green — skipped runs still count as success)
+
+If any task shows **Failed** instead of **Skipped**, vacation mode is not working — check that the Variable value is exactly `true` (lowercase, no spaces).
+
+---
+
+### Disable vacation mode (when you return)
+
+```bash
+# Step 1 — Update the Airflow Variable
+# Airflow UI → Admin → Variables → click VACATION_MODE → change value to false
+# (or delete the variable entirely — missing variable defaults to "false")
+
+# Step 2 — Unpause both DAGs
+# Airflow UI → DAGs list → click the toggle to unpause each DAG
+
+# Step 3 — Trigger a manual run to confirm everything is working
+ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  airflow dags trigger Stock_Market_Pipeline
+ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  airflow dags trigger API_Weather-Pull_Data
+```
+
+**Success criteria:** Both manual runs complete with `state: success`, new rows appear in `company_financials` and `weather_hourly`.
+
+---
+
+## 12. Configure Slack Alerting
+
+> **Current status (as of 2026-03-31):** A Slack webhook URL has been generated and the alerting infrastructure is fully built, but it has **not been connected to a Slack account or workspace**. The system is currently running in **log-only mode** — no Slack notifications are actively being received. Follow this runbook when you're ready to activate live notifications.
+
+**When:** Setting up Slack notifications for DAG failures, retries, and data staleness.
+
+**Prerequisites:**
+- A Slack workspace you control
+- Permission to create Slack apps / incoming webhooks
+
+### Create Slack Webhook
+
+1. Go to https://api.slack.com/apps → **Create New App** → **From scratch**
+2. Name it (e.g., "Stock Pipeline Alerts"), select your workspace
+3. **Incoming Webhooks** → toggle **On** → **Add New Webhook to Workspace**
+4. Choose the channel for alerts → **Allow**
+5. Copy the webhook URL (looks like `https://hooks.slack.com/services/T.../B.../xxx`)
+
+### Configure Locally (development)
+
+```bash
+# Add to your .env file at the repo root
+echo 'SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T.../B.../xxx' >> .env
+```
+
+Without `SLACK_WEBHOOK_URL`, alerting runs in **log-only mode** — alerts are printed to stdout and PVC log files but not sent to Slack.
+
+### Configure in Kubernetes (production)
+
+```bash
+# Update the db-credentials secret to include the webhook URL
+# (same secret that stores DB_USER, DB_PASSWORD, etc.)
+ssh ec2-stock
+kubectl create secret generic db-credentials \
+  -n airflow-my-namespace \
+  --from-literal=DB_USER=airflow_user \
+  --from-literal=DB_PASSWORD=<DB_PASSWORD> \
+  --from-literal=DB_NAME=database_one \
+  --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
+  --from-literal=EDGAR_CONTACT_EMAIL=davedevportfolio@gmail.com \
+  --from-literal=SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T.../B.../xxx \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart Airflow pods to pick up the new secret value
+kubectl delete pod airflow-scheduler-0 -n airflow-my-namespace
+kubectl delete pod -l component=dag-processor -n airflow-my-namespace
+
+# Wait for pods to restart
+sleep 60
+kubectl get pods -n airflow-my-namespace
+```
+
+### Test the Alert
+
+```bash
+# Trigger a manual DAG run that will fail (e.g., temporarily break DB credentials)
+# Or just check Slack channel after a natural failure/retry occurs
+
+# To test log-only mode, leave SLACK_WEBHOOK_URL empty and check PVC logs:
+ssh ec2-stock cat /home/ec2-user/airflow/dag-mylogs/*.txt | grep "ALERT"
+```
+
+### Adjust Staleness Thresholds
+
+Set these environment variables (in `.env` locally, or in the K8s secret for production):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `STALENESS_THRESHOLD_HOURS_STOCKS` | 168 (7 days) | Alert if `company_financials` has no data newer than this |
+| `STALENESS_THRESHOLD_HOURS_WEATHER` | 2 | Alert if `weather_hourly` has no data newer than this |
+
+### Adjust Alert Cooldown
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ALERT_COOLDOWN_MINUTES` | 60 | Minimum minutes between repeated alerts for the same DAG+task or stale table |
+
+With DAGs running every 5 minutes, the default 60-minute cooldown means at most 1 alert per hour per failure, instead of 12+.
+
+**Alert state is stored as Airflow Variables** with keys prefixed `alert_last_sent:` — visible and editable under Admin → Variables.
+
+- `alert_last_sent:<dag_id>:<task_id>` — task failure/retry cooldown
+- `alert_last_sent:staleness:company_financials` — staleness cooldown
+- `alert_last_sent:staleness:weather_hourly` — staleness cooldown
+
+**To immediately re-arm alerts** (e.g., after investigating an issue and wanting the next failure to notify you again): delete the relevant Variable in Admin → Variables.
+
+> Note: "Alert suppressed" ≠ "Alert broken" — if you expected a Slack message and didn't get one, check Admin → Variables for a recent `alert_last_sent:*` timestamp before assuming the webhook is down.
+
+**Recovery notifications:** When a failing task succeeds again, a single `:green_circle: Task Recovered` message is sent automatically and the cooldown state is cleared.
+
+### Vacation Mode Behavior
+
+- **Failure/retry alerts always fire** — if a DAG fails during vacation instead of cleanly skipping, that means vacation mode is broken
+- **Staleness alerts are silenced** during vacation mode — stale data is expected when pipelines are paused
+
+**Success criteria:** Slack message appears in your channel when a DAG task fails or retries, or when data exceeds the staleness threshold.
 
 ---
 

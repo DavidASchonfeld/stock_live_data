@@ -19,6 +19,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from weather_client import sendRequest_openMeteo  # renamed from api_weather_requests
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
+from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
+from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
 
 # Validate required environment variables are available (fail fast if Kubernetes secrets not injected)
@@ -61,9 +63,9 @@ if _missing_secrets:
         # 'end_date': datetime(2016, 1, 1),
         # 'wait_for_downstream': False,
         # 'execution_timeout': timedelta(seconds=300),
-        # 'on_failure_callback': some_function, # or list of functions
-        # 'on_success_callback': some_other_function, # or list of functions
-        # 'on_retry_callback': another_function, # or list of functions
+        'on_failure_callback': on_failure_alert,  # Slack + PVC log on task failure
+        'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
+        'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
         # 'sla_miss_callback': yet_another_function, # or list of functions
         # 'on_skipped_callback': another_function, #or list of functions
         # 'trigger_rule': 'all_success'
@@ -99,6 +101,9 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         ### Extract:
         Pull information from Meteo Website
         """
+
+        # Halt this task (and downstream transform/load) if vacation mode is active
+        check_vacation_mode()
 
         dictGotten : dict = sendRequest_openMeteo(inLatitude=40, inLongitude=40, inFarenheit=True)
         print(dictGotten)

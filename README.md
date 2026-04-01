@@ -18,15 +18,15 @@ AWS EC2 t3.xlarge
 └── K3S Kubernetes
     │
     ├── Pod 1: Apache Airflow 3.1.8 (Helm, LocalExecutor)
-    │     DAG: dag_stocks    — Alpha Vantage daily OHLCV → MariaDB
-    │     DAG: dag_weather   — Open-Meteo hourly temp  → MariaDB
+    │     DAG: dag_stocks    — SEC EDGAR XBRL financials → MariaDB
+    │     DAG: dag_weather   — Open-Meteo hourly temp    → MariaDB
     │
     ├── Pod 2: Flask + Dash (NodePort 32147)
     │     /dashboard/ — candlestick chart, volume, stats table
     │     /health     — Kubernetes liveness probe
     │
     └── MariaDB (EC2, outside K8s)
-          ├── stock_daily_prices
+          ├── company_financials
           └── weather_hourly
 ```
 

@@ -394,11 +394,91 @@ Your EC2 only allows SSH from one IP address (for security). When you're at a ne
 
 ---
 
-## Part 7: The Big Picture
+## Part 7: Alerting — Getting Notified When Things Break
+
+### What is alerting?
+
+When a pipeline task fails or your data goes stale, the system now sends you a notification. Without alerting, you'd only find out something was broken when you manually opened the Airflow UI or checked the dashboard — which could be hours or days later.
+
+### How it works
+
+When a task fails, your pipeline automatically calls a function (`on_failure_alert`) that:
+1. Writes the failure to the PVC log file (always)
+2. Sends a message to Slack (if you set up a webhook URL)
+
+A separate monitoring DAG (`Data_Staleness_Monitor`) runs every 30 minutes. It checks how old the latest data is in each table and alerts you if data hasn't been updated in too long.
+
+### Preventing notification spam (cooldown)
+
+Your DAGs run every 5 minutes. Without any protection, a single broken task could send you 12+ Slack messages per hour — one for every failed run. That's alert fatigue: so many notifications that you start ignoring them.
+
+**The cooldown system works like a "don't call me again for an hour" rule:**
+
+- The first time a task fails → you get a Slack message immediately
+- If that same task fails again within 60 minutes → the message is suppressed (logged but not sent to Slack)
+- When the task finally succeeds again → you get one `:green_circle: Task Recovered` message, then the clock resets
+
+**The same rule applies to retries.** When Airflow retries a failing task, it would normally send both a "failure" and a "retry" message. Now it only sends the first one — the retry message is suppressed once you've already been told about the failure.
+
+**And for the staleness check** — if your weather data stays stale for 2 hours, you get one alert. Not one every 30 minutes for as long as the problem lasts. When the data recovers, you get one `:green_circle: Staleness Resolved` message.
+
+**How it stores state:** The cooldown timer is saved as an Airflow Variable (the same system that stores vacation mode). You can see these variables in the Airflow UI under Admin → Variables — they look like `alert_last_sent:Stock_Market_Pipeline:extract`. If you want to be notified again immediately (e.g., after fixing a problem and wanting to confirm the fix works), just delete that variable from the UI.
+
+### What is Slack?
+
+**Slack is a messaging app** — like iMessage or WhatsApp but designed for teams. You install it on your Mac or phone, create a free account (at slack.com), and it gives you channels (chat rooms). When your pipeline fails, a message pops up in your Slack channel like any other notification.
+
+**You do not need to provide your email address to receive alerts.** Slack is its own system with its own login. Alerts are not sent via email.
+
+**Slack is not a terminal tool.** You receive messages in the Slack app on your phone or Mac desktop.
+
+### What is a Slack webhook?
+
+A **webhook** is a secret URL that Slack gives you. When your pipeline sends an HTTP POST request to that URL with a message, Slack delivers that message to a channel. That's the entire mechanism:
+
+```
+Pipeline task fails
+    ↓
+Python: POST "Task Failed!" to https://hooks.slack.com/services/T.../...
+    ↓
+Slack receives it and shows it in your #alerts channel
+    ↓
+Notification appears on your phone/Mac like any Slack message
+```
+
+No email involved. No terminal. Just a pop-up notification in the Slack app.
+
+### Do you need to set up Slack?
+
+No — it's optional. Without any configuration, the alerting system runs in **log-only mode**:
+- Failures are still logged to the PVC files on EC2
+- You just won't get a phone/desktop notification
+
+To get actual push notifications, you need to set up Slack (free account + webhook URL) and add the URL to your `.env` file locally and to the Kubernetes Secret in production. See [RUNBOOKS.md Runbook #12](operations/RUNBOOKS.md#12-configure-slack-alerting) for the step-by-step setup.
+
+> **Current status (as of 2026-03-31):** A Slack webhook URL was generated and the alerting infrastructure is fully built, but it has **not been connected to a Slack account or workspace**. The system is currently running in **log-only mode** — all alerts write to PVC log files only. No Slack notifications are actively being received.
+
+### Vacation mode and alerts
+
+If you have vacation mode enabled:
+- **Failure/retry alerts still fire** — if a DAG somehow fails during vacation instead of cleanly skipping, that means vacation mode is broken, which is worth knowing
+- **Staleness alerts are silenced** — the staleness monitor sees `VACATION_MODE=true` and skips its check entirely; stale data is expected when you've intentionally paused the pipelines
+
+### New files added for alerting
+
+| File | Plain English |
+|------|--------------|
+| `airflow/dags/alerting.py` | The module that sends alerts — handles Slack, PVC logging, and staleness checking |
+| `airflow/dags/alert_config.py` | Your private config: webhook URL and staleness thresholds (gitignored, never committed) |
+| `airflow/dags/dag_staleness_check.py` | A new DAG that runs every 30 minutes and checks if your data is fresh |
+
+---
+
+## Part 8: The Big Picture
 
 Here's what your project does, start to finish, in one paragraph:
 
-**Every 5 minutes**, Airflow (running inside a pod on your EC2 server) wakes up and runs your Stock pipeline. The pipeline calls SEC EDGAR (a free U.S. government API) and asks for financial data about Apple, Microsoft, and Google — things like revenue, net income, and total assets from their annual SEC filings. It takes the messy, deeply nested response and flattens it into clean rows. Then it writes those rows into a MariaDB database (running directly on EC2, not in a pod). Meanwhile, the Weather pipeline does the same thing with weather data from Open-Meteo. Your Flask website (running in its own pod) reads from MariaDB and shows the data on a dashboard that you can view in your browser through an SSH tunnel.
+**Every 5 minutes**, Airflow (running inside a pod on your EC2 server) wakes up and runs your Stock pipeline. The pipeline calls SEC EDGAR (a free U.S. government API) and asks for financial data about Apple, Microsoft, and Google — things like revenue, net income, and total assets from their annual SEC filings. It takes the messy, deeply nested response and flattens it into clean rows. Then it writes those rows into a MariaDB database (running directly on EC2, not in a pod). Meanwhile, the Weather pipeline does the same thing with weather data from Open-Meteo. Your Flask website (running in its own pod) reads from MariaDB and shows the data on a dashboard that you can view in your browser through an SSH tunnel. **Every 30 minutes**, a separate monitoring DAG checks how fresh the data is — if it's too old, it sends a Slack notification (or logs a warning if Slack isn't configured). If any pipeline task fails or retries, you're notified — once per hour per broken task, not on every single failed run — and when things recover, you get a green ":white_check_mark: Recovered" message.
 
 ---
 

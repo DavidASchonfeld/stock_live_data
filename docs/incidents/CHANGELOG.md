@@ -2,6 +2,50 @@
 
 ---
 
+## 2026-03-31: Vacation Mode — DAG Kill Switch ✅
+
+**What Changed**: Added a two-layer mechanism to safely disable all DAGs while away without laptop access.
+
+**Layer 1 — Airflow native pause** (primary): Toggle the pause switch on each DAG in the Airflow UI. Pause state persists in the metadata DB across pod restarts.
+
+**Layer 2 — `VACATION_MODE` Airflow Variable** (belt-and-suspenders): Both DAG `extract()` tasks now call `check_vacation_mode()` from the new `dag_utils.py`. If the `VACATION_MODE` Airflow Variable is set to `"true"`, the task raises `AirflowSkipException`, skipping the API call and all downstream tasks without failing the run. Changeable from the Airflow UI (Admin → Variables) with no SSH or kubectl required.
+
+**Why two layers?** Pause state lives in the Airflow metadata DB; if the DB were ever wiped/restored, pauses reset to unpaused. The Variable check is a code-level guard that survives any metadata DB state.
+
+**Files Created**:
+- `airflow/dags/dag_utils.py` — `check_vacation_mode()` shared utility
+
+**Files Modified**:
+- `airflow/dags/dag_stocks.py` — Added `from dag_utils import check_vacation_mode`; call at top of `extract()`
+- `airflow/dags/dag_weather.py` — Same
+- `docs/operations/RUNBOOKS.md` — Added Runbook #11: Vacation Mode
+- `docs/operations/PREVENTION_CHECKLIST.md` — Added pre-vacation checklist
+
+**How to enable before leaving**:
+1. Airflow UI → Admin → Variables → "+" → `VACATION_MODE = true`
+2. Airflow UI → DAGs → pause `Stock_Market_Pipeline`
+3. Airflow UI → DAGs → pause `API_Weather-Pull_Data`
+
+**How to disable when back**:
+1. Airflow UI → Admin → Variables → set `VACATION_MODE = false` (or delete it)
+2. Unpause both DAGs
+
+---
+
+## 2026-03-31: EDGAR Contact Email → Environment Variable ✅
+
+**What Changed**: Replaced the hardcoded placeholder email in `edgar_client.py`'s SEC User-Agent string with an environment variable (`EDGAR_CONTACT_EMAIL`), keeping the real email out of git history.
+
+**Why**: SEC EDGAR requires a real contact email in the User-Agent header. A dedicated Gmail was created for this purpose (`davedevportfolio@gmail.com`). Storing it in code would commit PII to git history permanently.
+
+**Files Modified**:
+- `airflow/dags/edgar_client.py` — Added `import os`; `EDGAR_USER_AGENT` now built from `os.environ.get("EDGAR_CONTACT_EMAIL", ...)` fallback
+- `.env` — Added `EDGAR_CONTACT_EMAIL=...` (gitignored; local dev)
+
+**Production deployment**: Add `EDGAR_CONTACT_EMAIL` to the `db-credentials` K8s secret (see Runbook #3). The Helm `extraEnvFrom` already injects that secret into all Airflow pods.
+
+---
+
 ## 2026-03-31: Alpha Vantage → SEC EDGAR Migration — COMPLETE ✅
 
 **What Changed**: Migrated the Stock_Market_Pipeline data source from Alpha Vantage (OHLCV stock prices) to SEC EDGAR (XBRL company financials). Also updated both DAG schedules to 5-minute intervals and added automatic pod restart to `deploy.sh` to prevent stale DAG cache issues.

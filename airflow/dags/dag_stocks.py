@@ -19,6 +19,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from stock_client import resolve_cik, fetch_company_facts, flatten_company_financials  # re-exported from edgar_client.py
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
+from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
+from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
 
 # Validate required environment variables are available (fail fast if Kubernetes secrets not injected)
@@ -68,9 +70,9 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]
         # 'end_date': datetime(2016, 1, 1),
         # 'wait_for_downstream': False,
         # 'execution_timeout': timedelta(seconds=300),
-        # 'on_failure_callback': some_function, # or list of functions
-        # 'on_success_callback': some_other_function, # or list of functions
-        # 'on_retry_callback': another_function, # or list of functions
+        'on_failure_callback': on_failure_alert,  # Slack + PVC log on task failure
+        'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
+        'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
         # 'sla_miss_callback': yet_another_function, # or list of functions
         # 'on_skipped_callback': another_function, #or list of functions
         # 'trigger_rule': 'all_success'
@@ -115,6 +117,9 @@ def stock_market_pipeline():
         Fetch raw XBRL financial data for each ticker from SEC EDGAR.
         Returns a list of raw API responses (one dict per ticker).
         """
+
+        # Halt this task (and downstream transform/load) if vacation mode is active
+        check_vacation_mode()
 
         # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
