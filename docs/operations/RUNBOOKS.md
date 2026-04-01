@@ -142,7 +142,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_PASSWORD=NEW_PASSWORD_HERE \
   --from-literal=DB_NAME=database_one \
   --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
-  --from-literal=ALPHA_VANTAGE_KEY=YOUR_API_KEY \
+  \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 3. Update K8s Secret in default namespace (for Flask)
@@ -152,7 +152,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_PASSWORD=NEW_PASSWORD_HERE \
   --from-literal=DB_NAME=database_one \
   --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
-  --from-literal=ALPHA_VANTAGE_KEY=YOUR_API_KEY \
+  \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # 4. Restart ALL pods (secrets don't hot-reload)
@@ -272,7 +272,7 @@ from sqlalchemy import create_engine, text
 import os
 engine = create_engine(f'mysql+pymysql://{os.environ[\"DB_USER\"]}:{os.environ[\"DB_PASSWORD\"]}@{os.environ[\"DB_HOST\"]}/{os.environ[\"DB_NAME\"]}')
 with engine.connect() as c:
-    for t in ['stock_daily_prices','weather_hourly']:
+    for t in ['company_financials','weather_hourly']:
         r = c.execute(text(f'SELECT COUNT(*) FROM {t}')).scalar()
         print(f'{t}: {r} rows')
 "
@@ -305,8 +305,8 @@ from sqlalchemy import create_engine, text
 import os
 engine = create_engine(f'mysql+pymysql://{os.environ[\"DB_USER\"]}:{os.environ[\"DB_PASSWORD\"]}@{os.environ[\"DB_HOST\"]}/{os.environ[\"DB_NAME\"]}')
 with engine.connect() as c:
-    r = c.execute(text('SELECT MAX(date) FROM stock_daily_prices')).scalar()
-    print(f'Latest stock data: {r}')
+    r = c.execute(text('SELECT MAX(filed_date) FROM company_financials')).scalar()
+    print(f'Latest financials data: {r}')
     r = c.execute(text('SELECT MAX(time) FROM weather_hourly')).scalar()
     print(f'Latest weather data: {r}')
 "
@@ -314,9 +314,9 @@ with engine.connect() as c:
 # 2a. For Stock data — trigger with specific execution date
 ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
   airflow dags trigger -e '2026-03-30' Stock_Market_Pipeline
-# Note: Alpha Vantage returns historical data, so one trigger
-# fetches recent daily data regardless of execution date.
-# Rate limit: 25 calls/day — plan backfills carefully.
+# Note: SEC EDGAR returns ALL historical financial data in one call,
+# so one trigger fetches everything. No daily rate limit concern
+# (RateLimiter handles per-second throttling automatically).
 
 # 2b. For Weather data — trigger
 ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
@@ -423,9 +423,10 @@ from sqlalchemy import create_engine, text
 import os
 engine = create_engine(f'mysql+pymysql://{os.environ[\"DB_USER\"]}:{os.environ[\"DB_PASSWORD\"]}@{os.environ[\"DB_HOST\"]}/{os.environ[\"DB_NAME\"]}')
 with engine.connect() as c:
-    for t in ['stock_daily_prices','weather_hourly']:
-        r = c.execute(text(f'SELECT MAX(imported_at) FROM {t}')).scalar()
-        print(f'{t}: last import = {r}')
+    r = c.execute(text('SELECT MAX(filed_date) FROM company_financials')).scalar()
+    print(f'company_financials: latest filed = {r}')
+    r = c.execute(text('SELECT MAX(imported_at) FROM weather_hourly')).scalar()
+    print(f'weather_hourly: latest import = {r}')
 "
 
 # 2. Check if DAGs are paused

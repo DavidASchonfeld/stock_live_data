@@ -70,7 +70,7 @@ if _missing_secrets:
         # [END default_args]
     },
     description="Pulling weather info from Meteo Weather API",
-    schedule=timedelta(minutes=0, hours = 1, days=0),  # This DAG will run every 1 hour
+    schedule=timedelta(minutes=5),  # Short interval for development/demo — increase for production
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
     start_date=pendulum.datetime(2025, 6, 8, 0, 0, tz="America/New_York"),
     # Note: start_date has to be in the past if you want it to run today/later

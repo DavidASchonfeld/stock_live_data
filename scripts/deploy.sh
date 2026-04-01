@@ -196,7 +196,31 @@ rsync -avz /tmp/pod-flask-rendered.yaml "$EC2_HOST:/tmp/pod-flask.yaml"
 rsync -avz dashboard/manifests/service-flask.yaml "$EC2_HOST:/tmp/"
 ssh "$EC2_HOST" "kubectl apply -f /tmp/service-flask.yaml && kubectl apply -f /tmp/pod-flask.yaml"
 
-echo "=== Step 7: Verifying deployment ==="
+echo "=== Step 7: Restarting Airflow pods to prevent stale DAG cache ==="
+# WHY this step is needed:
+#   When new DAG files are synced to EC2, K8s pods may retain a stale filesystem cache
+#   of /opt/airflow/dags/. The DAG Processor pod in particular can see old directory
+#   listings even though the files are updated on disk. This causes Airflow to mark newly
+#   deployed DAGs as is_stale=True and remove them from the UI after ~90 seconds.
+#
+#   Restarting both Scheduler and Processor pods forces K8s to remount the volume with a
+#   fresh filesystem view. This is the proven fix from the 2026-03-31 staleness incident.
+ssh "$EC2_HOST" "
+    echo 'Restarting Scheduler pod...' &&
+    kubectl delete pod airflow-scheduler-0 -n airflow-my-namespace --ignore-not-found=true &&
+    echo 'Restarting DAG Processor pod(s)...' &&
+    kubectl delete pod -l component=dag-processor -n airflow-my-namespace --ignore-not-found=true &&
+    echo 'Waiting 60s for pods to restart...' &&
+    sleep 60 &&
+    echo 'Verifying DAGs are visible...' &&
+    kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- airflow dags list
+" || {
+    echo ""
+    echo "WARNING: Airflow pod restart or DAG verification failed. Check manually."
+    ssh "$EC2_HOST" "kubectl get pods -n airflow-my-namespace"
+}
+
+echo "=== Step 8: Verifying deployment ==="
 # Wait up to 90s for the Flask pod to reach Running/Ready, then print all pod statuses.
 # WHY kubectl wait instead of kubectl get:
 #   The pod is created in Step 6 but starts Pending while K3S pulls the ECR image (~15-60s).

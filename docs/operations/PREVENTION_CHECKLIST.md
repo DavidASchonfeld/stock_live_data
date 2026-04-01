@@ -132,7 +132,7 @@ When changing database passwords, API keys, or other credentials.
     -n airflow-my-namespace \
     --from-literal=DB_USER=... --from-literal=DB_PASSWORD=... \
     --from-literal=DB_NAME=... --from-literal=DB_HOST=... \
-    --from-literal=ALPHA_VANTAGE_KEY=... \
+    \
     --dry-run=client -o yaml | kubectl apply -f -
   ```
 - [ ] **Recreate K8s Secret in `default` namespace** (same command, `-n default`)
@@ -181,9 +181,10 @@ Run this weekly to catch slow-burn issues before they become incidents.
   import os
   engine = create_engine(f'mysql+pymysql://{os.environ[\"DB_USER\"]}:{os.environ[\"DB_PASSWORD\"]}@{os.environ[\"DB_HOST\"]}/{os.environ[\"DB_NAME\"]}')
   with engine.connect() as c:
-      for t in ['stock_daily_prices','weather_hourly']:
-          r = c.execute(text(f'SELECT MAX(imported_at) FROM {t}')).scalar()
-          print(f'{t}: latest = {r}')
+      r = c.execute(text('SELECT MAX(filed_date) FROM company_financials')).scalar()
+      print(f'company_financials: latest filed = {r}')
+      r = c.execute(text('SELECT MAX(imported_at) FROM weather_hourly')).scalar()
+      print(f'weather_hourly: latest import = {r}')
   \""
   ```
 - [ ] **DAGs unpaused and scheduled** — `airflow dags list` shows `paused=False`, `next_dagrun` set

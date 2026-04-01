@@ -46,7 +46,7 @@ How components in this system depend on each other, where failures cascade betwe
           │ calls
     ┌─────▼────────┐
     │ External APIs │
-    │ - Alpha Vant. │
+    │ - SEC EDGAR │
     │ - Open-Meteo  │
     └──────────────┘
 ```
@@ -232,7 +232,7 @@ Database password rotated
 ### Chain 4: Rate Limit → Unvalidated Response → Data Corruption
 
 ```
-Alpha Vantage rate limit exceeded
+SEC EDGAR rate limit exceeded
   → API returns {"Note": "Thank you for using..."} with HTTP 200
   → Extract task doesn't validate response body
     → Returns rate-limit message as "data"

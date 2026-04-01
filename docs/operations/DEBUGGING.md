@@ -216,7 +216,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_PASSWORD=YOUR_NEW_PASSWORD \
   --from-literal=DB_NAME=database_one \
   --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
-  --from-literal=ALPHA_VANTAGE_KEY=YOUR_API_KEY \
+  \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Also create it in the default namespace for Flask pod:
@@ -226,7 +226,7 @@ kubectl create secret generic db-credentials \
   --from-literal=DB_PASSWORD=YOUR_NEW_PASSWORD \
   --from-literal=DB_NAME=database_one \
   --from-literal=DB_HOST=<MARIADB_PRIVATE_IP> \
-  --from-literal=ALPHA_VANTAGE_KEY=YOUR_API_KEY \
+  \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Then restart Airflow pods so they pick up the updated secret
@@ -266,7 +266,7 @@ extraEnvFrom: |
 
 ### G. Dashboard shows empty charts / errors
 
-**Cause:** The `stock_daily_prices` table doesn't exist yet — both DAGs create it automatically via `CREATE TABLE IF NOT EXISTS` on the first successful `load()` run.
+**Cause:** The `company_financials` table doesn't exist yet — both DAGs create it automatically via `CREATE TABLE IF NOT EXISTS` on the first successful `load()` run.
 
 **Fix:** Trigger both DAGs successfully (Issue D above), then reload the dashboard.
 

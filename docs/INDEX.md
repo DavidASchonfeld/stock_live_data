@@ -6,9 +6,10 @@ Complete navigation guide for all project documentation.
 
 ## Quick Start
 
-1. **README.md** (project root) — Overview and entry point
-2. **OVERVIEW.md** (project root) — Setup guide, read before deploying
-3. **[architecture/SYSTEM_OVERVIEW.md](architecture/SYSTEM_OVERVIEW.md)** — How K3s, Airflow, MariaDB, and Flask connect
+1. **[PLAIN_ENGLISH_GUIDE.md](PLAIN_ENGLISH_GUIDE.md)** — Non-technical explanation of how everything works, where code lives, how pods work, and what past bugs were
+2. **README.md** (project root) — Overview and entry point
+3. **OVERVIEW.md** (project root) — Setup guide, read before deploying
+4. **[architecture/SYSTEM_OVERVIEW.md](architecture/SYSTEM_OVERVIEW.md)** — How K3s, Airflow, MariaDB, and Flask connect
 
 ---
 

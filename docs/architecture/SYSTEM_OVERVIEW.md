@@ -144,8 +144,8 @@ Your system implements a classic **ETL pipeline** (Extract → Transform → Loa
 ```
                          ┌─────────────────────┐
                          │  External APIs      │
-                         │ - Alpha Vantage     │
-                         │   (stock data)      │
+                         │ - SEC EDGAR         │
+                         │   (company finan.)  │
                          │ - Open-Meteo        │
                          │   (weather data)    │
                          └──────────┬──────────┘
@@ -173,7 +173,7 @@ Your system implements a classic **ETL pipeline** (Extract → Transform → Loa
                                     │
                          ┌──────────▼──────────┐
                          │   MariaDB (MySQL)   │
-                         │  - stocks table      │
+                         │  - financials table  │
                          │  - weather table     │
                          └──────────┬──────────┘
                                     │
@@ -194,7 +194,7 @@ Your system implements a classic **ETL pipeline** (Extract → Transform → Loa
 **Location:** `stock_live_data/scripts/stock_client.py` and `weather_client.py`
 
 Your extraction scripts call external APIs:
-- **stock_client.py:** Calls Alpha Vantage API (`GET https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=...`)
+- **stock_client.py → edgar_client.py:** Calls SEC EDGAR XBRL API (`GET https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json`)
 - **weather_client.py:** Calls Open-Meteo API (`GET https://api.open-meteo.com/v1/forecast?...`)
 
 Result: Raw JSON responses from APIs.
@@ -212,20 +212,26 @@ Airflow DAG tasks receive the raw JSON and:
 
 **Example:**
 ```python
-# Raw JSON from Alpha Vantage
+# Raw JSON from SEC EDGAR (nested XBRL structure)
 raw_json = {
-    "Time Series": {
-        "2026-03-30": {"1. open": "100.00", "2. close": "102.50", ...},
-        "2026-03-29": {...}
+    "cik": 320193,
+    "entityName": "Apple Inc.",
+    "facts": {
+        "us-gaap": {
+            "NetIncomeLoss": {
+                "units": { "USD": [{"end": "2023-09-30", "val": 96995000000, ...}] }
+            }
+        }
     }
 }
 
-# After json_normalize() + transformation
+# After flatten_company_financials() transformation
 df = pd.DataFrame({
-    "date": ["2026-03-30", "2026-03-29"],
-    "open": [100.00, 99.50],
-    "close": [102.50, 101.00],
-    "sma_20": [101.25, 100.75]  # Simple Moving Average calculated
+    "ticker": ["AAPL", "AAPL"],
+    "metric": ["NetIncomeLoss", "Assets"],
+    "period_end": ["2023-09-30", "2023-09-30"],
+    "value": [96995000000, 352583000000],
+    "form_type": ["10-K", "10-K"],
 })
 ```
 
@@ -235,10 +241,10 @@ df = pd.DataFrame({
 
 The transformed DataFrame is written to MariaDB:
 ```python
-df.to_sql("stocks", connection, if_exists="append", index=False)
+df.to_sql("company_financials", connection, if_exists="replace", index=False)
 ```
 
-This inserts rows into the MariaDB `stocks` table. Airflow schedules this to run daily (or on your configured interval).
+This replaces the `company_financials` table in MariaDB with fresh data from SEC EDGAR. Airflow schedules this to run every 5 minutes (configurable).
 
 ---
 
@@ -295,7 +301,7 @@ In your project, Helm is used to deploy Airflow with various configurations (ima
 1. **EC2 Instance** runs K3S (lightweight Kubernetes)
 2. **K3S pods** run containerd, which executes Docker images pulled from AWS ECR
 3. **Airflow pod** schedules your ETL DAGs (extract, transform, load)
-4. **Extract scripts** call external APIs (Alpha Vantage, Open-Meteo)
+4. **Extract scripts** call external APIs (SEC EDGAR XBRL for financials, Open-Meteo for weather)
 5. **Transform phase** normalizes JSON with pandas
 6. **Load phase** writes DataFrames to MariaDB
 7. **MariaDB pod** persists data on a PersistentVolume

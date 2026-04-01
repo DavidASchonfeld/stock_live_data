@@ -2,6 +2,38 @@
 
 ---
 
+## 2026-03-31: Alpha Vantage → SEC EDGAR Migration — COMPLETE ✅
+
+**What Changed**: Migrated the Stock_Market_Pipeline data source from Alpha Vantage (OHLCV stock prices) to SEC EDGAR (XBRL company financials). Also updated both DAG schedules to 5-minute intervals and added automatic pod restart to `deploy.sh` to prevent stale DAG cache issues.
+
+**Why**:
+- Alpha Vantage free tier (25 calls/day) caused rate-limit errors
+- Finnhub and other stock price APIs restrict public display on free tiers (blocking portfolio projects)
+- SEC EDGAR is U.S. government public domain data — no API key, no daily limit, no display restrictions
+- Parsing XBRL filings is more impressive for a Data Engineer portfolio than simple OHLCV prices
+
+**Files Created**:
+- `airflow/dags/edgar_client.py` — SEC EDGAR API client with `RateLimiter` class (token-bucket, 8 req/sec), CIK resolution with caching, XBRL response parsing
+
+**Files Modified**:
+- `airflow/dags/stock_client.py` — Replaced Alpha Vantage functions with thin re-export layer pointing to `edgar_client.py`
+- `airflow/dags/dag_stocks.py` — Updated extract/transform/load for EDGAR data; schedule changed to 5 minutes; table changed from `stock_daily_prices` (append) to `company_financials` (replace); removed `api_key` import
+- `airflow/dags/dag_weather.py` — Schedule changed from 1 hour to 5 minutes
+- `airflow/dags/validate_database.py` — Updated expected schema from `stock_daily_prices` to `company_financials` (12 columns)
+- `scripts/deploy.sh` — Added Step 7: automatic Scheduler + Processor pod restart after deploy (prevents 90s staleness)
+- All docs updated to reflect SEC EDGAR, `company_financials` table, and new architecture
+
+**Data Now Extracted** (10 financial metrics from 10-K annual filings):
+Revenue, Net Income, EPS (Diluted), Total Assets, Total Liabilities, Stockholders Equity, Operating Income, Gross Profit, Cash & Equivalents, R&D Expense
+
+**Verification**:
+- ✅ All 3 tickers (AAPL, MSFT, GOOGL) fetch successfully from SEC EDGAR
+- ✅ deploy.sh completes all steps including pod restart
+- ✅ Both DAGs visible and unpaused in `airflow dags list`
+- ✅ Flask pod running
+
+---
+
 ## 2026-03-31: Stock DAG 90-Second Staleness — FIXED ✅
 
 **Problem**: After the dynamic `start_date` fix, Stock DAG appeared in Airflow UI and remained stable initially. However, after deploying files to K8s, the DAG would appear then disappear after ~90 seconds with `is_stale: True`. Weather DAG in the same folder was unaffected.

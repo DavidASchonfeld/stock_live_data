@@ -16,9 +16,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
-from stock_client import sendRequest_alphavantage_daily, flatten_daily_timeseries  # renamed from api_stock_requests
+from stock_client import resolve_cik, fetch_company_facts, flatten_company_financials  # re-exported from edgar_client.py
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
-from api_key import api_keys  # api_key.py is in .gitignore — never commit secrets
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
 
 
@@ -47,7 +46,8 @@ if _missing_secrets:
 
 
 # ── Tickers to track ─────────────────────────────────────────────────────────
-# 3 tickers × 1 call each = 3 of our 25 free Alpha Vantage calls per day
+# 3 tickers × 2 API calls each (CIK lookup + companyfacts) = 6 calls total
+# SEC EDGAR allows 10 requests/second with no daily limit — no quota concern
 TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -76,25 +76,27 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]
         # 'trigger_rule': 'all_success'
         # [END default_args]
     },
-    description="Daily stock market pipeline: Alpha Vantage → MariaDB (→ Snowflake in Step 2)",
-    schedule=timedelta(days=1),  # run once per day — matches market data cadence
+    description="Company financials pipeline: SEC EDGAR XBRL → MariaDB (→ Snowflake in Step 2)",
+    schedule=timedelta(minutes=5),  # Short interval for development/demo — increase for production
     # start_date must be in the past for Airflow to schedule the first run immediately
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
     start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York"),
-    # catchup=False: without this, Airflow would try to run one instance per day
-    # starting from start_date until today, creating dozens of queued runs on
-    # first deploy. We skip that because Alpha Vantage "compact" already returns
-    # the last 100 days in the very first successful run.
+    # catchup=False: without this, Airflow would try to run one instance per week
+    # starting from start_date until today, creating many queued runs on first deploy.
+    # We skip that because SEC EDGAR companyfacts already returns all historical data
+    # in the very first successful run.
     catchup=False,  # don't backfill historical runs when DAG is first deployed
-    tags=["stocks", "alpha_vantage", "mariadb", "portfolio"]
+    tags=["stocks", "sec_edgar", "financials", "mariadb", "portfolio"]
 )
 def stock_market_pipeline():
     """
-    ### Stock Market Data Pipeline
+    ### Company Financials Data Pipeline
 
-    Pulls daily OHLCV (Open, High, Low, Close, Volume) data for a list of
-    tickers from Alpha Vantage, flattens the nested JSON into a tabular
-    format, and loads it into MariaDB.
+    Pulls financial data (revenue, net income, EPS, assets, etc.) for a list
+    of tickers from SEC EDGAR's XBRL API, flattens the nested XBRL JSON into
+    a tabular format, and loads it into MariaDB.
+
+    Data source: SEC EDGAR (U.S. government, public domain, no API key needed)
 
     #### Pipeline stages:
     extract()  →  transform()  →  load()
@@ -110,7 +112,7 @@ def stock_market_pipeline():
     def extract() -> list[dict[str, Any]]:
         """
         ### Extract
-        Fetch raw daily OHLCV data for each ticker from Alpha Vantage.
+        Fetch raw XBRL financial data for each ticker from SEC EDGAR.
         Returns a list of raw API responses (one dict per ticker).
         """
 
@@ -121,31 +123,29 @@ def stock_market_pipeline():
         # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
         # which would cause issues.
 
-        # Guard: with 1 retry per ticker, max safe tickers = floor(25 / 2) = 12
-        assert len(TICKERS) <= 12, (
-            f"Too many tickers ({len(TICKERS)}). "
-            "Alpha Vantage free tier allows 25 calls/day; "
-            "with 1 retry per ticker the safe ceiling is 12 tickers."
-        )
-
         results: list[dict[str, Any]] = []
 
         for ticker in TICKERS:
-            writer.print(f"Fetching: {ticker}")
-            raw_response = sendRequest_alphavantage_daily(
-                symbol=ticker,
-                api_key=api_keys.alpha_vantage["key"],
-                outputsize="compact",  # last 100 trading days — saves API quota
-            )
+            writer.print(f"Resolving CIK for: {ticker}")
+            # SEC EDGAR uses CIK numbers, not ticker symbols — resolve_cik() handles the mapping
+            cik = resolve_cik(ticker)
+            writer.print(f"  CIK: {cik}")
+
+            writer.print(f"Fetching company facts for: {ticker}")
+            # fetch_company_facts() calls SEC EDGAR's XBRL API with built-in rate limiting
+            raw_response = fetch_company_facts(cik)
+
             # Validate response structure before storing (fail fast on API failures)
-            if not raw_response or "Time Series (Daily)" not in raw_response:
-                raise ValueError(f"Invalid API response for {ticker}: missing 'Time Series (Daily)' field")
-            if not raw_response.get("Time Series (Daily)"):
-                raise ValueError(f"No data returned for {ticker} from Alpha Vantage")
+            if not raw_response or "facts" not in raw_response:
+                raise ValueError(f"Invalid API response for {ticker} (CIK {cik}): missing 'facts' key")
+            if "us-gaap" not in raw_response.get("facts", {}):
+                raise ValueError(f"No US-GAAP data for {ticker} (CIK {cik}) — company may use IFRS")
+
             # Store ticker alongside its raw response so transform() knows which symbol it belongs to
-            results.append({"ticker": ticker, "raw": raw_response})
-            writer.print(f"  ✓ {ticker}: {len(raw_response.get('Time Series (Daily)', {}))} days received")
-            time.sleep(1)  # Alpha Vantage free tier requires minimum 1 second between requests
+            results.append({"ticker": ticker, "cik": cik, "raw": raw_response})
+            # Count how many US-GAAP concepts were returned for logging visibility
+            gaap_count = len(raw_response["facts"]["us-gaap"])
+            writer.print(f"  ✓ {ticker}: {gaap_count} US-GAAP concepts received")
 
         return results
 
@@ -154,11 +154,13 @@ def stock_market_pipeline():
     def transform(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
         ### Transform
-        Flatten each ticker's nested JSON time-series into a list of row-dicts.
-        One row per ticker per trading day.
+        Flatten each ticker's nested XBRL JSON into a list of row-dicts.
+        One row per ticker per financial metric per reporting period.
 
-        Input shape  (from extract):  [{ "ticker": "AAPL", "raw": { ... } }, ...]
-        Output shape (to load):       [{ "ticker", "date", "open", "high", "low", "close", "volume" }, ...]
+        Input shape  (from extract):  [{ "ticker": "AAPL", "cik": "...", "raw": { ... } }, ...]
+        Output shape (to load):       [{ "ticker", "cik", "entity_name", "metric", "label",
+                                         "period_end", "value", "filed_date", "form_type",
+                                         "fiscal_year", "fiscal_period", "frame" }, ...]
         """
 
         # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
@@ -168,10 +170,10 @@ def stock_market_pipeline():
 
         for item in raw_data:
             ticker = item["ticker"]
-            # flatten_daily_timeseries() lives in api_stock_requests.py — keeps transform() clean
-            rows = flatten_daily_timeseries(ticker, item["raw"])
+            # flatten_company_financials() lives in edgar_client.py — keeps transform() clean
+            rows = flatten_company_financials(ticker, item["raw"], annual_only=True)
             all_records.extend(rows)
-            writer.print(f"  {ticker}: {len(rows)} rows after flatten")
+            writer.print(f"  {ticker}: {len(rows)} rows after flatten (10-K annual filings only)")
 
         # Preview the transformed data
         preview_df: pd.DataFrame = pd.DataFrame(all_records)
@@ -187,7 +189,11 @@ def stock_market_pipeline():
     def load(records: list[dict[str, Any]]) -> None:
         """
         ### Load
-        Push transformed rows into MariaDB (table: stock_daily_prices).
+        Push transformed rows into MariaDB (table: company_financials).
+
+        Uses REPLACE strategy: drops and recreates the table on each run because
+        SEC EDGAR companyfacts returns ALL historical data in every response.
+        This avoids duplicate rows without needing a primary key or upsert logic.
 
         #### TODO (Step 2 of career plan):
         Swap MariaDB for Snowflake:
@@ -195,11 +201,8 @@ def stock_market_pipeline():
             from snowflake.connector.pandas_tools import write_pandas
             hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
             conn = hook.get_conn()
-            write_pandas(conn, df, "RAW_STOCK_DAILY_PRICES", auto_create_table=True)
+            write_pandas(conn, df, "RAW_COMPANY_FINANCIALS", auto_create_table=True)
         """
-        # Location of Logs
-        # writer : OutputTextWriter = OutputTextWriter("/home/ec2-user/myK3Spods_files/myAirflow/dag-mylogs")
-
         # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
 
@@ -211,14 +214,9 @@ def stock_market_pipeline():
         writer.print(str(records[:2]))
 
         # list-of-dicts → flat DataFrame ready for SQL
-        myDataFrameThing: pd.DataFrame = pd.DataFrame(records)
-
-        ## Testing/Learning about Python to SQL (with Pandas)
+        df: pd.DataFrame = pd.DataFrame(records)
 
         try:
-            # engine = create_engine("mysql+pymysql://USERNAME:PASSWORD@localhost:3306/mydatabase")
-            # If Apache Airflow was not inside Kubernetes pod, since MariaDB is already outside a pod: "localhost:3306"  # Default MariaDB Value (This Command in "Command Line" confirms this: "sudo netstat -tulnp | grep 3306")
-
             # Why mysql+pymysql://? SQLAlchemy needs a driver prefix; pymysql is a
             # pure-Python MySQL/MariaDB driver that requires no C extensions to install.
             # DB_HOST points to MariaDB's private EC2 IP — reachable from inside the K8s
@@ -230,31 +228,24 @@ def stock_market_pipeline():
                 print("Success! "+str(result_one.scalar()))
 
             writer.print("----AAA----")
-            writer.print(str(myDataFrameThing.head()))
-            writer.print(str(myDataFrameThing.dtypes))
+            writer.print(str(df.head()))
+            writer.print(str(df.dtypes))
             writer.print("----BBB----")
 
             ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOAMTICALLY CONVERTING IT INTO A SQL OBJECT
-            # if_exists="append": each daily run adds new rows; the table accumulates history over time.
-            # Alternative "replace" would wipe the table on every run — we want to keep history.
-            myDataFrameThing.to_sql("stock_daily_prices", con=engine, if_exists="append", index=False)
+            # if_exists="replace": SEC EDGAR returns ALL historical data each call, so we
+            # replace the entire table to avoid duplicates. Unlike Alpha Vantage (which
+            # returned only recent data and needed "append"), EDGAR gives us everything.
+            df.to_sql("company_financials", con=engine, if_exists="replace", index=False)
 
             # index = False means: don't write the Pandas Dataframe's index into the SQL table
-            writer.print(f"Loaded {len(myDataFrameThing)} rows into stock_daily_prices table")  # confirm row count written
+            writer.print(f"Loaded {len(df)} rows into company_financials table")  # confirm row count written
 
         except SQLAlchemyError as e:
             # Re-raise so task fails and Airflow can retry (instead of silent failure)
             writer.print(f"Database error loading records: {e}")
             raise
 
-        # Still have to install MySQL etc. the d
-        # Would need "pip install pymysql"
-        # Also, URL for SQL might be different since this script will be in kuberentes pod
-        # and my SQL db will be outside the Kubernetes pod
-
-
-    # Airflow automatically converts all task method outputs to XComArg objects.
-    # If I want the objects treated as the types I want
 
     # ── Wiring the pipeline ───────────────────────────────────────────────────
     # Calling the @task functions here (inside the @dag function body) is what

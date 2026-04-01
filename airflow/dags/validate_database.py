@@ -1,7 +1,7 @@
 """
 Database Validation Script
 
-Verifies that stock_daily_prices and weather_hourly tables exist with correct
+Verifies that company_financials and weather_hourly tables exist with correct
 schemas, and provides a summary of data freshness and row counts.
 
 Usage:
@@ -23,15 +23,20 @@ from file_logger import OutputTextWriter
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST
 
 
-# Expected schema for stock_daily_prices table
-EXPECTED_SCHEMA_STOCK = {
+# Expected schema for company_financials table (SEC EDGAR XBRL data)
+EXPECTED_SCHEMA_FINANCIALS = {
     "ticker": "VARCHAR",
-    "date": "VARCHAR",
-    "open": "FLOAT",
-    "high": "FLOAT",
-    "low": "FLOAT",
-    "close": "FLOAT",
-    "volume": "INT",
+    "cik": "VARCHAR",
+    "entity_name": "VARCHAR",
+    "metric": "VARCHAR",
+    "label": "VARCHAR",
+    "period_end": "VARCHAR",
+    "value": "FLOAT",
+    "filed_date": "VARCHAR",
+    "form_type": "VARCHAR",
+    "fiscal_year": "INT",
+    "fiscal_period": "VARCHAR",
+    "frame": "VARCHAR",
 }
 
 # Expected schema for weather_hourly table
@@ -74,11 +79,11 @@ def validate_database():
         tables = inspector.get_table_names()
         writer.print(f"\n✓ Tables in database: {tables}")
 
-        # Validate stock_daily_prices table
+        # Validate company_financials table (SEC EDGAR XBRL data)
         writer.print("\n" + "─" * 80)
-        writer.print("TABLE: stock_daily_prices")
+        writer.print("TABLE: company_financials")
         writer.print("─" * 80)
-        _validate_table(engine, inspector, "stock_daily_prices", EXPECTED_SCHEMA_STOCK, writer)
+        _validate_table(engine, inspector, "company_financials", EXPECTED_SCHEMA_FINANCIALS, writer)
 
         # Validate weather_hourly table
         writer.print("\n" + "─" * 80)
@@ -138,11 +143,11 @@ def _validate_table(engine, inspector, table_name: str, expected_schema: dict, w
 
             # Get freshness info (latest date/time in table)
             # Stale timestamps indicate DAG failure; fresh data means pipeline is healthy
-            if table_name == "stock_daily_prices":
+            if table_name == "company_financials":
                 freshness = conn.execute(
-                    text(f"SELECT MAX(date) as latest_date FROM {table_name}")
+                    text(f"SELECT MAX(filed_date) as latest_filed FROM {table_name}")
                 ).scalar()
-                writer.print(f"  ✓ Latest data date: {freshness}")
+                writer.print(f"  ✓ Latest filing date: {freshness}")
 
             elif table_name == "weather_hourly":
                 freshness = conn.execute(

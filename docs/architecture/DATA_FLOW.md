@@ -29,7 +29,7 @@ Each "gate" is a validation checkpoint. Data should not pass to the next stage u
 
 ## Stage 1: Extract (API Ingestion)
 
-**Location:** `scripts/stock_client.py`, `scripts/weather_client.py`
+**Location:** `airflow/dags/edgar_client.py`, `airflow/dags/weather_client.py`
 **What happens:** HTTP GET to external API → receive JSON response
 **XCom transport:** Extract task returns data → Airflow serializes to JSON → stored in PostgreSQL
 
@@ -39,7 +39,7 @@ Each "gate" is a validation checkpoint. Data should not pass to the next stage u
 |---------|---------|-----------------|
 | API timeout | `requests.ConnectionError` or `Timeout` | Unhandled — task crashes |
 | HTTP error (4xx/5xx) | `response.status_code != 200` | Partially handled in stock DAG |
-| Rate limit (Alpha Vantage) | HTTP 200, body contains `{"Note": "..."}` | Handled in stock DAG after fix |
+| Rate limit (SEC EDGAR) | HTTP 403 if exceeding 10 req/sec | Handled via RateLimiter class in edgar_client.py |
 | Empty response body | HTTP 200, `response.text == ""` | Not validated |
 | HTML error page | HTTP 200, `Content-Type: text/html` | Not validated |
 | Malformed JSON | `json.JSONDecodeError` | Not validated |
@@ -56,17 +56,17 @@ Gate 1 Checklist:
 ├── Response body is non-empty (len > minimum threshold)
 ├── Response body parses as valid JSON
 ├── No rate-limit indicators:
-│   ├── Alpha Vantage: no "Note" key, no "Information" key
+│   ├── SEC EDGAR: HTTP 403 = rate limited (handled by RateLimiter class)
 │   └── Open-Meteo: no "reason" key with error message
 ├── Expected top-level keys exist:
-│   ├── Stock: "Time Series (Daily)" or "Technical Analysis: SMA"
+│   ├── Financials: "facts" → "us-gaap" (SEC EDGAR XBRL structure)
 │   └── Weather: "hourly" containing "time" and "temperature_2m"
 └── Data is non-trivial (e.g., time series has > 0 entries)
 ```
 
 **On failure:** Raise an exception with a clear message identifying which check failed and including relevant response details (status code, first 200 chars of body). Do NOT return partial or error data downstream.
 
-**Current state:** Stock DAG validates response structure and rate-limit messages (added 2026-03-31). Weather DAG needs the same treatment.
+**Current state:** Stock DAG validates response structure (checks for `facts` and `us-gaap` keys). Rate limiting handled by `RateLimiter` class in `edgar_client.py` (8 req/sec, token-bucket). Weather DAG needs the same treatment.
 
 ---
 
@@ -95,7 +95,7 @@ What to check before returning transformed data:
 Gate 2 Checklist:
 ├── DataFrame is not empty (len > 0 rows)
 ├── Column names match expected schema exactly:
-│   ├── Stock: {date, open, high, low, close, volume, sma_20, ...}
+│   ├── Financials: {ticker, cik, entity_name, metric, label, period_end, value, filed_date, form_type, fiscal_year, fiscal_period, frame}
 │   └── Weather: {time, temperature_2m, latitude, longitude, ...}
 ├── No unexpected extra columns (schema hasn't grown)
 ├── Data types are correct:
@@ -103,7 +103,7 @@ Gate 2 Checklist:
 │   ├── Date/time columns parse as valid dates
 │   └── No columns that are all-null
 ├── Values are in plausible ranges:
-│   ├── Stock prices > 0
+│   ├── Financial values are numeric (not null for required metrics)
 │   ├── Temperature between -100 and 100 (Celsius)
 │   └── Dates within expected range (not future dates, not 1970-01-01)
 └── Row count is plausible (e.g., daily stock data should have 1-100 rows)
@@ -118,7 +118,7 @@ Gate 2 Checklist:
 ## Stage 3: Load (Database Insert)
 
 **Location:** Same DAG files, `load()` task
-**What happens:** Receive DataFrame from XCom → `df.to_sql("table_name", con=engine, if_exists="append")`
+**What happens:** Receive DataFrame from XCom → `df.to_sql("company_financials", con=engine, if_exists="replace")` (financials) or `df.to_sql("weather_hourly", con=engine, if_exists="append")` (weather)
 
 ### What Can Fail
 
@@ -163,7 +163,7 @@ Gate 3 Checklist (POST-INSERT):
 ## Stage 4: Storage (MariaDB)
 
 **Location:** MariaDB pod (K8s), database `database_one`
-**What happens:** Data at rest in `stock_daily_prices` and `weather_hourly` tables
+**What happens:** Data at rest in `company_financials` and `weather_hourly` tables
 
 ### What Can Fail
 
@@ -182,10 +182,10 @@ What to check periodically (not per-request):
 ```
 Gate 4 Checklist (PERIODIC):
 ├── Tables exist with expected schema
-│   ├── DESCRIBE stock_daily_prices → expected columns
+│   ├── DESCRIBE company_financials → expected columns
 │   └── DESCRIBE weather_hourly → expected columns
 ├── Data is fresh (most recent row within expected interval):
-│   ├── Stock: latest date within 1-2 business days
+│   ├── Financials: latest filed_date within expected SEC filing cycle
 │   └── Weather: latest time within 2 hours
 ├── Row counts are growing (not stuck):
 │   ├── Compare today's count to yesterday's

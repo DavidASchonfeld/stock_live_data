@@ -224,24 +224,24 @@ When something breaks, find the component showing symptoms below. Each failure m
 
 ---
 
-## API Layer (Alpha Vantage / Open-Meteo)
+## API Layer (SEC EDGAR / Open-Meteo)
 
 ### API-1: Rate Limit / Quota Exceeded
 
 | Field | Detail |
 |-------|--------|
-| **Symptoms** | API returns HTTP 200 but body contains `{"Note": "Thank you for using Alpha Vantage..."}` instead of data. Or HTTP 429. |
-| **Root cause** | Alpha Vantage free tier: 25 requests/day, 5/minute. Open-Meteo: 10,000 requests/day. Exceeding limits returns error responses that look like success (HTTP 200). |
-| **Blast radius** | Extract task "succeeds" but passes rate-limit message downstream. Transform may fail, or worse, load task inserts garbage. |
-| **Prevention** | Validate response body for known rate-limit patterns before returning data. Check for `"Note"` or `"Information"` keys in Alpha Vantage responses. |
-| **Real incident?** | Addressed in Stock DAG fix — added response validation. |
+| **Symptoms** | SEC EDGAR: HTTP 403 if exceeding 10 requests/second. Open-Meteo: HTTP 429 if exceeding daily limit. |
+| **Root cause** | SEC EDGAR allows 10 req/sec (no daily limit). Open-Meteo: 10,000 requests/day. `edgar_client.py` has a built-in `RateLimiter` class (token-bucket, 8 req/sec) that prevents hitting the SEC limit. |
+| **Blast radius** | Extract task fails with HTTP error. No risk of garbage data passing downstream (unlike the old Alpha Vantage setup where rate-limit responses looked like HTTP 200 success). |
+| **Prevention** | Rate limiting handled automatically by `RateLimiter` class in `edgar_client.py`. Response structure validated before returning (`facts` and `us-gaap` keys checked). |
+| **Real incident?** | Alpha Vantage rate limits caused issues before migration to SEC EDGAR. No SEC EDGAR rate limit incidents since migration. |
 
 ### API-2: Schema Change
 
 | Field | Detail |
 |-------|--------|
 | **Symptoms** | Transform task fails with KeyError or produces DataFrame with unexpected columns. Or succeeds but data is wrong. |
-| **Root cause** | API provider changes JSON structure (renamed keys, nested differently, new required fields). Your `json_normalize()` path assumptions break. |
+| **Root cause** | API provider changes JSON structure (renamed keys, nested differently, new required fields). Your XBRL concept names or response parsing assumptions break. |
 | **Blast radius** | Silent data corruption if new schema partially overlaps old expectations. Loud failure if key paths completely change. |
 | **Prevention** | Validate that expected top-level and nested keys exist before `json_normalize()`. Log schema fingerprint (sorted column list) and alert on change. |
 
@@ -287,7 +287,7 @@ When something breaks, find the component showing symptoms below. Each failure m
 | Pod empty directory, files on EC2 | K8-1 (PV path mismatch) |
 | Fix deployed but pod still crashing | K8-2 (backoff inertia) |
 | SSH timeout from new location | EC-1 (IP restriction) |
-| API returns data but it's wrong | API-1 (rate limit) or API-2 (schema change) |
+| API returns data but it's wrong | API-2 (schema change) |
 | Dashboard shows old data, no errors | FL-4 (stale data, silent DAG failure) |
 
 ---
