@@ -340,7 +340,7 @@ ssh ec2-stock "kubectl logs -n default my-kuber-pod-flask --tail=20"
 ### K8s Volume Mount Flow (Fixed)
 
 ```
-Local Mac (stock_live_data/):
+Local Mac (data_pipeline/):
   └─ airflow/dags/
      ├─ dag_stocks.py
      └─ dag_weather.py

@@ -147,7 +147,7 @@ ls -la /home/ec2-user/airflow/dags/
 - Both pods: See same fresh `/opt/airflow/dags/dag_stocks.py` ✅
 
 **Source Files**:
-- Local: `/Users/David/Documents/Programming/Python/StockLiveData/stock_live_data/airflow/dags/dag_stocks.py`
+- Local: `/Users/David/Documents/Programming/Python/Data-Pipeline-2026/data_pipeline/airflow/dags/dag_stocks.py`
 - EC2: `/home/ec2-user/airflow/dags/dag_stocks.py` (should be here)
 - K8s: `/opt/airflow/dags/dag_stocks.py` (mounted from EC2)
 

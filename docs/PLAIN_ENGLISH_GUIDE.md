@@ -14,7 +14,7 @@ This is your Mac. When you open VS Code and edit `dag_stocks.py`, you're editing
 
 ```
 Your Mac
-  └── Documents/Programming/Python/StockLiveData/stock_live_data/
+  └── Documents/Programming/Python/Data-Pipeline-2026/data_pipeline/
         ├── airflow/dags/          ← Your pipeline code (dag_stocks.py, edgar_client.py, etc.)
         ├── airflow/manifests/     ← Kubernetes config files (YAML)
         ├── dashboard/             ← Flask website code

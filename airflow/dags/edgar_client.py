@@ -31,7 +31,7 @@ import requests
 EDGAR_CONTACT_EMAIL = os.environ.get("EDGAR_CONTACT_EMAIL", "contact@stocklivedata.dev")
 
 # SEC requires a descriptive User-Agent so they can contact you if your script misbehaves
-EDGAR_USER_AGENT = f"StockLiveData Portfolio Project {EDGAR_CONTACT_EMAIL}"
+EDGAR_USER_AGENT = f"DataPipeline Portfolio Project {EDGAR_CONTACT_EMAIL}"
 
 # Base URLs for the two SEC EDGAR endpoints we use
 EDGAR_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"

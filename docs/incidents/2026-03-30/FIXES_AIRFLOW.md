@@ -14,11 +14,11 @@ Airflow had **never successfully started** on EC2. The root cause was a cascade 
 
 ### Issue 1 — `values.yaml` never reached EC2
 
-`deploy.sh` only rsyncs `airflow/dags/` and `dashboard/` — it has no step for `airflow/helm/`. So `helm upgrade` had been attempted without a values file, and manual attempts to rsync it manually were run from the wrong directory. `deploy.sh` uses relative paths from the project root (`stock_live_data/`), so `airflow/helm/values.yaml` only resolves correctly when rsync is run from that folder.
+`deploy.sh` only rsyncs `airflow/dags/` and `dashboard/` — it has no step for `airflow/helm/`. So `helm upgrade` had been attempted without a values file, and manual attempts to rsync it manually were run from the wrong directory. `deploy.sh` uses relative paths from the project root (`data_pipeline/`), so `airflow/helm/values.yaml` only resolves correctly when rsync is run from that folder.
 
 **Fix:** Ran rsync from the correct project root:
 ```bash
-cd /Users/David/Documents/Programming/Python/StockLiveData/stock_live_data
+cd /Users/David/Documents/Programming/Python/Data-Pipeline-2026/data_pipeline
 rsync -avz airflow/helm/values.yaml ec2-stock:/home/ec2-user/airflow/helm/values.yaml
 ```
 Then updated `deploy.sh` permanently to also sync this file on every deploy (new Step 2b).

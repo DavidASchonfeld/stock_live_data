@@ -191,7 +191,7 @@ Your system implements a classic **ETL pipeline** (Extract → Transform → Loa
 
 ### Extract Phase
 
-**Location:** `stock_live_data/scripts/stock_client.py` and `weather_client.py`
+**Location:** `data_pipeline/scripts/stock_client.py` and `weather_client.py`
 
 Your extraction scripts call external APIs:
 - **stock_client.py → edgar_client.py:** Calls SEC EDGAR XBRL API (`GET https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json`)
@@ -201,7 +201,7 @@ Result: Raw JSON responses from APIs.
 
 ### Transform Phase
 
-**Location:** `stock_live_data/airflow/dags/dag_stocks.py` and `dag_weather.py`
+**Location:** `data_pipeline/airflow/dags/dag_stocks.py` and `dag_weather.py`
 
 Airflow DAG tasks receive the raw JSON and:
 

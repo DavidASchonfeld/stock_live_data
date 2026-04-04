@@ -105,7 +105,7 @@ After reserialize at 04:16:42 UTC:
 - `db_config.py` - Database credentials (imports at module level)
 
 **Deployment Path**:
-- Local: `/Users/David/Documents/Programming/Python/StockLiveData/stock_live_data/airflow/dags/dag_stocks.py`
+- Local: `/Users/David/Documents/Programming/Python/Data-Pipeline-2026/data_pipeline/airflow/dags/dag_stocks.py`
 - EC2: `/home/ec2-user/airflow/dags/dag_stocks.py`
 - K8s pod: `/opt/airflow/dags/dag_stocks.py` (via PersistentVolume mount)
 

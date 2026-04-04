@@ -1,4 +1,4 @@
-# stock_live_data
+# data_pipeline
 
 > **Status: In Progress — Step 1 of 2**
 > Step 1 (current): Airflow + MariaDB + Flask/Dash on AWS EC2/K3S — fully operational.
@@ -76,7 +76,7 @@ AWS EC2 t3.xlarge (4 vCPU, 16 GB RAM, 100 GiB EBS)
 ## Project Structure
 
 ```
-stock_live_data/
+data_pipeline/
 ├── airflow/
 │   ├── dags/                   DAG definitions + support modules (mounted into pods via PVC)
 │   │   ├── dag_stocks.py         Main stock pipeline (SEC EDGAR → MariaDB)

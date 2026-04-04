@@ -286,7 +286,7 @@ kubectl get endpoints --all-namespaces
 ### Source of Truth (Git)
 
 ```
-stock_live_data/
+data_pipeline/
 ├── airflow/manifests/
 │   ├── pv-dags.yaml
 │   ├── pvc-dags.yaml

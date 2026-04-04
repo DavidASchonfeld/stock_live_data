@@ -83,7 +83,7 @@ AWS EC2 t3.xlarge  (Elastic IP <YOUR_EC2_IP>)
 ## File / Folder Structure
 
 ```
-stock_live_data/
+data_pipeline/
 ├── OVERVIEW.md                          # This file
 ├── README.md                            # High-level architecture sketch
 ├── notes.txt                            # Detailed setup/deployment notes (~69KB)
@@ -205,7 +205,7 @@ EXIT;
 
 These files are in `.gitignore` and must be created locally — they are **never pushed to the public repo**.
 
-**`.env`** — all local secrets in one place *(at `stock_live_data/.env`)*:
+**`.env`** — all local secrets in one place *(at `data_pipeline/.env`)*:
 ```bash
 DB_USER=airflow_user
 DB_PASSWORD=YOUR_DB_PASSWORD
@@ -218,7 +218,7 @@ EDGAR_CONTACT_EMAIL=your.email@gmail.com
 ```
 
 **`airflow/dags/db_config.py`** — database credentials
-*(create this file at `stock_live_data/airflow/dags/db_config.py`)*:
+*(create this file at `data_pipeline/airflow/dags/db_config.py`)*:
 ```python
 DB_USER     = "airflow_user"       # created in step 1 SQL
 DB_PASSWORD = "YOUR_DB_PASSWORD"   # password you chose in step 1
@@ -251,7 +251,7 @@ SEC EDGAR requires no API key. `api_key.py` is a leftover from the Alpha Vantage
 ### 5. Update the logs path in `constants.py`
 ```python
 # airflow/dags/constants.py
-outputTextsFolder_folderPath = "/Users/<you>/path/to/stock_live_data/logs"
+outputTextsFolder_folderPath = "/Users/<you>/path/to/data_pipeline/logs"
 ```
 (Already set to David's Mac path — update if cloning on a different machine.)
 
