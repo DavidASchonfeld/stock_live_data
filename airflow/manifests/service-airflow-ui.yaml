@@ -11,6 +11,6 @@ spec:
      targetPort: 8080  # Port exposed in the actual pod/container
      nodePort: 30080  # External port to expose publicly (# Note: Default potential exposed Kubernetes ports: Between 30000 and 32767)
   selector:
-    component: api-server  # Airflow 3.x renamed webserver pod to api-server
+    component: webserver  # Airflow 2.x label; update to api-server if/when upgrading to Airflow 3.x
     release: airflow
     # Using 2 labels to make it easier to only select airflow and only select the airflow's webserver

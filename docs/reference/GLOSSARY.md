@@ -209,7 +209,7 @@ An AWS virtual machine. You run a `t3.large` instance (2 vCPU, 8 GB RAM) that ho
 ### SSH (Secure Shell)
 A protocol for secure remote access to machines. You use SSH to connect to your EC2 instance:
 ```bash
-ssh -i your-key.pem ec2-user@ec2-instance-ip
+ssh -i your-key.pem ubuntu@ec2-instance-ip
 ```
 
 ### Security Group

@@ -89,7 +89,7 @@ One-time checklist for the migration from `--docker` mode to K3S + AWS ECR. All 
 
 **Issue Found:** First deployment attempt failed in Step 2c (Kubernetes manifest sync) with error:
 ```
-rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed: No such file or directory
+rsync: [Receiver] mkdir "/home/ubuntu/dashboard/manifests" failed: No such file or directory
 ```
 
 **Root Cause:** Step 1's directory creation only created `$EC2_BUILD_PATH` for the dashboard, but didn't create the nested `manifests` subdirectory needed by Step 2c's rsync command.
@@ -105,13 +105,13 @@ ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASH
 
 Also added a new variable on line 12 for clarity:
 ```bash
-EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
+EC2_DASHBOARD_PATH="/home/ubuntu/dashboard"
 ```
 
 **Why this solution:**
-1. **Using `mkdir -p` with nested paths** — creates both `/home/ec2-user/dashboard` and `/home/ec2-user/dashboard/manifests` in one command
+1. **Using `mkdir -p` with nested paths** — creates both `/home/ubuntu/dashboard` and `/home/ubuntu/dashboard/manifests` in one command
 2. **Idempotent** — the `-p` flag prevents errors if directories already exist, so re-running deploy.sh is safe
 3. **Maintainable** — using a variable instead of hardcoding makes the path explicit and reusable
-4. **Matches the pipeline** — ensures Step 2c's rsync to `/home/ec2-user/dashboard/manifests/` always succeeds
+4. **Matches the pipeline** — ensures Step 2c's rsync to `/home/ubuntu/dashboard/manifests/` always succeeds
 
 **Verification:** After the fix, `./scripts/deploy.sh` runs all 7 steps without rsync errors and successfully deploys the Flask pod to Kubernetes with the latest image from ECR.

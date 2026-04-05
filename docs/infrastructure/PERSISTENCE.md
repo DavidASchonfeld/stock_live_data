@@ -13,7 +13,7 @@ How PersistentVolumes and PersistentVolumeClaims work in this project, what can 
 
 ```
 EC2 Host Filesystem
-├── /home/ec2-user/airflow/dags/     ← deploy.sh syncs DAG files here
+├── /home/ubuntu/airflow/dags/     ← deploy.sh syncs DAG files here
 │   ├── dag_stocks.py
 │   ├── dag_weather.py
 │   ├── stock_client.py
@@ -25,7 +25,7 @@ EC2 Host Filesystem
 
 
 K8s PersistentVolumes (host paths on EC2)
-├── dag-pv          → hostPath: /home/ec2-user/airflow/dags/
+├── dag-pv          → hostPath: /home/ubuntu/airflow/dags/
 ├── airflow-logs-pv → hostPath: /opt/airflow/logs/
 └── output-logs-pv  → hostPath: /opt/airflow/out/
 
@@ -61,7 +61,7 @@ spec:
   accessModes:
     - ReadWriteOnce
   hostPath:
-    path: /home/ec2-user/airflow/dags/   # ← this folder on EC2
+    path: /home/ubuntu/airflow/dags/   # ← this folder on EC2
   storageClassName: ""
   claimRef:
     namespace: airflow-my-namespace
@@ -72,9 +72,9 @@ spec:
 
 1. Pod starts and requests `dag-pvc`
 2. K8s finds `dag-pvc` is bound to `dag-pv`
-3. `dag-pv` says `hostPath: /home/ec2-user/airflow/dags/`
+3. `dag-pv` says `hostPath: /home/ubuntu/airflow/dags/`
 4. The kubelet creates a bind mount from that host directory into the pod's filesystem
-5. Pod sees files at `/opt/airflow/dags/` (its mount point) — these ARE the files at `/home/ec2-user/airflow/dags/` on the host
+5. Pod sees files at `/opt/airflow/dags/` (its mount point) — these ARE the files at `/home/ubuntu/airflow/dags/` on the host
 
 **No copying happens.** The pod reads and writes directly to the host directory. Changes are immediate and bidirectional.
 
@@ -88,7 +88,7 @@ K8s does **not validate** that the `hostPath` directory exists or contains expec
 
 ```
 PV says:       hostPath: /tmp/airflow-dags/           (old path, empty)
-deploy.sh to:  /home/ec2-user/airflow/dags/           (correct path, has files)
+deploy.sh to:  /home/ubuntu/airflow/dags/           (correct path, has files)
 Pod sees:      /opt/airflow/dags/ → empty directory    (mounted the wrong path)
 ```
 
@@ -112,7 +112,7 @@ When multiple pods mount the same `hostPath`, each pod gets its own filesystem c
 **The mechanism:**
 
 ```
-1. rsync writes new dag_stocks.py to /home/ec2-user/airflow/dags/
+1. rsync writes new dag_stocks.py to /home/ubuntu/airflow/dags/
 2. EC2 filesystem assigns new inode (e.g., 84268967)
 3. Scheduler pod's kernel cache refreshes → sees new inode → finds file
 4. Processor pod's kernel cache is stale → sees old inode list → file missing
@@ -238,7 +238,7 @@ kubectl get pv dag-pv -o jsonpath='{.spec.hostPath.path}'
 grep "EC2_DAG_PATH" scripts/deploy.sh
 
 # Are the files actually there on EC2?
-ssh ec2-stock ls -la /home/ec2-user/airflow/dags/
+ssh ec2-stock ls -la /home/ubuntu/airflow/dags/
 
 # Are they visible inside the pod?
 ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- ls -la /opt/airflow/dags/

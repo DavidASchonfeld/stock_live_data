@@ -29,7 +29,7 @@ Your EC2 instance is a computer rented from Amazon, running 24/7 in the cloud. W
 
 ```
 EC2 (Amazon cloud server)
-  └── /home/ec2-user/
+  └── /home/ubuntu/
         ├── airflow/dags/          ← Copy of your pipeline code
         ├── airflow/manifests/     ← Copy of your Kubernetes configs
         └── dashboard/             ← Copy of your Flask code
@@ -48,7 +48,7 @@ This is the part that's confusing. Your EC2 server runs Kubernetes (K3S), which 
 
 ```
 EC2 server
-  └── /home/ec2-user/airflow/dags/dag_stocks.py    ← File on EC2's hard drive
+  └── /home/ubuntu/airflow/dags/dag_stocks.py    ← File on EC2's hard drive
         │
         │ (Kubernetes mounts this folder into the pod)
         ▼
@@ -157,7 +157,7 @@ This is the most confusing part. At any moment, your terminal could be running c
 | Where you are | How you got there | Your prompt looks like | How to leave |
 |---------------|-------------------|----------------------|-------------|
 | Your Mac | Default — you opened Terminal | `David@Davids-MacBook ~ %` | (you're already here) |
-| EC2 server | Ran `ssh ec2-stock` | `[ec2-user@ip-... ~]$` | Type `exit` |
+| EC2 server | Ran `ssh ec2-stock` | `[ubuntu@ip-... ~]$` | Type `exit` |
 | Inside a pod | Ran `kubectl exec -it ... -- bash` | `airflow@airflow-scheduler-0:/$` | Type `exit` |
 
 **The most common mistake:** Forgetting which "level" you're on. If you're inside EC2 and try to edit a local file, it won't work. If you're on your Mac and try to run `kubectl` without the SSH prefix, it won't work (unless you have an SSH tunnel running for the K8s API too).
@@ -172,7 +172,7 @@ Remember: pods don't have their own hard drive. They "borrow" folders from EC2 u
 
 ```
 Step 1: You created a PersistentVolume (PV) — a Kubernetes object that says:
-        "There is a folder on EC2 at /home/ec2-user/airflow/dags/"
+        "There is a folder on EC2 at /home/ubuntu/airflow/dags/"
 
 Step 2: You created a PersistentVolumeClaim (PVC) — a Kubernetes object that says:
         "I need some storage, and I want to use the PV from Step 1"
@@ -181,7 +181,7 @@ Step 3: The Airflow pods say (in their config):
         "Mount the PVC at /opt/airflow/dags/ inside me"
 
 Result: When the pod looks at /opt/airflow/dags/, it actually sees
-        the files at /home/ec2-user/airflow/dags/ on EC2.
+        the files at /home/ubuntu/airflow/dags/ on EC2.
 ```
 
 **Analogy:** A PV is like saying "there's a filing cabinet in room 204." A PVC is like saying "I need access to that filing cabinet." The mount is like putting a door from the pod directly to that filing cabinet.
@@ -236,6 +236,15 @@ This command says:
 - `http://localhost:32147/dashboard/` in your browser → Your Flask dashboard
 
 **If you close this terminal window, the tunnel dies and those URLs stop working.** You need to keep this terminal open (it looks like it's just sitting there doing nothing — that's normal).
+
+**If you also need to run `kubectl` commands from your Mac**, use the extended tunnel that adds the Kubernetes API port:
+
+```bash
+ssh -N -L 6443:localhost:6443 -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
+```
+
+- Port `6443` is the **Kubernetes API server** — it's what `kubectl` talks to behind the scenes whenever you run a kubectl command. Without this port forwarded, `kubectl` on your Mac can't reach the cluster.
+- The `-N` flag means "don't open a shell, just hold the tunnel open" — useful for running it silently in the background while you work in another terminal.
 
 ---
 
@@ -299,7 +308,7 @@ Kubernetes automatically creates a new Processor pod, which sees the current fil
 Remember the filing cabinet analogy? The PV said "the filing cabinet is in room 204" — but the files were actually in room 307.
 
 Specifically:
-- `deploy.sh` was copying files to `/home/ec2-user/airflow/dags/` on EC2
+- `deploy.sh` was copying files to `/home/ubuntu/airflow/dags/` on EC2
 - But the PV config still said the folder was at `/tmp/airflow-dags/` (an old location from before you reorganized the project)
 
 The pod mounted the old, empty folder. It looked inside and saw nothing. No DAGs, no errors — just silence.
@@ -313,7 +322,7 @@ hostPath:
 
 # After (correct):
 hostPath:
-  path: /home/ec2-user/airflow/dags/
+  path: /home/ubuntu/airflow/dags/
 ```
 
 But you can't just edit a PV — Kubernetes doesn't allow changes to an existing PV. You have to delete the old PV and PVC and create new ones pointing to the right place.
@@ -359,6 +368,161 @@ fi
 ```
 
 Both produce identical output. `sed` is always available on every Mac and Linux system, so the fallback is guaranteed to work.
+
+---
+
+### Bug 7: PostgreSQL Pod Stuck — Image Not Found on Docker Hub
+
+**What happened:** After bootstrapping the new Ubuntu EC2 instance, `airflow-postgresql-0` stayed in `ImagePullBackOff` indefinitely. K3s was trying to pull an image and kept failing.
+
+**Why it happened — in plain English:**
+
+The Airflow Helm chart has a built-in default for which PostgreSQL image to use. That default was `bitnami/postgresql:16.1.0-debian-11-r15`. Bitnami (the company that packages these images) quietly deleted most of their old versioned tags from Docker Hub — they only keep `latest` there now. So when K3s tried to download that exact version, Docker Hub said "that tag doesn't exist."
+
+We tried a second tag (`bitnami/postgresql:16-debian-12`) — also gone.
+
+**The fix:** Override the image to pull from **Amazon ECR Public** (`public.ecr.aws/bitnami/postgresql:16`). ECR Public is Amazon's own image registry. It has all the Bitnami images, no rate limits, and no authentication needed. Since your EC2 runs on Amazon's network, ECR Public is the ideal source.
+
+This override is now permanently set in `airflow/helm/values.yaml` under the `postgresql:` section:
+
+```yaml
+postgresql:
+  image:
+    registry: public.ecr.aws
+    repository: bitnami/postgresql
+    tag: "16"
+```
+
+**Why it works for the bigger picture:** Bitnami has been migrating their canonical image hosting away from Docker Hub for a while. For any AWS-hosted stack, defaulting to ECR Public avoids both the missing-tag problem and Docker Hub's pull rate limits (which can throttle EC2 instances on the free tier).
+
+---
+
+### Bug 8: Airflow Webserver CrashLoopBackOff — Startup Probe Too Short
+
+**What happened:** `airflow-webserver-...` kept restarting in a loop. It looked like a crash. But the logs showed something strange: gunicorn (the web server process) started up normally, loaded successfully — then was killed 18 seconds later with exit code 0 (a "clean" shutdown). Exit code 0 means success, not a crash.
+
+**Why it happened — in plain English:**
+
+Kubernetes has a concept called a **startup probe** — a health check it runs while a pod is starting up. The startup probe says: "I'll check every 10 seconds. If the pod isn't healthy after 6 checks (60 seconds total), kill it and try again."
+
+On a fast machine, 60 seconds is plenty. On a t3.large, it isn't:
+- gunicorn takes 30–40 seconds just to start
+- then Airflow loads all its provider packages across 4 workers — another 30–60 seconds
+
+The probe killed the pod at exactly 60 seconds, before gunicorn even had a chance to become ready. Because Kubernetes sent a `SIGTERM` ("please shut down cleanly"), gunicorn exited with code 0 — which looked like success but was actually the probe murdering it.
+
+**Diagnosed by:** Running `kubectl logs --previous` (which shows logs from the *last* run of a crashed pod). The logs showed gunicorn starting normally, then: `[SIGTERM received] — shutting down` at the 18-second mark. No errors, no panics — just an external signal.
+
+**The fix:** Override the startup probe in `values.yaml` to give 180 seconds (18 checks × 10 seconds):
+
+```yaml
+webserver:
+  startupProbe:
+    failureThreshold: 18
+    periodSeconds: 10
+    timeoutSeconds: 20
+```
+
+**Why it works for the bigger picture:** The chart defaults were written assuming a faster machine. t3.large is just slow enough on first boot that provider loading tips past the 60-second window. 3 minutes is generous but still catches real hangs — if the webserver hasn't started in 3 minutes, something is genuinely broken.
+
+---
+
+### Bug 9: Triggerer OOMKilled — 256Mi Memory Limit Too Low
+
+**What happened:** `airflow-triggerer-0` kept restarting. Each time, `kubectl get pods` showed `OOMKilled` in the STATUS column.
+
+**What OOMKilled means — in plain English:**
+
+OOMKilled = "Out Of Memory Killed." This is the Linux kernel (not Airflow, not Kubernetes) forcibly killing a process because it exceeded its memory limit. Kubernetes sets a hard ceiling; the kernel enforces it instantly. There's no warning — the process just disappears.
+
+**Why it happened:**
+
+The triggerer's memory limit was set to `256Mi` (256 megabytes). At startup, the triggerer loads all Airflow provider packages into memory at once. That loading spike temporarily pushed past 256MB — and the kernel killed it before it finished starting. Every restart, the same thing happened.
+
+**The fix:** Increase the triggerer memory limit in `values.yaml` to `512Mi`:
+
+```yaml
+triggerer:
+  resources:
+    limits:
+      memory: "512Mi"
+```
+
+**Why it works for the bigger picture:** 512Mi gives the triggerer enough room to absorb the provider-loading burst. Once fully loaded, the triggerer settles back to ~100MB in steady state — so the extra headroom isn't wasted, it just handles the startup spike. The kernel now never needs to intervene.
+
+---
+
+### Bug 10: deploy.sh Fails — "No module named airflow"
+
+**What happened:** Running `./scripts/deploy.sh` from the Mac failed immediately at the pre-flight check step with: `ModuleNotFoundError: No module named 'airflow'`.
+
+**Why it happened — in plain English:**
+
+`deploy.sh` validates your DAG files before deploying them — it runs a Python import check to make sure your DAG code doesn't have any obvious errors. It uses whatever `python3` is on your system PATH.
+
+Your system `python3` (the one installed on your Mac by default) doesn't have Airflow installed. Airflow lives in the project's virtual environment (`airflow_env/`). When the script tried to import `airflow` to validate the DAGs, the system Python said "I don't know what airflow is."
+
+**The fix:** Activate the project venv before running deploy:
+
+```bash
+export PATH="/Users/David/Documents/Programming/Python/Data-Pipeline-2026/data_pipeline/airflow_env/bin:$PATH"
+./scripts/deploy.sh
+```
+
+This puts the venv's `python3` (which has Airflow installed) first on the PATH, so the validation step finds it.
+
+**Why this only matters on the Mac:** The deploy script's validation step runs *locally* before SSHing to EC2. The actual pipeline code runs inside Kubernetes pods on EC2, where Airflow is always available in the container environment. So this issue only bites you when running `deploy.sh` directly from your Mac with a fresh terminal that hasn't activated the venv.
+
+---
+
+### Bug 11: Airflow UI (Port 30080) Not Reachable — Service Selector Mismatch
+
+**What happened:** After the Ubuntu migration, the Flask dashboard loaded fine at `http://localhost:32147` but the Airflow UI at `http://localhost:30080` dropped the connection immediately (Safari: "server unexpectedly dropped the connection"). All pods showed `Running`.
+
+**Why it happened — in plain English:**
+
+Kubernetes services work like a telephone switchboard. The service doesn't actually run the app — it just routes traffic *to* the pod that does. It finds the right pod using **labels**, which are key-value tags that every pod carries (like a nametag).
+
+The Airflow NodePort service (`airflow-service-expose-ui-port`) had a selector of `component: api-server`. This is the label that Airflow 3.x uses for its UI component. But the cluster was running **Airflow 2.9.3** (Helm chart 1.15.0), which names that same pod `component: webserver`.
+
+The selector found zero matching pods — so the service had no destination to send traffic to. Any connection attempt was instantly refused. This is called an empty **endpoints** list:
+
+```
+NAME                             ENDPOINTS   AGE
+airflow-service-expose-ui-port   <none>      112m
+```
+
+`<none>` is the tell. A healthy service shows an IP:port here (e.g., `10.42.0.26:8080`).
+
+**Why the dashboard worked but Airflow didn't:**
+
+The Flask service (`flask-service-expose-port`) uses a different selector — one that correctly matched the Flask pod. Only the Airflow service had the wrong label. Two services, two selectors, one broken.
+
+**How it was diagnosed:**
+
+1. Confirmed the webserver pod was Running and responding to Kubernetes health probes (HTTP 200 on `/health`)
+2. Checked `kubectl get endpoints -n airflow-my-namespace` — Airflow's NodePort service showed `<none>`
+3. Checked `kubectl describe svc airflow-service-expose-ui-port | grep Selector` — revealed `component=api-server`
+4. Checked the webserver pod's actual labels: `component=webserver`
+5. Mismatch confirmed — one label change away from working
+
+**The fix:** Changed the selector in `airflow/manifests/service-airflow-ui.yaml` from `api-server` to `webserver`:
+
+```yaml
+# Before (wrong — Airflow 3.x label applied to 2.x cluster):
+selector:
+  component: api-server
+
+# After (correct for Airflow 2.x):
+selector:
+  component: webserver
+```
+
+Then re-applied the manifest (`kubectl apply -f`). Endpoints populated immediately; port 30080 returned HTTP 200.
+
+**Why this label was wrong in the first place:** The manifest was updated in anticipation of an Airflow 3.x upgrade (which renames the webserver component to "api-server"). That future-proofing was added too early — it broke the current 2.x deployment. The comment in the file now notes to update the label only when actually upgrading to Airflow 3.x.
+
+**The bigger lesson:** When a port is unreachable but the pod is healthy, check the service endpoints first (`kubectl get endpoints`). If they show `<none>`, the service's selector doesn't match any pod labels. Compare `kubectl describe svc <name> | grep Selector` against `kubectl get pods --show-labels` to find the mismatch.
 
 ---
 
@@ -428,6 +592,16 @@ with engine.connect() as c:
 
 ### "SSH won't connect from a new location"
 Your EC2 only allows SSH from one IP address (for security). When you're at a new location (different Wi-Fi), your IP changes. Go to AWS Console -> EC2 -> Security Groups -> update the SSH rule with your new IP.
+
+### "WARNING: connection is not using a post-quantum key exchange algorithm"
+
+This warning appeared after upgrading to macOS with OpenSSH 10.2+. It meant the EC2 server (then running Amazon Linux 2023, OpenSSH 8.7p1) was too old to support post-quantum key exchange algorithms. The workaround at the time was to add `KexAlgorithms -mlkem768x25519-sha256` to `~/.ssh/config` to suppress the warning.
+
+**This is now resolved.** The EC2 was migrated to Ubuntu 24.04 LTS, which ships OpenSSH 9.6p1. The new server negotiates `sntrup761x25519-sha512` (a post-quantum hybrid algorithm) automatically — no warning appears, and no workaround is needed.
+
+**Pending cleanup (after Phase H EIP cutover):** Remove the `KexAlgorithms -mlkem768x25519-sha256` line from `~/.ssh/config` under the `ec2-stock` host entry — it is only there for the old AL2023 instance and is no longer needed once `ec2-stock` points to the Ubuntu instance.
+
+**Is this a real risk?** The "store now, decrypt later" attack means an adversary records your encrypted traffic today and decrypts it later when quantum computers exist. For this pipeline — SSH tunnels to view the Airflow UI and dashboard — the risk is negligible. No sensitive credentials pass through the tunnel; it only carries UI traffic. But now you're using a proper post-quantum algorithm anyway.
 
 ---
 
@@ -635,4 +809,4 @@ See [infrastructure/EC2_SIZING.md](infrastructure/EC2_SIZING.md) for the full te
 
 ---
 
-**Last updated:** 2026-04-05 — Added resource limits explanation (Part 9); added Bug 6 (envsubst Apple Silicon fallback); updated deploy.sh step 3 to explain ECR_REGISTRY placeholder substitution.
+**Last updated:** 2026-04-05 — Added resource limits explanation (Part 9); added Bug 6 (envsubst Apple Silicon fallback); updated deploy.sh step 3 to explain ECR_REGISTRY placeholder substitution. Added Bugs 7–10 (EC2 Ubuntu migration: Bitnami image removal from Docker Hub, webserver startup probe timeout, triggerer OOMKill, deploy.sh venv PATH). Updated SSH KEX warning section: migration to Ubuntu 24.04 LTS resolved the issue permanently. Added Bug 11 (Airflow UI port 30080 unreachable — service selector mismatch: `api-server` vs `webserver`).

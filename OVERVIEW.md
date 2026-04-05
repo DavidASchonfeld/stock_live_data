@@ -105,7 +105,7 @@ data_pipeline/
 │   │   ├── db_config.py                 # DB credentials from env vars (NOT committed — gitignored)
 │   │   └── constants.py                 # Local dev log path constant (NOT committed — gitignored)
 │   ├── manifests/                       # Kubernetes resource definitions for Airflow
-│   │   ├── pv-dags.yaml                 # PersistentVolume: mounts /home/ec2-user/airflow/dags into pods
+│   │   ├── pv-dags.yaml                 # PersistentVolume: mounts /home/ubuntu/airflow/dags into pods
 │   │   ├── pvc-dags.yaml                # PersistentVolumeClaim for DAG files
 │   │   ├── pv-airflow-logs.yaml         # PV for Airflow scheduler/webserver logs
 │   │   ├── pvc-airflow-logs.yaml        # PVC for Airflow logs
@@ -287,7 +287,7 @@ airflow scheduler
 > Also note: the EC2 security group locks SSH to your current location's IP — update it in AWS Console if you can't connect.
 
 ### One-time infrastructure setup
-1. Launch EC2 t3.large, Amazon Linux 2023, 100 GiB gp3, assign Elastic IP.
+1. Launch EC2 t3.large, Ubuntu 24.04 LTS, 100 GiB gp3, assign Elastic IP.
 2. Open inbound ports: 22, 30080 (Airflow UI), 32147 (Flask).
 3. `curl -sfL https://get.k3s.io | sh -`  (installs K3S)
 4. Install Helm, add Airflow repo: `helm repo add apache-airflow https://airflow.apache.org`
@@ -327,7 +327,7 @@ chmod +x scripts/deploy.sh
 ```
 
 **What `scripts/deploy.sh` does (in order):**
-1. Creates `/home/ec2-user/airflow/dags` and `/home/ec2-user/dashboard_build` on EC2 if they don't exist
+1. Creates `/home/ubuntu/airflow/dags` and `/home/ubuntu/dashboard_build` on EC2 if they don't exist
 2. `rsync airflow/dags/` → EC2: syncs all DAG files including gitignored secrets (`api_key.py`, `db_config.py`, `constants.py`) over encrypted SSH; only changed files are transferred
 3. `rsync dashboard/` → EC2: syncs `app.py`, `Dockerfile`, `requirements.txt`, and manifests
 4. Builds the Docker image on EC2, tags it, and pushes to AWS ECR: `docker build` → `docker push <ECR_REGISTRY>/my-flask-app:latest` (EC2 IAM role handles ECR authentication)
@@ -431,18 +431,18 @@ The dashboard URL becomes: `http://<ELASTIC_IP>:32147/dashboard/`
 
 **Symptom:** Running `./scripts/deploy.sh` fails in Step 2c (syncing Kubernetes manifests) with error:
 ```
-rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed: No such file or directory (2)
+rsync: [Receiver] mkdir "/home/ubuntu/dashboard/manifests" failed: No such file or directory (2)
 ```
 
 **Root Cause:**
 The deploy script creates target directories on EC2 in Step 1, but only created the basic paths:
 ```bash
-mkdir -p /home/ec2-user/airflow/dags \
-         /home/ec2-user/airflow/helm \
-         /home/ec2-user/dashboard_build
+mkdir -p /home/ubuntu/airflow/dags \
+         /home/ubuntu/airflow/helm \
+         /home/ubuntu/dashboard_build
 ```
 
-However, Step 2c attempts to sync K8s manifests to `/home/ec2-user/dashboard/manifests/`, which requires the parent `/home/ec2-user/dashboard` directory to exist first. Without it, rsync cannot create the target directory and fails with a permission error.
+However, Step 2c attempts to sync K8s manifests to `/home/ubuntu/dashboard/manifests/`, which requires the parent `/home/ubuntu/dashboard` directory to exist first. Without it, rsync cannot create the target directory and fails with a permission error.
 
 **Why this bug existed:**
 - The deploy script was newly created (commit 42061b4, 2026-03-30)
@@ -455,7 +455,7 @@ Added the dashboard manifests subdirectory to the Step 1 directory creation:
 
 1. Created a new variable for clarity (line 12):
    ```bash
-   EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
+   EC2_DASHBOARD_PATH="/home/ubuntu/dashboard"
    ```
 
 2. Updated the mkdir command (line 21):

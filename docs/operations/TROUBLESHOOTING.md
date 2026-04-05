@@ -137,7 +137,7 @@ This shifts debugging from "hours in logs" to "minutes locally".
 
 1. **Verify files exist on EC2**:
    ```bash
-   ssh ec2-stock ls -la /home/ec2-user/airflow/dags/
+   ssh ec2-stock ls -la /home/ubuntu/airflow/dags/
    ```
 
 2. **Check what's in the pod**:
@@ -184,8 +184,8 @@ ssh ec2-stock kubectl delete pv dag-pv --grace-period=0 --force
 # Change: hostPath.path to match deploy.sh sync destination
 
 # 5. Recreate PV and PVC
-ssh ec2-stock kubectl apply -f /home/ec2-user/airflow/manifests/pv-dags.yaml
-ssh ec2-stock kubectl apply -f /home/ec2-user/airflow/manifests/pvc-dags.yaml
+ssh ec2-stock kubectl apply -f /home/ubuntu/airflow/manifests/pv-dags.yaml
+ssh ec2-stock kubectl apply -f /home/ubuntu/airflow/manifests/pvc-dags.yaml
 
 # 6. Restart scheduler pod
 ssh ec2-stock kubectl rollout restart statefulset/airflow-scheduler -n airflow-my-namespace
@@ -517,10 +517,10 @@ Host ec2-stock
 2. **Kubernetes manifests not applied** → Run:
    ```bash
    # From Mac:
-   ssh ec2-stock kubectl apply -f /home/ec2-user/airflow/manifests/
+   ssh ec2-stock kubectl apply -f /home/ubuntu/airflow/manifests/
 
    # Or manually apply specific manifests:
-   ssh ec2-stock kubectl apply -f /home/ec2-user/airflow/manifests/pv-dags.yaml
+   ssh ec2-stock kubectl apply -f /home/ubuntu/airflow/manifests/pv-dags.yaml
    ```
 
 3. **Scheduler pod needs restart** → Run:
@@ -576,6 +576,61 @@ ssh ec2-stock "mariadb -u airflow_user -p'[PASSWORD]' -h <MARIADB_PRIVATE_IP> -e
 ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
   mariadb -u airflow_user -p'[PASSWORD]' -h <MARIADB_PRIVATE_IP> -e 'SHOW TABLES;'"
 ```
+
+---
+
+## Issue: Airflow UI (Port 30080) Drops Connection — Service Has No Endpoints
+
+### Symptoms
+- `http://localhost:30080` fails immediately: "server unexpectedly dropped the connection"
+- SSH tunnel is open and working (dashboard on 32147 loads fine)
+- All Airflow pods show `Running` with `0` restarts
+- Webserver logs show HTTP 200 responses to `/health` from `kube-probe`
+
+### Root Cause: Service Selector Mismatch
+
+The NodePort service routes traffic to pods by matching **labels**. If the selector doesn't match any pod's labels, the service has no endpoints and rejects all connections.
+
+Confirm this is the cause:
+```bash
+kubectl get endpoints -n airflow-my-namespace airflow-service-expose-ui-port
+# If ENDPOINTS shows <none>, the selector matches nothing
+```
+
+Compare the service selector against the actual pod labels:
+```bash
+kubectl describe svc -n airflow-my-namespace airflow-service-expose-ui-port | grep Selector
+kubectl get pods -n airflow-my-namespace --show-labels | grep webserver
+```
+
+**Known instance (2026-04-05):** The manifest `airflow/manifests/service-airflow-ui.yaml` had `component: api-server` (the Airflow 3.x label), but the cluster runs Airflow 2.9.3 which uses `component: webserver`. The selector matched zero pods.
+
+### Solution
+
+1. **Edit `airflow/manifests/service-airflow-ui.yaml`** — update the selector to match the actual pod label:
+   ```yaml
+   selector:
+     component: webserver   # Airflow 2.x; change to api-server when upgrading to 3.x
+     release: airflow
+   ```
+
+2. **Re-apply the manifest on EC2:**
+   ```bash
+   # Copy updated manifest to EC2 and apply, or apply inline:
+   ssh ec2-stock 'kubectl apply -f ~/airflow/manifests/service-airflow-ui.yaml'
+   ```
+
+3. **Verify endpoints populate:**
+   ```bash
+   ssh ec2-stock 'kubectl get endpoints -n airflow-my-namespace airflow-service-expose-ui-port'
+   # Should show: 10.42.x.x:8080  (not <none>)
+   ```
+
+4. **Test the port:**
+   ```bash
+   ssh ec2-stock 'curl -s -o /dev/null -w "%{http_code}" http://localhost:30080/health'
+   # Should return: 200
+   ```
 
 ---
 

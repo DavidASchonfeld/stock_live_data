@@ -204,7 +204,7 @@ Docker Hub deletes Bitnami PostgreSQL image tag
 
 ```
 deploy.sh sync path changed (or PV manifest edited)
-  → Files land at /home/ec2-user/airflow/dags/
+  → Files land at /home/ubuntu/airflow/dags/
   → PV still points to /tmp/airflow-dags/
     → Pod mounts empty directory
       → Airflow sees no DAGs

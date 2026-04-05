@@ -43,9 +43,9 @@ AWS EC2 t3.large (2 vCPU, 8 GB RAM, 100 GiB EBS)
     ├── Pod: PostgreSQL   (Airflow metadata DB — not your data)
     │
     └── PersistentVolumes (hostPath on EC2 disk)
-        ├── DAG files     /home/ec2-user/airflow/dags
-        ├── Airflow logs  /home/ec2-user/airflow_logs
-        └── Task logs     /home/ec2-user/airflow/out
+        ├── DAG files     /home/ubuntu/airflow/dags
+        ├── Airflow logs  /home/ubuntu/airflow_logs
+        └── Task logs     /home/ubuntu/airflow/out
 ```
 
 **Data flow:** API → `extract()` → `transform()` (pandas) → `load()` (SQLAlchemy → MariaDB) → Flask/Dash → browser.

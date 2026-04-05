@@ -129,7 +129,7 @@ When something breaks, find the component showing symptoms below. Each failure m
 | Field | Detail |
 |-------|--------|
 | **Symptoms** | Pod mounts an empty directory. Files exist on EC2 host but not visible inside the pod. No errors in pod events. |
-| **Root cause** | `deploy.sh` syncs files to one path on EC2 (e.g., `/home/ec2-user/airflow/dags/`). PV manifest's `hostPath.path` points to a different path (e.g., `/tmp/airflow-dags/`). K8s silently mounts the wrong (empty) directory. |
+| **Root cause** | `deploy.sh` syncs files to one path on EC2 (e.g., `/home/ubuntu/airflow/dags/`). PV manifest's `hostPath.path` points to a different path (e.g., `/tmp/airflow-dags/`). K8s silently mounts the wrong (empty) directory. |
 | **Blast radius** | All pods using that PV see empty directory. DAGs invisible to Airflow. |
 | **Prevention** | Add validation to `deploy.sh`: read PV manifest's `hostPath.path` and compare to sync target. Fail deploy if they diverge. |
 | **Real incident?** | Yes — 2026-03-31. |

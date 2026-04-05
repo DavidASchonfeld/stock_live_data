@@ -32,10 +32,12 @@ done
 
 # Note: SSH config for ec2-stock (including .pem key path) lives in ~/.ssh/config
 EC2_HOST="ec2-stock"
-EC2_DAG_PATH="/home/ec2-user/airflow/dags"
-EC2_HELM_PATH="/home/ec2-user/airflow/helm"
-EC2_BUILD_PATH="/home/ec2-user/dashboard_build"
-EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
+# Home directory for the EC2 SSH user (ubuntu on Ubuntu, ec2-user on Amazon Linux)
+EC2_HOME="/home/ubuntu"
+EC2_DAG_PATH="$EC2_HOME/airflow/dags"
+EC2_HELM_PATH="$EC2_HOME/airflow/helm"
+EC2_BUILD_PATH="$EC2_HOME/dashboard_build"
+EC2_DASHBOARD_PATH="$EC2_HOME/dashboard"
 FLASK_IMAGE="my-flask-app:latest"
 FLASK_POD="my-kuber-pod-flask"
 ECR_IMAGE="$ECR_REGISTRY/my-flask-app:latest"
@@ -61,6 +63,13 @@ cd airflow/dags
 python3 << 'VALIDATION_EOF'
 import sys
 sys.path.insert(0, '.')  # Simulate /opt/airflow/dags in the pod
+
+# Skip import check if airflow is not installed locally (only available inside the pod)
+try:
+    import airflow
+except ImportError:
+    print("⚠ airflow not installed locally — skipping import validation (syntax already verified above)")
+    sys.exit(0)
 
 # Try importing all DAG files
 dag_files = ['dag_stocks', 'dag_weather']
@@ -98,8 +107,8 @@ rsync -avz --progress airflow/helm/values.yaml "$EC2_HOST:$EC2_HELM_PATH/"
 echo "=== Step 2c: Syncing Kubernetes manifests to EC2 ==="
 # Reference copies of manifests on EC2 enable direct kubectl apply from EC2 if needed
 # (Git remains the source of truth; these are convenience copies for EC2-side operations)
-rsync -avz --progress airflow/manifests/ "$EC2_HOST:/home/ec2-user/airflow/manifests/"
-rsync -avz --progress dashboard/manifests/ "$EC2_HOST:/home/ec2-user/dashboard/manifests/"
+rsync -avz --progress airflow/manifests/ "$EC2_HOST:$EC2_HOME/airflow/manifests/"
+rsync -avz --progress dashboard/manifests/ "$EC2_HOST:$EC2_HOME/dashboard/manifests/"
 
 echo "=== Step 3: Syncing dashboard build files to EC2 ==="
 rsync -avz --progress dashboard/ "$EC2_HOST:$EC2_BUILD_PATH/"
@@ -257,7 +266,7 @@ echo ""
 echo "=== kubectl Workflow ==="
 echo "Manifests are version-controlled in Git and synced to EC2:"
 echo "  Local (Git):  airflow/manifests/   dashboard/manifests/"
-echo "  EC2:          /home/ec2-user/airflow/manifests/   /home/ec2-user/dashboard/manifests/"
+echo "  EC2:          $EC2_HOME/airflow/manifests/   $EC2_HOME/dashboard/manifests/"
 echo ""
 echo "To apply/update manifests from your Mac:"
 echo "  kubectl apply -f airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace"
@@ -265,7 +274,7 @@ echo "  kubectl apply -f dashboard/manifests/pod-flask.yaml -n default"
 echo ""
 echo "To apply directly from EC2:"
 echo "  ssh ec2-stock"
-echo "  kubectl apply -f /home/ec2-user/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace"
+echo "  kubectl apply -f $EC2_HOME/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace"
 echo ""
 
 # ACCESS NOTE — these URLs are NOT open to the public by default.

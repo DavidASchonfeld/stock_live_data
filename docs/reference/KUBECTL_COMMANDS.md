@@ -1,6 +1,6 @@
 # Kubernetes (kubectl) Commands Reference
 
-This guide documents common kubectl operations for managing the Stock Live Data Kubernetes cluster on EC2.
+This guide documents common kubectl operations for managing the data_pipeline Kubernetes cluster on EC2.
 
 ---
 
@@ -11,7 +11,10 @@ This guide documents common kubectl operations for managing the Stock Live Data 
 Before running any kubectl commands on your Mac, establish an SSH tunnel to the EC2 K3S API server:
 
 ```bash
-# Start SSH tunnel for kubectl (port 6443) and service NodePorts
+# Start SSH tunnel for kubectl and service NodePorts
+# Port 6443: Kubernetes API server (what kubectl talks to)
+# Port 30080: Airflow UI  |  Port 32147: Flask Dashboard
+# Note: ~/.ssh/config includes ServerAliveInterval/KexAlgorithms for ec2-stock (see PLAIN_ENGLISH_GUIDE.md Part 6)
 ssh -N -L 6443:localhost:6443 \
     -L 30080:localhost:30080 \
     -L 32147:localhost:32147 \
@@ -100,8 +103,8 @@ kubectl apply -f airflow/manifests/ -n airflow-my-namespace
 **Apply from EC2 (using synced copies):**
 ```bash
 ssh ec2-stock
-kubectl apply -f /home/ec2-user/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace
-kubectl apply -f /home/ec2-user/dashboard/manifests/pod-flask.yaml -n default
+kubectl apply -f /home/ubuntu/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace
+kubectl apply -f /home/ubuntu/dashboard/manifests/pod-flask.yaml -n default
 ```
 
 **Delete a resource:**
@@ -304,7 +307,7 @@ data_pipeline/
 ### Reference Copies on EC2
 
 ```
-/home/ec2-user/
+/home/ubuntu/
 ├── airflow/manifests/          # synced by deploy.sh
 └── dashboard/manifests/         # synced by deploy.sh
 ```

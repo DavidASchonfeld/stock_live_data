@@ -2,6 +2,43 @@
 
 ---
 
+## 2026-04-05: Ubuntu 24.04 Migration — Phase H Cutover + Phase I Initiated ✅
+
+**What Changed**: Completed Phase H (Elastic IP cutover) — EIP `52.70.211.1` moved from old AL2023 instance to the new Ubuntu 24.04 instance. `ec2-stock` SSH alias now resolves to Ubuntu. `deploy.sh` confirmed working end-to-end against `ec2-stock` post-cutover: all 3 DAGs visible, Flask pod Running (1/1 Ready), ECR image pushed.
+
+Phase I initiated: old AL2023 instances in us-west-2 and us-east-1 stopped (not terminated) as a 1-week safety net. Target permanent deletion: **2026-04-12**.
+
+**Bug 12 fixed — deploy.sh import validation fails on Mac (no local Airflow)**: The pre-flight validation in `deploy.sh` tried to `import airflow` locally, but Airflow only exists inside the K8s pod — so the check always failed on Mac. Added a graceful skip: if `airflow` is not installed locally, the script prints a warning and continues (syntax was already verified by `py_compile` above).
+
+**deploy.sh fix committed**: Replaced hardcoded `/home/ec2-user` paths with `EC2_HOME="/home/ubuntu"` variable so the script works on Ubuntu without manual edits.
+
+**Next step**: After 2026-04-12 with no issues — terminate old instances and delete any old AMI snapshots (Runbook #15 Phase I).
+
+---
+
+## 2026-04-05: Ubuntu 24.04 Migration — Phase G Verified + Bug 11 Fixed ✅
+
+**What Changed**: Completed Phase G (verification) of Runbook #15 (AL2023 → Ubuntu 24.04 LTS migration). The new Ubuntu instance (`ec2-ubuntu-temp`, `100.26.191.233`) passed all checklist items after fixing one bug discovered during verification.
+
+**Verification results**:
+- All pods Running (flask, scheduler, webserver, triggerer, postgresql, statsd)
+- RAM: 3.0 GiB used / 7.6 GiB total — well under the 6 GB headroom threshold
+- Resource limits active: flask (500m CPU / 512Mi), scheduler (1 CPU / 1Gi)
+- SSH KEX: `sntrup761x25519-sha512` (post-quantum hybrid) negotiated natively — no warning
+- Both DAGs triggered successfully; dashboard displaying data
+
+**Bug found and fixed during Phase G — Airflow UI port 30080 unreachable:**
+- `http://localhost:30080` dropped the connection immediately; dashboard on 32147 worked fine
+- Root cause: `service-airflow-ui.yaml` had `selector: component: api-server` (Airflow 3.x label) but the cluster runs Airflow 2.9.3 which labels the pod `component: webserver` — the service had zero endpoints
+- Fix: changed selector to `component: webserver` in the manifest and re-applied; endpoints populated, port 30080 returned HTTP 200
+- Diagnosis command: `kubectl get endpoints -n airflow-my-namespace airflow-service-expose-ui-port`
+
+**Post-quantum SSH fix is permanent**: Ubuntu 24.04 ships OpenSSH 9.6p1, which supports post-quantum key exchange natively. The `KexAlgorithms` workaround in `~/.ssh/config` is no longer needed and will be removed after Phase H (EIP cutover).
+
+**Next step**: Phase H — move EIP `52.70.211.1` to the new Ubuntu instance (AWS Console).
+
+---
+
 ## 2026-04-04: Snowflake Dual-Write + EC2 Migration Prep ✅
 
 **What Changed**: Wired Snowflake into the pipeline as Step 2 of the career roadmap. Added dual-write so both DAGs write to MariaDB AND Snowflake on each run. Also prepped code and infra for the EC2 us-west-2 → us-east-1 migration.

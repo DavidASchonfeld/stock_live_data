@@ -120,7 +120,7 @@ kubectl describe pod <pod-name> -n <namespace>
 helm upgrade --install airflow apache-airflow/airflow \
   --version 1.20.0 \
   -n airflow-my-namespace \
-  -f /home/ec2-user/airflow/helm/values.yaml
+  -f /home/ubuntu/airflow/helm/values.yaml
 ```
 
 **Fix (Flask pod — ECR token expired):**
@@ -272,9 +272,9 @@ extraEnvFrom: |
 
 ---
 
-### J. Deploy script fails: `rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed`
+### J. Deploy script fails: `rsync: [Receiver] mkdir "/home/ubuntu/dashboard/manifests" failed`
 
-**Symptoms:** Running `./scripts/deploy.sh` fails in Step 2c with: `rsync: [Receiver] mkdir "/home/ec2-user/dashboard/manifests" failed: No such file or directory (2)`
+**Symptoms:** Running `./scripts/deploy.sh` fails in Step 2c with: `rsync: [Receiver] mkdir "/home/ubuntu/dashboard/manifests" failed: No such file or directory (2)`
 
 **Root Cause:** The deploy script's Step 1 creates directories on EC2 for Airflow DAGs and the dashboard build folder, but **did not create the dashboard manifests subdirectory**. The `mkdir -p` command was missing `$EC2_DASHBOARD_PATH/manifests`:
 
@@ -286,7 +286,7 @@ ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH"
 ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
 ```
 
-Later in Step 2c, the script tries to rsync `dashboard/manifests/` (pod-flask.yaml, service-flask.yaml) to `/home/ec2-user/dashboard/manifests/`. Without the directory existing first, rsync fails with `mkdir` permission denied.
+Later in Step 2c, the script tries to rsync `dashboard/manifests/` (pod-flask.yaml, service-flask.yaml) to `/home/ubuntu/dashboard/manifests/`. Without the directory existing first, rsync fails with `mkdir` permission denied.
 
 **Why this happened:** The deploy script was written to sync manifests to EC2 for reference/convenience (Git remains source of truth), but the initial directory creation step didn't account for this nested path. The bug appeared on the first deployment attempt after the script was created.
 
@@ -294,7 +294,7 @@ Later in Step 2c, the script tries to rsync `dashboard/manifests/` (pod-flask.ya
 
 1. **Added `EC2_DASHBOARD_PATH` variable** (line 12):
    ```bash
-   EC2_DASHBOARD_PATH="/home/ec2-user/dashboard"
+   EC2_DASHBOARD_PATH="/home/ubuntu/dashboard"
    ```
    This makes the path reusable and explicit — clearer intent than hardcoding.
 
@@ -304,7 +304,7 @@ Later in Step 2c, the script tries to rsync `dashboard/manifests/` (pod-flask.ya
    ```
 
 **Why this fix works:**
-- `mkdir -p` creates directories recursively, so `/home/ec2-user/dashboard/manifests` is created in a single pass
+- `mkdir -p` creates directories recursively, so `/home/ubuntu/dashboard/manifests` is created in a single pass
 - The `-p` flag means "no error if directory exists," so re-running deploy.sh is idempotent (safe to run multiple times)
 - rsync can now successfully write to the target directory in Step 2c
 

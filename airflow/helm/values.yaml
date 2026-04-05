@@ -1,5 +1,12 @@
 executor: LocalExecutor
 
+# Override postgresql image: chart default tag (16.1.0-debian-11-r15) removed from Docker Hub; ECR Public has no rate limits from EC2
+postgresql:
+  image:
+    registry: public.ecr.aws
+    repository: bitnami/postgresql
+    tag: "16"
+
 # Inject all DB credentials and API keys into every Airflow pod from the db-credentials secret
 extraEnvFrom: |
   - secretRef:
@@ -77,16 +84,21 @@ webserver:
     limits:
       memory: "1Gi"
       cpu: "1000m"
+  # Provider loading across 4 gunicorn workers takes >60s on t3.large; give 3 min to start
+  startupProbe:
+    failureThreshold: 18
+    periodSeconds: 10
+    timeoutSeconds: 20
 
 triggerer:
   # Runs deferred operators (async sensors). Baseline is lightweight (~100 MB).
-  # 256Mi limit prevents unbounded growth if many sensors queue up simultaneously.
+  # 512Mi limit: observed OOMKill at 256Mi on t3.large with providers loaded at startup.
   resources:
     requests:
       memory: "128Mi"
       cpu: "100m"
     limits:
-      memory: "256Mi"
+      memory: "512Mi"
       cpu: "300m"
 
 dagProcessor:
