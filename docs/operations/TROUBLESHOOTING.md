@@ -532,7 +532,7 @@ Host ec2-stock
    ```bash
    # deploy.sh handles this automatically, but you can refresh manually:
    ssh ec2-stock "
-   aws ecr get-login-password --region us-west-2 \
+   aws ecr get-login-password --region us-east-1 \
      | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com
    "
    ```

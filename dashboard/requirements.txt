@@ -11,6 +11,5 @@ pandas==2.2.2
 SQLAlchemy==2.0.30    # 2.x required — uses text() wrapper for raw SQL
 pymysql==1.1.1        # MariaDB/MySQL driver for SQLAlchemy
 
-# TODO (Step 2 of career plan): uncomment when switching load target to Snowflake
-# snowflake-connector-python==3.10.1
-# snowflake-sqlalchemy==1.5.3
+snowflake-connector-python==3.10.1
+snowflake-sqlalchemy==1.6.1       # 1.6.x+ required for SQLAlchemy 2.x compatibility

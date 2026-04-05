@@ -2,6 +2,54 @@
 
 ---
 
+## 2026-04-04: Snowflake Dual-Write + EC2 Migration Prep ✅
+
+**What Changed**: Wired Snowflake into the pipeline as Step 2 of the career roadmap. Added dual-write so both DAGs write to MariaDB AND Snowflake on each run. Also prepped code and infra for the EC2 us-west-2 → us-east-1 migration.
+
+**How the dual-write works**: Each `load()` task writes to MariaDB first (unchanged behavior), then attempts a Snowflake write via the new shared `snowflake_client.write_df_to_snowflake()` helper. The Snowflake call is wrapped in a soft-fail `try/except` — if the `snowflake_default` Airflow Connection is not yet configured, it logs a warning and continues without failing the task. Once Snowflake is configured, both writes succeed.
+
+**To activate Snowflake**:
+1. Sign up at app.snowflake.com → AWS → US East (N. Virginia) → Standard tier
+2. Run warehouse/database/schema/role/user SQL (see Runbook #14)
+3. Create K8s `snowflake-credentials` secret (see Runbook #14)
+4. Register `snowflake_default` Airflow Connection in the UI
+5. Deploy with `./scripts/deploy.sh`
+6. To cut the dashboard over to Snowflake: set `DB_BACKEND=snowflake` in the K8s secret
+
+**Files Created**:
+- `airflow/dags/snowflake_client.py` — Shared `write_df_to_snowflake()` helper (SnowflakeHook + write_pandas)
+
+**Files Modified**:
+- `airflow/dags/dag_stocks.py` — Soft-fail Snowflake dual-write added inside `load()` after MariaDB write
+- `airflow/dags/dag_weather.py` — Same pattern; target table `WEATHER_HOURLY`
+- `dashboard/app.py` — `DB_BACKEND` env var conditional added; `mariadb` default, set to `snowflake` to switch
+- `dashboard/requirements.txt` — `snowflake-connector-python` and `snowflake-sqlalchemy` uncommented
+- `.env.deploy.example` — Default region updated to `us-east-1` (target for EC2 migration)
+
+**EC2 migration prep** (AWS Console steps still needed):
+- SSH public key extracted for us-east-1 key pair import
+- See Runbook #13 for the full AMI snapshot → copy → launch → verify procedure
+
+---
+
+## 2026-04-04: VACATION_MODE Audit Logging ✅
+
+**What Changed**: `check_vacation_mode()` in `dag_utils.py` now logs the current `VACATION_MODE` value on every DAG run, regardless of whether vacation mode is active or inactive.
+
+**Why**: When returning from a break, it was unclear from git history whether VACATION_MODE had actually fired. The Airflow Variable is stored in the metadata DB (not tracked in git), so the only way to confirm past behavior was to check the Airflow UI task grid manually.
+
+**What the logs now show**:
+- `VACATION_MODE = true` + `"VACATION_MODE is enabled — skipping..."` → tasks were skipped
+- `VACATION_MODE = false` + `"VACATION_MODE is inactive — proceeding..."` → pipeline ran normally
+
+**How to audit**: Search task logs for `VACATION_MODE =` or use the new audit step in Runbook #11.
+
+**Files Modified**:
+- `airflow/dags/dag_utils.py` — Added `import logging`; log variable value before branch; log inactive confirmation
+- `docs/operations/RUNBOOKS.md` — Added audit section to Runbook #11
+
+---
+
 ## 2026-03-31: Vacation Mode — DAG Kill Switch ✅
 
 **What Changed**: Added a two-layer mechanism to safely disable all DAGs while away without laptop access.

@@ -192,13 +192,26 @@ When you run `./scripts/deploy.sh`, here's what happens in plain English:
 
 1. **Checks your code for typos** — runs Python syntax checker on all DAG files
 2. **Copies DAG files to EC2** — uses `rsync` (a smart copy tool that only sends files that changed)
-3. **Copies Kubernetes config files to EC2** — same rsync
+3. **Renders and copies the Flask pod manifest** — `pod-flask.yaml` in git contains `${ECR_REGISTRY}` as a placeholder (so your AWS account ID is never committed). Before sending the file to EC2, the script swaps that placeholder for your real ECR URL. It uses `envsubst` to do this substitution, with a fallback to `sed` if `envsubst` isn't on the PATH (see Bug 6 below).
 4. **Copies Flask website code to EC2** — same rsync
 5. **Builds a new Docker image for Flask on EC2** — packages your website into a container
-6. **Pushes that image to AWS ECR** — ECR is like a storage locker for Docker images
+6. **Pushes that image to AWS ECR** — ECR is like a storage locker for Docker images; requires an IAM role (see box below)
 7. **Restarts Airflow pods** — forces them to see the new DAG files (prevents the stale cache bug)
 8. **Restarts the Flask pod** — picks up the new website image
 9. **Verifies everything is running** — checks pod statuses
+
+> **IAM role — what it is and why deploy.sh needs it**
+>
+> An **IAM role** is a permission badge that tells AWS "this EC2 instance is allowed to do X." In this project, the role gives EC2 permission to push and pull Docker images from ECR (the image storage).
+>
+> Step 6 above works by asking AWS for a temporary 12-hour password (`aws ecr get-login-password`). AWS only hands that out if the EC2 instance has the right IAM role attached — it's how AWS knows the request is coming from your trusted server and not a random machine.
+>
+> **The catch with AMIs:** When you create a new instance from an AMI (a disk snapshot of the old one), AWS copies the entire disk — all your files, Docker images, K8s state — but it does **not** copy the IAM role assignment. The role is a property of the instance, not the disk. So every time you launch a new instance (including region migrations), you must manually re-attach the IAM role in the AWS Console.
+>
+> If you forget, `./scripts/deploy.sh` fails at Step 4 with: `Unable to locate credentials`.
+>
+> **Fix:** EC2 Console → select instance → **Actions → Security → Modify IAM role** → attach the role.
+> **Verify:** `ssh ec2-stock 'aws sts get-caller-identity'` — should return your AWS account ID.
 
 ---
 
@@ -324,6 +337,30 @@ This is like baking a cake and then throwing it in the trash. The function creat
 ```python
 dag = stock_market_pipeline()  # Now Airflow can find it by looking for "dag"
 ```
+
+### Bug 6: envsubst Not Found on Apple Silicon
+
+**What happened:** `deploy.sh` failed with `command not found: envsubst` on a Mac with Apple Silicon (M1/M2/M3 chip), even though the tool was installed.
+
+**Why it happened — in plain English:**
+
+`pod-flask.yaml` contains `${ECR_REGISTRY}` as a placeholder instead of your real AWS account ID — this keeps secrets out of git. Before the manifest is applied to Kubernetes, the script needs to swap that placeholder for your actual ECR URL. It uses a tool called `envsubst` to do that substitution.
+
+On Intel Macs, `envsubst` is installed in a standard location that's always on the PATH. On Apple Silicon Macs, Homebrew installs it to `/opt/homebrew/bin/` — a different location. When `deploy.sh` runs, that folder isn't always in the shell's PATH, so the script couldn't find `envsubst` even though it was sitting right there on disk.
+
+**The fix:** Added a fallback — if `envsubst` isn't found, use `sed` instead:
+
+```bash
+if command -v envsubst &>/dev/null; then
+    envsubst '${ECR_REGISTRY}' < pod-flask.yaml > /tmp/pod-flask-rendered.yaml
+else
+    sed "s|\${ECR_REGISTRY}|$ECR_REGISTRY|g" pod-flask.yaml > /tmp/pod-flask-rendered.yaml
+fi
+```
+
+Both produce identical output. `sed` is always available on every Mac and Linux system, so the fallback is guaranteed to work.
+
+---
 
 ### Bug 5: Alpha Vantage Rate Limits (API Errors)
 
@@ -482,4 +519,120 @@ Here's what your project does, start to finish, in one paragraph:
 
 ---
 
-**Last updated:** 2026-03-31
+## Part 9: What Size EC2 Do You Need?
+
+### RAM and vCPU in plain English
+
+Your EC2 instance is like a computer. Every program you run on it uses some memory (RAM). When RAM fills up, programs crash or slow to a crawl. vCPU is like the number of hands your computer has — more hands means it can do more things at the same time without waiting.
+
+Your stack runs multiple programs simultaneously: Airflow (several pods), the Flask dashboard, MariaDB (for now), and eventually Kafka. All of these share the same RAM and vCPU.
+
+### The size options
+
+| Size | RAM | vCPU | Plain English |
+|------|-----|------|--------------|
+| t3.small | 2GB | 2 | Too small — K3s and Airflow alone can use most of this |
+| t3.medium | 4GB | 2 | Not enough — barely fits today's stack, no room for Kafka |
+| **t3.large** | **8GB** | **2** | **Works — the right size for this project** |
+| t3.xlarge | 16GB | 4 | Comfortable but costs ~$60/month more than needed |
+
+### Why t3.large works (and medium doesn't)
+
+Right now, the stack uses roughly 2.5–4GB of RAM. t3.medium has 4GB total — that's basically nothing left over for Kafka or any unexpected spikes. t3.large has 8GB, which gives you real breathing room.
+
+**The key reason t3.large stays comfortable long-term:** your roadmap replaces MariaDB with Snowflake. Snowflake is a cloud database — it runs on Snowflake's servers, not yours. Once that migration is done, MariaDB is uninstalled from EC2, freeing ~300–500MB of RAM. That's the single biggest thing you can do to help t3.large succeed.
+
+### Kafka needs a special setting on t3.large
+
+Kafka is written in Java. Java programs are famous for asking for way more memory than they actually need — kind of like someone who always grabs a huge desk even for a small task. By default, Kafka might claim 1–2GB of RAM just for itself.
+
+On t3.large, you tell Kafka to use a smaller desk:
+
+```
+KAFKA_HEAP_OPTS="-Xmx768m -Xms768m"
+```
+
+This limits Kafka to 768MB, which is plenty for a low-volume pipeline. With this setting, Kafka fits comfortably alongside Airflow and the dashboard.
+
+You also use **KRaft mode** for Kafka, which means Kafka runs without needing a helper program called Zookeeper. Skipping Zookeeper saves another ~500MB.
+
+### Cost savings
+
+- t3.xlarge: ~$121/month
+- t3.large: ~$61/month
+- **Savings: ~$60/month (~$720/year)**
+
+If t3.large ever feels slow or pods start crashing with out-of-memory errors, you can resize to t3.xlarge in the AWS Console in about 2 minutes with no data loss.
+
+### Resource limits — what they are and why every pod needs them
+
+**The problem without limits:**
+
+Imagine five people sharing a 8GB RAM computer, and none of them have any rule about how much RAM they're allowed to use. One person's program develops a memory leak (a bug where it slowly grabs more and more RAM without ever releasing it). Eventually it takes all 8GB. The other four programs crash.
+
+That's exactly what happens in Kubernetes without resource limits. One runaway pod — say, the Airflow webserver spiking during startup — can silently eat all available RAM, causing other pods to get killed. And when a pod gets killed by the system for using too much memory, it gets an `OOMKilled` status (Out Of Memory Killed). You'd see it in `kubectl get pods`.
+
+**The solution: requests and limits**
+
+Each pod now has two numbers set for both memory and CPU:
+
+- **Request** — "I need at least this much." Kubernetes uses this to decide which computer to put the pod on, and guarantees the pod will always have at least this much available.
+- **Limit** — "This is the absolute most I'm allowed to use." If a pod tries to exceed this, Kubernetes kills it (for memory) or throttles it (for CPU). This protects every other pod from being starved.
+
+Think of it like assigned seats on a plane:
+- The **request** is your reserved seat — it's yours, guaranteed.
+- The **limit** is the armrest rule — you can't take more than your share, even if the seat next to you is empty.
+
+**Why were those specific numbers chosen?**
+
+The amounts are based on observed RAM usage at low/portfolio traffic levels (documented in `EC2_SIZING.md`), with roughly **2× headroom** above the baseline to absorb startup spikes — Airflow's webserver, for example, can briefly spike to 800 MB when it first starts:
+
+| Pod | Observed baseline | Memory limit set | Why that limit |
+|-----|------------------|-----------------|----------------|
+| Flask/Dash | ~200 MB | 512 Mi | 2.5× baseline — lightweight app, gives spike room |
+| Airflow webserver | ~500–800 MB | 1 Gi | Covers cold-start spike; stays under 1 Gi in steady state |
+| Airflow scheduler | ~300–500 MB | 1 Gi | Heart of Airflow — generous limit to prevent slow scheduling |
+| Airflow triggerer | ~100–200 MB | 256 Mi | Very lightweight; limit is still 2× baseline |
+| Airflow dag-processor | ~200–300 MB | 512 Mi | If it exceeds 512 Mi, it's a bug in a DAG file, not a sizing issue |
+
+**What happens if a limit is hit?**
+
+- **Memory limit hit** → pod is immediately killed and restarted (OOMKilled). You'd see `RESTARTS` count go up in `kubectl get pods`.
+- **CPU limit hit** → pod is throttled (slowed down), not killed. Things just run slower.
+
+In both cases, the other pods keep running normally — which is the whole point.
+
+**How to check that limits are actually in place:**
+
+```bash
+# Check Flask pod limits
+ssh ec2-stock kubectl describe pod my-kuber-pod-flask -n default | grep -A6 "Limits:"
+
+# Check Airflow scheduler limits
+ssh ec2-stock kubectl describe pod -n airflow-my-namespace -l component=scheduler | grep -A6 "Limits:"
+```
+
+You should see `memory: 512Mi` for Flask and `memory: 1Gi` for the scheduler.
+
+**Where the limits are defined in your code:**
+
+- Flask pod: `dashboard/manifests/pod-flask.yaml` (look for the `resources:` section)
+- All Airflow components: `airflow/helm/values.yaml` (look for `webserver:`, `scheduler:`, `triggerer:`, `dagProcessor:` sections)
+
+Each limit has a comment in the file explaining why that specific amount was chosen.
+
+### What to watch for after switching
+
+After you switch to t3.large, run this command and look at the "available" column — it should show at least 3–4GB free at rest:
+
+```bash
+ssh ec2-stock free -h
+```
+
+If pods start showing high RESTARTS counts or errors, check `kubectl get pods --all-namespaces`. A status of `OOMKilled` means a pod ran out of memory and crashed — that's the sign you need to resize up or tune memory settings.
+
+See [infrastructure/EC2_SIZING.md](infrastructure/EC2_SIZING.md) for the full technical breakdown, and [BACKLOG.md](BACKLOG.md) for the step-by-step checklist.
+
+---
+
+**Last updated:** 2026-04-05 — Added resource limits explanation (Part 9); added Bug 6 (envsubst Apple Silicon fallback); updated deploy.sh step 3 to explain ECR_REGISTRY placeholder substitution.

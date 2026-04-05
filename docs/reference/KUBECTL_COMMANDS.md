@@ -204,7 +204,7 @@ kubectl describe pod my-kuber-pod-flask -n default
 **Fix:**
 ```bash
 # Refresh ECR credentials and redeploy
-ssh "$EC2_HOST" "aws ecr get-login-password --region us-west-2 \
+ssh "$EC2_HOST" "aws ecr get-login-password --region us-east-1 \
     | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com"
 
 # Then delete and recreate the pod

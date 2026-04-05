@@ -31,7 +31,7 @@ This is **Step 1** of a larger learning project. Step 2 will migrate the databas
 ## Architecture
 
 ```
-AWS EC2 t3.xlarge  (Elastic IP <YOUR_EC2_IP>)
+AWS EC2 t3.large  (Elastic IP <YOUR_EC2_IP>)
 └── K3S Kubernetes
     │
     ├── Pod 1: Apache Airflow
@@ -72,7 +72,7 @@ AWS EC2 t3.xlarge  (Elastic IP <YOUR_EC2_IP>)
 | App Server | Gunicorn 22.0.0 (2 workers) |
 | Containerization | Docker (python:3.12-slim) + AWS ECR (private image registry) |
 | Kubernetes | K3S (lightweight K8s, default containerd runtime) |
-| Cloud | AWS EC2 t3.xlarge, 100 GiB EBS gp3 |
+| Cloud | AWS EC2 t3.large, 100 GiB EBS gp3 |
 | Stock / Financials API | SEC EDGAR XBRL (free U.S. government data — no API key, no rate cap) |
 | Weather API | Open-Meteo (free, no key required) |
 | Helm | Used for Airflow deployment on K3S |
@@ -287,7 +287,7 @@ airflow scheduler
 > Also note: the EC2 security group locks SSH to your current location's IP — update it in AWS Console if you can't connect.
 
 ### One-time infrastructure setup
-1. Launch EC2 t3.xlarge, Amazon Linux 2023, 100 GiB gp3, assign Elastic IP.
+1. Launch EC2 t3.large, Amazon Linux 2023, 100 GiB gp3, assign Elastic IP.
 2. Open inbound ports: 22, 30080 (Airflow UI), 32147 (Flask).
 3. `curl -sfL https://get.k3s.io | sh -`  (installs K3S)
 4. Install Helm, add Airflow repo: `helm repo add apache-airflow https://airflow.apache.org`
@@ -304,7 +304,7 @@ cp .env.deploy.example .env.deploy
 The file looks like:
 ```bash
 ECR_REGISTRY="<AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com"
-AWS_REGION="us-west-2"
+AWS_REGION="us-east-1"
 ```
 
 `deploy.sh` will refuse to run if `.env.deploy` is missing or incomplete.

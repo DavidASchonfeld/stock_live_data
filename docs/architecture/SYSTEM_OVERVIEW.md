@@ -18,10 +18,10 @@ Your stock data pipeline is a production system running on a single AWS EC2 inst
 
 ### Your Use Case: K3S on EC2
 
-You run K3S on a single **t3.xlarge EC2 instance** (4 vCPU, 16 GB RAM) in AWS. This choice saves money compared to alternatives:
+You run K3S on a single **t3.large EC2 instance** (2 vCPU, 8 GB RAM) in AWS. This choice saves money compared to alternatives:
 
 - **Full EKS (Elastic Kubernetes Service):** $0.10/hour cluster fee + compute costs → ~$100+/month just for the cluster
-- **K3S on EC2:** Only pay for the t3.xlarge instance (~$0.15/hour) → ~$110/month total, with full Kubernetes features
+- **K3S on EC2:** Only pay for the t3.large instance (~$0.07/hour) → ~$54/month total, with full Kubernetes features
 - **Docker Compose on EC2:** No orchestration, no auto-restart, harder to scale → risky for production
 
 K3S gives you production-grade container orchestration (auto-restart, rolling updates, health checks) at a fraction of the cost.
@@ -50,7 +50,7 @@ K3S ships with **containerd** pre-configured because:
 1. **Minimal overhead:** No Docker daemon bloat; K3S speaks directly to containerd
 2. **Native CRI support:** containerd implements the Kubernetes Container Runtime Interface (CRI)
 3. **Faster pod startup:** No extra layer between Kubernetes and container execution
-4. **Lower resource usage:** Critical on your single t3.xlarge instance
+4. **Lower resource usage:** Critical on your single t3.large instance
 
 When you push images to AWS ECR and K3S pulls them, the flow is:
 ```

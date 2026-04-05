@@ -41,9 +41,23 @@ SQL_PASSWORD = os.environ.get("DB_PASSWORD", "")
 SQL_DATABASE = os.environ.get("DB_NAME",     "database_one")
 SQL_URL      = os.environ.get("DB_HOST",     "")
 
-DB_ENGINE = create_engine(
-    f"mysql+pymysql://{SQL_USERNAME}:{SQL_PASSWORD}@{SQL_URL}/{SQL_DATABASE}"
-)
+DB_BACKEND = os.environ.get("DB_BACKEND", "mariadb")  # "mariadb" (default) or "snowflake" — switch after validating Snowflake data
+if DB_BACKEND == "snowflake":
+    # Snowflake engine — set DB_BACKEND=snowflake in the K8s secret to activate
+    from snowflake.sqlalchemy import URL as SnowflakeURL
+    DB_ENGINE = create_engine(SnowflakeURL(
+        account=os.environ.get("SNOWFLAKE_ACCOUNT"),
+        user=os.environ.get("SNOWFLAKE_USER"),
+        password=os.environ.get("SNOWFLAKE_PASSWORD"),
+        database=os.environ.get("SNOWFLAKE_DATABASE", "PIPELINE_DB"),
+        schema=os.environ.get("SNOWFLAKE_SCHEMA", "RAW"),
+        warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "PIPELINE_WH"),
+    ))
+else:
+    # MariaDB engine (default) — stays active until DB_BACKEND=snowflake is set
+    DB_ENGINE = create_engine(
+        f"mysql+pymysql://{SQL_USERNAME}:{SQL_PASSWORD}@{SQL_URL}/{SQL_DATABASE}"
+    )
 # ─────────────────────────────────────────────────────────────────────────────
 
 

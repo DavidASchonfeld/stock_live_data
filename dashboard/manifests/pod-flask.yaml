@@ -15,6 +15,17 @@ spec:
     envFrom:
     - secretRef:
         name: db-credentials  # injects DB_USER, DB_PASSWORD, DB_HOST, DB_NAME
+    # Resource limits required on t3.large (8 GB RAM) to prevent one runaway pod from OOMKilling (Out Of Memory Killing) others.
+    # requests = memory/CPU K8s guarantees and uses for scheduling; limits = hard ceiling before OOMKill (pod killed by OS for exceeding RAM).
+    # 256Mi request: Flask/Dash idle baseline is ~200 MB (see EC2_SIZING.md); 512Mi limit covers peak load.
+    # 100m CPU request (0.1 core): low-traffic dashboard needs very little; 500m burst cap leaves cores free for Airflow.
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
     # Liveness probe: restart pod if health endpoint fails (prevents hung processes)
     # Detects "zombie" processes that appear running but are actually stuck; auto-heals via restart
     livenessProbe:

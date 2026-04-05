@@ -204,7 +204,7 @@ A YAML file that describes Kubernetes resources (pods, services, volumes). K3S r
 Example: `pv-dags.yaml` (PersistentVolume), `pod-flask.yaml` (Pod definition).
 
 ### EC2 Instance
-An AWS virtual machine. You run a `t3.xlarge` instance (4 vCPU, 16 GB RAM) that hosts your K3S cluster.
+An AWS virtual machine. You run a `t3.large` instance (2 vCPU, 8 GB RAM) that hosts your K3S cluster.
 
 ### SSH (Secure Shell)
 A protocol for secure remote access to machines. You use SSH to connect to your EC2 instance:

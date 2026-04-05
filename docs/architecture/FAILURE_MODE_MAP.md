@@ -167,8 +167,8 @@ When something breaks, find the component showing symptoms below. Each failure m
 
 | Field | Detail |
 |-------|--------|
-| **Symptoms** | Pods evicted or OOMKilled. New pods stuck in `Pending`. `kubectl describe node` shows resource pressure. |
-| **Root cause** | All pods share one t3.xlarge (16GB RAM). A memory leak or large DataFrame processing can starve other pods. No resource limits set means one pod can consume everything. |
+| **Symptoms** | Pods evicted or OOMKilled (`OOMKilled` = Out Of Memory Killed — OS force-killed a pod for exceeding its RAM limit). New pods stuck in `Pending`. `kubectl describe node` shows resource pressure. |
+| **Root cause** | All pods share one node's RAM. A memory leak or large DataFrame processing can starve other pods. No resource limits set means one pod can consume everything. |
 | **Blast radius** | Cascading evictions. K8s evicts lowest-priority pods first, which may include MariaDB (total data loss if PV not configured) or the scheduler (all DAGs stop). |
 | **Prevention** | Set resource requests and limits on all pods. Monitor node memory usage. Identify which pods are critical vs. evictable. |
 
@@ -217,8 +217,8 @@ When something breaks, find the component showing symptoms below. Each failure m
 
 | Field | Detail |
 |-------|--------|
-| **Symptoms** | SSH sluggish. Commands timeout. Pods report OOMKilled. `top` shows high memory/CPU. |
-| **Root cause** | 16GB RAM and 4 vCPU shared across all K3s pods plus the OS. Large DataFrame operations in DAGs, runaway log growth, or memory leaks push past limits. |
+| **Symptoms** | SSH sluggish. Commands timeout. Pods report OOMKilled (Out Of Memory Killed — OS force-killed a pod for exceeding its RAM limit). `top` shows high memory/CPU. |
+| **Root cause** | All RAM and vCPU shared across all K3s pods plus the OS. Large DataFrame operations in DAGs, runaway log growth, or memory leaks push past limits. |
 | **Blast radius** | Cascading pod evictions. SSH itself may become unusable if the OOM killer targets system processes. |
 | **Prevention** | Set K8s resource limits per pod. Monitor with `kubectl top nodes` and `kubectl top pods`. |
 

@@ -13,7 +13,7 @@ A deep dive into the non-obvious risks of running K3s on a single EC2 instance w
 
 ### What You Gain
 
-- **Cost efficiency** — One t3.xlarge (~$110/mo) vs. EKS cluster ($73/mo just for control plane + compute)
+- **Cost efficiency** — One t3.large (~$54/mo) vs. EKS cluster ($73/mo just for control plane + compute)
 - **Simplicity** — No multi-node networking, no leader election complexity, no split-brain scenarios
 - **Full K8s API** — Production-grade orchestration (auto-restart, rolling updates, health checks)
 - **Portfolio value** — Demonstrates real K8s knowledge without cloud-managed training wheels
@@ -194,7 +194,7 @@ resources:
     cpu: "1000m"
 ```
 
-**Requests** guarantee minimum resources. **Limits** set a ceiling — if a pod exceeds its memory limit, K8s OOMKills it. Set limits generously to avoid unnecessary kills, but set them to prevent one pod from starving everything.
+**Requests** guarantee minimum resources. **Limits** set a ceiling — if a pod exceeds its memory limit, K8s OOMKills it (Out Of Memory Kill: the OS force-kills the pod and restarts it). Set limits generously to avoid unnecessary kills, but set them to prevent one pod from starving everything.
 
 ---
 

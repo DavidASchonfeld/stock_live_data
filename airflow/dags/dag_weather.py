@@ -213,6 +213,14 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
             # index = False means: don't write the Pandas Dataframe's index into the SQL table
             writer.print(f"Loaded {len(myDataFrameThing)} rows into weather_hourly table")  # confirm row count written
 
+            # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
+            try:
+                from snowflake_client import write_df_to_snowflake
+                write_df_to_snowflake(myDataFrameThing.copy(), "WEATHER_HOURLY")
+                writer.print(f"Loaded {len(myDataFrameThing)} rows into Snowflake WEATHER_HOURLY")
+            except Exception as sf_err:
+                writer.print(f"Snowflake write skipped (not yet configured): {sf_err}")
+
         except SQLAlchemyError as e:
             print("Connection failed. Error: "+str(e))
             raise

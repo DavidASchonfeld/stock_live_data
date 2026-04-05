@@ -246,6 +246,14 @@ def stock_market_pipeline():
             # index = False means: don't write the Pandas Dataframe's index into the SQL table
             writer.print(f"Loaded {len(df)} rows into company_financials table")  # confirm row count written
 
+            # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
+            try:
+                from snowflake_client import write_df_to_snowflake
+                write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
+                writer.print(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
+            except Exception as sf_err:
+                writer.print(f"Snowflake write skipped (not yet configured): {sf_err}")
+
         except SQLAlchemyError as e:
             # Re-raise so task fails and Airflow can retry (instead of silent failure)
             writer.print(f"Database error loading records: {e}")

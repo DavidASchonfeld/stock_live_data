@@ -53,3 +53,49 @@ scheduler:
   extraVolumeMounts:
    - name: out-volume
      mountPath: /opt/airflow/out
+  # Heart of Airflow — parses DAGs and triggers tasks. Guaranteed 512Mi prevents slow scheduling under load.
+  # 1Gi limit: DAG parsing can spike briefly; same ceiling as webserver keeps budget symmetric and predictable.
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "200m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+# Resource limits required on t3.large (8 GB RAM). Without limits a runaway component can OOMKill (Out Of Memory Kill — OS force-kills the pod when it exceeds its RAM allowance) other pods.
+# requests = K8s scheduling guarantee; limits = hard ceiling. Amounts chosen at ~2x observed baseline
+# (EC2_SIZING.md) to absorb startup spikes while keeping total ceiling ~2.75Gi — safe headroom for Kafka later.
+
+webserver:
+  # Airflow UI + REST API server. Peaks ~800 MB on cold start; 1Gi limit absorbs that spike.
+  # 200m CPU: mostly idle between requests; 1000m cap handles page-render and DAG-graph bursts.
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "200m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+triggerer:
+  # Runs deferred operators (async sensors). Baseline is lightweight (~100 MB).
+  # 256Mi limit prevents unbounded growth if many sensors queue up simultaneously.
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "300m"
+
+dagProcessor:
+  # Continuously re-parses DAG files. 256Mi request covers normal cycles.
+  # 512Mi limit: if exceeded it signals a DAG code problem (e.g. import loop), not a sizing issue.
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"

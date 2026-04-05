@@ -250,7 +250,7 @@ kubectl get pods --all-namespaces
 # PostgreSQL should come up first, then Airflow pods
 
 # 5. If pods stuck in ImagePullBackOff (ECR token expired)
-aws ecr get-login-password --region us-west-2 | \
+aws ecr get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com
 # Then recreate the ECR credential secret
 # (deploy.sh step 5 handles this — or run manually)
@@ -355,13 +355,13 @@ docker tag stock-dashboard:latest \
   <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/stock-dashboard:latest
 
 # 3. Push to ECR
-aws ecr get-login-password --region us-west-2 | \
+aws ecr get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com
 docker push <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/stock-dashboard:latest
 
 # 4. Refresh ECR credentials on EC2
 ssh ec2-stock "
-aws ecr get-login-password --region us-west-2 | \
+aws ecr get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com
 "
 # Then update the ecr-credentials K8s secret (deploy.sh step 5 does this)
@@ -556,6 +556,24 @@ If any task shows **Failed** instead of **Skipped**, vacation mode is not workin
 
 ---
 
+### Audit past runs — confirm vacation mode fired
+
+Every DAG run now records the VACATION_MODE value in the `extract` task log. To verify whether a specific run was skipped:
+
+1. **Airflow UI → DAGs → `Stock_Market_Pipeline` → click a past run**
+2. Click the `extract` task box → **"Log"**
+3. Search the log for `VACATION_MODE =`
+   - `VACATION_MODE = true` → vacation mode was active; tasks were skipped
+   - `VACATION_MODE = false` → pipeline ran normally; API calls were made
+
+You can also check all runs at once from the CLI:
+```bash
+ssh ec2-stock kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  grep -r "VACATION_MODE =" /opt/airflow/logs/dag_id=Stock_Market_Pipeline/
+```
+
+---
+
 ### Disable vacation mode (when you return)
 
 ```bash
@@ -677,4 +695,312 @@ With DAGs running every 5 minutes, the default 60-minute cooldown means at most 
 
 ---
 
-**Last updated:** 2026-03-31
+---
+
+## 13. Migrate EC2 to a New Region
+
+**When:** Moving the EC2 instance to a different AWS region (e.g., us-west-2 → us-east-1).
+
+**Prerequisites:**
+- AWS Console access
+- SSH key `.pem` file available locally
+- No active DAG runs in progress
+
+### Phase A — Pre-migration (local Mac)
+
+```bash
+# 1. Extract public key from .pem (needed to import into new region)
+ssh-keygen -y -f /Users/David/Documents/Programming/Python/Data-Pipeline-2026/kafkaProjectKeyPair_4-29-2025.pem
+# Save the output line (starts with ssh-rsa)
+
+# 2. Document current security group inbound rules in AWS Console:
+#    EC2 (us-west-2) → Security Groups → Inbound rules → write them all down
+```
+
+### Phase B — AWS Console (us-west-2)
+
+1. **Create AMI:** EC2 → Instances → select instance → Actions → Image and templates → Create image
+   - Name: `data-pipeline-migration-YYYYMMDD`
+   - "No reboot": leave **unchecked** (ensures filesystem consistency)
+   - **"Delete on termination" (in the storage section): leave checked (default)**
+     > There are 3 separate things: (1) the **EC2 instance** — the virtual computer; (2) the **EBS volume** — its virtual hard drive; (3) the **AMI** — a backup photo of the hard drive stored separately in S3. "Delete on termination" only controls whether the hard drive is automatically thrown away when the instance is permanently shut down (terminated). Checked = yes, auto-delete the hard drive on termination (no orphaned volumes, no surprise charges). The AMI is completely separate and is never affected — it persists until you manually delete it yourself.
+   - Wait for status "available" (5–20 min)
+2. **Copy AMI to target region:** AMIs → select AMI → Actions → Copy AMI → Destination: `us-east-1`
+   - Wait for "available" in us-east-1 (15–45 min)
+
+> The AMI carries K3S etcd (all K8s Secrets intact), MariaDB data dir, Docker images, and `/home/ec2-user/`.
+
+### Phase C — AWS Console (us-east-1)
+
+3. **Import key pair:** EC2 → Key Pairs → Import key pair → paste the public key from Phase A
+4. **Create security group:** EC2 → Security Groups → Create → add identical inbound rules from Phase A
+5. **Create ECR repo:** ECR → Create repository → Name: `my-flask-app` (Private)
+   - New registry URI: `683010036255.dkr.ecr.us-east-1.amazonaws.com`
+6. **Launch instance:** AMIs → select copied AMI → Launch instance from AMI
+   - Instance type: `t3.large` (2 vCPU, 8 GB — downsized from t3.xlarge; safe to test since this is a fresh launch)
+   - Key pair, security group: from steps 3–4 above
+   - **IAM role: must be manually re-attached** — AMIs copy the disk but NOT the IAM role assignment. Without it, the instance has no credentials to talk to ECR, and `./scripts/deploy.sh` will fail at Step 4 with "Unable to locate credentials". Set it here at launch time: under **Advanced details → IAM instance profile**, select the same role the old instance used (check old instance: EC2 Console → select instance → Security tab → IAM Role). If you forget, you can attach it later: EC2 → select instance → **Actions → Security → Modify IAM role**.
+7. **Allocate + Associate EIP:**
+   - EC2 → Network & Security → **Elastic IPs** → **Allocate Elastic IP address** → Allocate
+   - Select the newly allocated EIP → **Actions → Associate Elastic IP address**
+   - Resource type: **Instance** | Instance: select your new t3.large | Private IP: leave default → **Associate**
+   - Verify: the instance's **Public IPv4 address** in EC2 console should now show the EIP
+   > **Note — EIPs are region-specific and cannot be transferred.** Your old EIP
+   > (`44.245.29.65`, us-west-2) stays there until you release it in Phase G. You
+   > will receive a **brand new IP address** in us-east-1. Update `~/.ssh/config`,
+   > bookmarks, and `infra_local.md` with this new IP (Phase E covers this).
+
+### Phase D — First-boot verification (SSH into new instance)
+
+> **t3.large RAM budget** — verify headroom before declaring success:
+>
+> | Component | K8s limit | Notes |
+> |-----------|-----------|-------|
+> | Flask/Dash | 512 Mi | `dashboard/manifests/pod-flask.yaml` |
+> | Airflow webserver | 1 Gi | `airflow/helm/values.yaml` |
+> | Airflow scheduler | 1 Gi | `airflow/helm/values.yaml` |
+> | Airflow triggerer | 256 Mi | `airflow/helm/values.yaml` |
+> | Airflow dag-processor | 512 Mi | `airflow/helm/values.yaml` |
+> | K3s system (host) | ~500 Mi | not a K8s pod |
+> | MariaDB (host) | ~500 Mi | not a K8s pod |
+> | **Worst-case total** | **~4.75 Gi** | **~3.25 Gi free on 8 GB** |
+>
+> If `free -h` shows > 6 GB used under load, stop here and resize to t3.xlarge before continuing.
+
+```bash
+ssh -i .../kafkaProjectKeyPair_4-29-2025.pem ec2-user@52.70.211.1
+
+sudo systemctl status k3s
+kubectl get pods --all-namespaces          # wait 3–5 min for pods to start
+sudo systemctl status mariadb
+kubectl get secret db-credentials -n airflow-my-namespace
+
+# Get new private IP — will differ from old 172.31.23.236
+ip addr show | grep "inet 172"
+```
+
+**Critical — update db-credentials secret** with new private IP (old one is baked in from AMI):
+
+```bash
+NEW_IP=$(hostname -I | awk '{print $1}')
+for NS in airflow-my-namespace default; do
+  kubectl create secret generic db-credentials -n $NS \
+    --from-literal=DB_USER=airflow_user \
+    --from-literal=DB_PASSWORD=<password> \
+    --from-literal=DB_HOST=$NEW_IP \
+    --from-literal=DB_NAME=database_one \
+    --from-literal=EDGAR_CONTACT_EMAIL=davedevportfolio@gmail.com \
+    --dry-run=client -o yaml | kubectl apply -f -
+done
+
+# Restart pods to pick up the new secret
+kubectl rollout restart deployment -n airflow-my-namespace
+kubectl delete pod my-kuber-pod-flask -n default
+```
+
+**Verify resource limits are active** (limits are defined in manifests/values.yaml and protect t3.large from OOMKill cascades — OOMKill = Out Of Memory Kill, where the OS force-kills a pod that exceeds its RAM limit):
+
+```bash
+# Confirm Flask pod has memory limit of 512Mi
+kubectl describe pod my-kuber-pod-flask -n default | grep -A6 "Limits:"
+
+# Confirm Airflow scheduler has memory limit of 1Gi
+kubectl describe pod -n airflow-my-namespace -l component=scheduler | grep -A6 "Limits:"
+```
+
+### Phase E — Update local config files
+
+**`~/.ssh/config`** — update the `ec2-stock` entry on your Mac:
+
+```
+Host ec2-stock
+    HostName 52.70.211.1
+    User ec2-user
+    IdentityFile ~/Documents/Programming/Python/Data-Pipeline-2026/kafkaProjectKeyPair_4-29-2025.pem
+```
+
+**`.env.deploy`** — update both values to us-east-1 (deploy.sh reads these for ECR auth and image push):
+
+```bash
+ECR_REGISTRY="683010036255.dkr.ecr.us-east-1.amazonaws.com"
+AWS_REGION="us-east-1"
+```
+
+| File | Change |
+|------|--------|
+| `~/.ssh/config` | `HostName` → `52.70.211.1` (see snippet above) |
+| `.env.deploy` | `ECR_REGISTRY` → us-east-1 registry; `AWS_REGION` → `us-east-1` (see snippet above) |
+| `infra_local.md` | Update EIP, MariaDB private IP (from Phase D), service URLs |
+
+### Phase F — First deploy + testing
+
+```bash
+# Run deploy to push image to new ECR and refresh K8s secrets
+./scripts/deploy.sh
+
+# Then test via SSH tunnel:
+ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
+```
+
+**Pre-deploy checklist (before running `./scripts/deploy.sh`):**
+- [ ] IAM role attached to new instance (EC2 Console → select instance → Security tab → IAM Role must be non-empty). Without this, deploy fails at Step 4 with "Unable to locate credentials" — `aws ecr get-login-password` requires the instance's IAM role to get a temporary ECR token.
+- [ ] Verify: `ssh ec2-stock 'aws sts get-caller-identity'` — should return your account ID, not an error
+
+**Post-deploy checklist:**
+- [ ] All pods Running (`kubectl get pods --all-namespaces`)
+- [ ] Airflow UI loads at `http://localhost:30080`
+- [ ] Manually trigger both DAGs — all tasks succeed
+- [ ] Dashboard shows data at `http://localhost:32147/dashboard/`
+- [ ] `free -h` shows < 6 GB used (t3.large headroom check)
+
+### Phase G — Cleanup (after 48–72 hours stable)
+
+```bash
+# Release old EIP (stops billing for idle EIP)
+# AWS Console (us-west-2) → Elastic IPs → Disassociate → Release
+
+# Stop (don't terminate) old instance — keep as safety net for 1 week
+# After 1 week: Terminate instance, delete old AMI + EBS snapshots
+# Delete us-west-2 ECR repo to stop paying for stored images
+```
+
+**Success criteria:** Both DAGs run clean, dashboard displays data, deploy.sh completes without errors, `free -h` < 6 GB used.
+
+---
+
+## 14. Set Up and Activate Snowflake
+
+**When:** First-time Snowflake setup, or re-establishing the Snowflake connection after a migration.
+
+**Prerequisites:**
+- Snowflake account in AWS us-east-1 (see sign-up steps below)
+- EC2 instance running and accessible via `ssh ec2-stock`
+- `./scripts/deploy.sh` working
+
+### Phase A — Sign up for Snowflake
+
+1. Go to `app.snowflake.com` → Start for free
+2. Cloud: **AWS**, Region: **US East (N. Virginia)** — matches EC2 region
+3. Edition: **Standard** (free trial gives $400 credits)
+4. Note your account identifier — format `abc12345.us-east-1` — needed for all connections
+
+### Phase B — Initial SQL setup (run in Snowsight worksheet)
+
+```sql
+-- Warehouse: X-Small, auto-suspends after 60s idle to minimize cost
+CREATE WAREHOUSE IF NOT EXISTS PIPELINE_WH
+  WAREHOUSE_SIZE = 'X-SMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE;
+
+CREATE DATABASE IF NOT EXISTS PIPELINE_DB;
+CREATE SCHEMA IF NOT EXISTS PIPELINE_DB.RAW;
+
+-- Least-privilege service role for the pipeline
+CREATE ROLE IF NOT EXISTS PIPELINE_ROLE;
+GRANT USAGE ON WAREHOUSE PIPELINE_WH TO ROLE PIPELINE_ROLE;
+GRANT USAGE ON DATABASE PIPELINE_DB TO ROLE PIPELINE_ROLE;
+GRANT USAGE ON SCHEMA PIPELINE_DB.RAW TO ROLE PIPELINE_ROLE;
+GRANT CREATE TABLE ON SCHEMA PIPELINE_DB.RAW TO ROLE PIPELINE_ROLE;
+GRANT INSERT, UPDATE, SELECT, DELETE ON ALL TABLES IN SCHEMA PIPELINE_DB.RAW TO ROLE PIPELINE_ROLE;
+GRANT INSERT, UPDATE, SELECT, DELETE ON FUTURE TABLES IN SCHEMA PIPELINE_DB.RAW TO ROLE PIPELINE_ROLE;
+
+-- Service user — store the password in .env / K8s secret, never in source code
+CREATE USER IF NOT EXISTS PIPELINE_USER
+  PASSWORD = '<STRONG_PASSWORD>'
+  DEFAULT_ROLE = PIPELINE_ROLE
+  DEFAULT_WAREHOUSE = PIPELINE_WH
+  DEFAULT_NAMESPACE = 'PIPELINE_DB.RAW';
+
+GRANT ROLE PIPELINE_ROLE TO USER PIPELINE_USER;
+```
+
+### Phase C — Store credentials
+
+**Local `.env`:**
+```
+SNOWFLAKE_ACCOUNT=<account_identifier>
+SNOWFLAKE_USER=PIPELINE_USER
+SNOWFLAKE_PASSWORD=<strong_password>
+SNOWFLAKE_DATABASE=PIPELINE_DB
+SNOWFLAKE_SCHEMA=RAW
+SNOWFLAKE_WAREHOUSE=PIPELINE_WH
+```
+
+**K8s secret on EC2** (both namespaces):
+```bash
+ssh ec2-stock
+for NS in airflow-my-namespace default; do
+  kubectl create secret generic snowflake-credentials -n $NS \
+    --from-literal=SNOWFLAKE_ACCOUNT=<account_identifier> \
+    --from-literal=SNOWFLAKE_USER=PIPELINE_USER \
+    --from-literal=SNOWFLAKE_PASSWORD=<password> \
+    --from-literal=SNOWFLAKE_DATABASE=PIPELINE_DB \
+    --from-literal=SNOWFLAKE_SCHEMA=RAW \
+    --from-literal=SNOWFLAKE_WAREHOUSE=PIPELINE_WH \
+    --dry-run=client -o yaml | kubectl apply -f -
+done
+```
+
+**Helm values** — add `snowflake-credentials` to `extraEnvFrom` in `airflow/helm/values.yaml`:
+```yaml
+extraEnvFrom: |
+  - secretRef:
+      name: db-credentials
+  - secretRef:
+      name: snowflake-credentials
+```
+
+**Pod manifest** — add to `envFrom` in `dashboard/manifests/pod-flask.yaml`:
+```yaml
+envFrom:
+- secretRef:
+    name: db-credentials
+- secretRef:
+    name: snowflake-credentials
+```
+
+### Phase D — Register Airflow Connection
+
+Airflow UI → Admin → Connections → Add:
+- **Conn Id:** `snowflake_default`
+- **Conn Type:** Snowflake
+- **Account:** your account identifier
+- **Login:** `PIPELINE_USER`
+- **Password:** your password
+- **Schema:** `RAW`
+- **Extra (JSON):** `{"warehouse": "PIPELINE_WH", "database": "PIPELINE_DB", "role": "PIPELINE_ROLE"}`
+
+### Phase E — Deploy and verify
+
+```bash
+./scripts/deploy.sh
+```
+
+Then manually trigger both DAGs and verify in Snowsight:
+```sql
+SELECT COUNT(*) FROM PIPELINE_DB.RAW.COMPANY_FINANCIALS;
+SELECT COUNT(*) FROM PIPELINE_DB.RAW.WEATHER_HOURLY;
+-- Both should return > 0 rows
+```
+
+Also check Airflow task logs for: `Loaded N rows into Snowflake COMPANY_FINANCIALS`
+
+### Phase F — Cut dashboard over to Snowflake (after validating data)
+
+Once Snowflake data looks correct, update the K8s secret to switch the dashboard engine:
+```bash
+ssh ec2-stock
+kubectl create secret generic snowflake-credentials -n default \
+  ... (existing values) \
+  --from-literal=DB_BACKEND=snowflake \   # this key activates the Snowflake engine in app.py
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl delete pod my-kuber-pod-flask -n default   # restart to pick up new value
+```
+
+**Success criteria:** Rows appear in Snowsight after DAG runs; dashboard loads data correctly when `DB_BACKEND=snowflake`.
+
+---
+
+**Last updated:** 2026-04-04

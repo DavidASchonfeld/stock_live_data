@@ -24,7 +24,7 @@ A Flask + Dash web app queries MariaDB and renders an interactive candlestick ch
 Your Mac
 └── docker build/push → AWS ECR (image registry)
 
-AWS EC2 t3.xlarge (4 vCPU, 16 GB RAM, 100 GiB EBS)
+AWS EC2 t3.large (2 vCPU, 8 GB RAM, 100 GiB EBS)
 ├── MariaDB  ← runs directly on EC2 (not in K8s)
 │   └── database_one
 │       ├── company_financials  (ticker, metric, value, date, ...)

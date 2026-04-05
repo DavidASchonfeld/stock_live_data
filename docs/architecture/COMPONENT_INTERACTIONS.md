@@ -15,7 +15,7 @@ How components in this system depend on each other, where failures cascade betwe
                     ┌──────────────┐
                     │  AWS EC2     │
                     │  Instance    │
-                    │  (t3.xlarge) │
+                    │  (t3.large)  │
                     └──────┬───────┘
                            │ hosts
                     ┌──────▼───────┐

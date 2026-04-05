@@ -191,7 +191,12 @@ ssh "$EC2_HOST" "kubectl delete pod $FLASK_POD -n default --ignore-not-found=tru
 # We substitute the real value from .env.deploy before applying, so the AWS account ID
 # stays out of version control. envsubst replaces ${ECR_REGISTRY} with the actual URI.
 # service-flask.yaml has no secrets, so it's applied as-is.
-ECR_REGISTRY="$ECR_REGISTRY" envsubst '${ECR_REGISTRY}' < dashboard/manifests/pod-flask.yaml > /tmp/pod-flask-rendered.yaml
+# envsubst is in /opt/homebrew/bin on Apple Silicon Macs; fall back to sed if not found
+if command -v envsubst &>/dev/null; then
+    ECR_REGISTRY="$ECR_REGISTRY" envsubst '${ECR_REGISTRY}' < dashboard/manifests/pod-flask.yaml > /tmp/pod-flask-rendered.yaml
+else
+    sed "s|\${ECR_REGISTRY}|$ECR_REGISTRY|g" dashboard/manifests/pod-flask.yaml > /tmp/pod-flask-rendered.yaml
+fi
 rsync -avz /tmp/pod-flask-rendered.yaml "$EC2_HOST:/tmp/pod-flask.yaml"
 rsync -avz dashboard/manifests/service-flask.yaml "$EC2_HOST:/tmp/"
 ssh "$EC2_HOST" "kubectl apply -f /tmp/service-flask.yaml && kubectl apply -f /tmp/pod-flask.yaml"

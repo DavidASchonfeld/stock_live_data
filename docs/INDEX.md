@@ -13,6 +13,14 @@ Complete navigation guide for all project documentation.
 
 ---
 
+## Planning & Roadmap
+
+| Document | What it covers |
+|----------|---------------|
+| [BACKLOG.md](BACKLOG.md) | Ordered checklist: t3.large go-live, Snowflake migration, Kafka setup with tuning steps |
+
+---
+
 ## Architecture (How the system works and fails)
 
 | Document | What it covers |
@@ -41,6 +49,7 @@ Complete navigation guide for all project documentation.
 |----------|---------------|
 | [K3S_RISKS.md](infrastructure/K3S_RISKS.md) | Single-node tradeoffs, containerd vs Docker, Helm state, resource contention, security |
 | [PERSISTENCE.md](infrastructure/PERSISTENCE.md) | PV/PVC deep dive: hostPath risks, filesystem cache, reclaim policy, debugging |
+| [EC2_SIZING.md](infrastructure/EC2_SIZING.md) | EC2 instance sizing: component RAM table, t3.large verdict, Kafka heap tuning, monitoring |
 | [ECR_SETUP.md](infrastructure/ECR_SETUP.md) | AWS ECR configuration, image push workflow, authentication |
 | [refactor-ecr-migration.md](infrastructure/refactor-ecr-migration.md) | Why containerd + ECR replaced Docker mode |
 
@@ -87,6 +96,7 @@ docs/
 ├── infrastructure/
 │   ├── K3S_RISKS.md                  ← Hidden K3s complexity
 │   ├── PERSISTENCE.md               ← PV/PVC deep dive
+│   ├── EC2_SIZING.md                 ← EC2 instance sizing & Kafka tuning
 │   ├── ECR_SETUP.md                  ← AWS ECR setup
 │   └── refactor-ecr-migration.md     ← ECR migration rationale
 │
@@ -126,4 +136,4 @@ docs/
 
 ---
 
-**Last updated:** 2026-03-31
+**Last updated:** 2026-04-04
