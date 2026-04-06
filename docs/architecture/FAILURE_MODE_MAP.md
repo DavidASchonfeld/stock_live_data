@@ -45,11 +45,11 @@ When something breaks, find the component showing symptoms below. Each failure m
 
 | Field | Detail |
 |-------|--------|
-| **Symptoms** | All Airflow pods (scheduler, triggerer, api-server) stuck at `Init:0/1` or `PodInitializing` indefinitely. |
-| **Root cause** | Every Airflow pod runs a `wait-for-airflow-migrations` init container that blocks until the internal PostgreSQL database is reachable and migrated. If `airflow-postgresql-0` is down (e.g., `ImagePullBackOff` due to deleted Docker Hub image), nothing else can start. |
-| **Blast radius** | **Total Airflow outage.** All DAGs stop. No new data ingested. Flask serves stale data. Single dependency (PostgreSQL) cascades to everything. |
-| **Prevention** | Pin PostgreSQL image tags to digests, not mutable tags. Monitor PostgreSQL pod health independently. |
-| **Real incident?** | Yes — 2026-03-30. Bitnami deleted `postgresql:16.1.0-debian-11-r15` from Docker Hub. See [../incidents/2026-03-30/](../incidents/2026-03-30/). |
+| **Symptoms** | All Airflow pods (scheduler, triggerer, api-server) stuck at `Init:0/1` or `Init:CrashLoopBackOff` indefinitely. |
+| **Root cause** | Every Airflow pod runs a `wait-for-airflow-migrations` init container that blocks until the DB is reachable and fully migrated. Two known triggers: (1) PostgreSQL pod is down (e.g., `ImagePullBackOff`); (2) the migration job itself never ran because all pods (including the migration job pod) had `CreateContainerConfigError` from a missing secret — see AF-7. |
+| **Blast radius** | **Total Airflow outage.** All DAGs stop. No new data ingested. Flask serves stale data. |
+| **Prevention** | Pin PostgreSQL image tags. After a major Helm chart upgrade, verify the migration job pod started and completed before diagnosing init container crashes. |
+| **Real incident?** | Yes — 2026-03-30 (PostgreSQL image). Yes — 2026-04-06 (missing secret blocked migration job). See CHANGELOG.md. |
 
 ### AF-4: XCom Serialization Mismatch
 
@@ -70,6 +70,36 @@ When something breaks, find the component showing symptoms below. Each failure m
 | **Blast radius** | Only newly deployed DAGs. Existing DAGs unaffected. |
 | **Prevention** | After deploying files, restart both Scheduler AND Processor pods. Or migrate DAGs to ConfigMap-based deployment. |
 | **Real incident?** | Yes — 2026-03-31. Stock DAG 90-second staleness cycle. |
+
+### AF-6: Scheduler OOMKilled After Major Version Upgrade
+
+| Field | Detail |
+|-------|--------|
+| **Symptoms** | Scheduler starts, runs for 2–4 minutes, then `OOMKilled` (exit code 137). Repeats in a loop. |
+| **Root cause** | Airflow 3.x uses a supervisor model that spawns ~15 worker subprocesses at startup, each loading the full provider stack. Memory spikes well above the 2.x-era 1 Gi limit, which was sized for the old single-process scheduler. |
+| **Blast radius** | Scheduler down → DAGs not triggered. Triggerer and api-server unaffected. |
+| **Prevention** | After any Airflow major version upgrade, review memory limits. Airflow 3.x scheduler needs 2 Gi limit on a t3.large. |
+| **Real incident?** | Yes — 2026-04-06. See CHANGELOG.md. |
+
+### AF-7: All Pods `CreateContainerConfigError` — Missing Chart Secret After Major Upgrade
+
+| Field | Detail |
+|-------|--------|
+| **Symptoms** | Every pod in the namespace (scheduler, api-server, dag-processor, triggerer, AND the migration job) gets `CreateContainerConfigError`. Nothing starts. `kubectl describe pod` shows: `Error: secret "airflow-webserver-secret-key" not found`. |
+| **Root cause** | `enableBuiltInSecretEnvVars.AIRFLOW__WEBSERVER__SECRET_KEY` defaults to `true`. In Airflow 3.x, the chart no longer creates `airflow-webserver-secret-key` (that secret is 2.x-only — replaced by `airflow-api-secret-key`). Every pod spec references the nonexistent secret, so no pod can start. Because the migration job also can't start, the DB is never migrated, and all init containers wait forever. |
+| **Blast radius** | **Total cluster outage.** Cascade: missing secret → migration job fails → DB not migrated → all init containers crash → all pods down. |
+| **Prevention** | When upgrading from Airflow 2.x to 3.x: add `enableBuiltInSecretEnvVars.AIRFLOW__WEBSERVER__SECRET_KEY: false` to `values.yaml` before running `helm upgrade`. |
+| **Real incident?** | Yes — 2026-04-06. Root cause of 4 consecutive failed `helm upgrade` attempts spanning several hours. See CHANGELOG.md. |
+
+### AF-8: Helm Upgrade Without Version Pin — Accidental Major Version Jump
+
+| Field | Detail |
+|-------|--------|
+| **Symptoms** | `helm upgrade` succeeds initially, migration job runs, then upgrade times out. Subsequent rollback fails with DB schema mismatch error. Cluster stuck between versions. |
+| **Root cause** | Running `helm upgrade` without `--version <tag>` pulls the latest chart. If a major version has been released, the migration job upgrades the DB schema before the timeout occurs. After timeout, the DB is at the new schema but pods may still be on the old version — and Airflow cannot downgrade its DB. |
+| **Blast radius** | Forced migration to the new major version. All subsequent `helm upgrade` attempts with the old chart version fail. |
+| **Prevention** | Always use `--version` in `helm upgrade` commands. Pin in `scripts/deploy.sh`. |
+| **Real incident?** | Yes — 2026-04-05 (rev 18). Caused accidental 2.9.3 → 3.1.8 upgrade. See CHANGELOG.md. |
 
 ---
 
@@ -291,7 +321,10 @@ When something breaks, find the component showing symptoms below. Each failure m
 | DAG appears then vanishes after ~30s | AF-1 (config drift) |
 | DAG appears then vanishes after ~90s | AF-5 (processor cache) |
 | DAG never appears, no errors | AF-2 (module variable) |
-| All Airflow pods stuck Init:0/1 | AF-3 (PostgreSQL down) |
+| All Airflow pods stuck Init:0/1 | AF-3 (PostgreSQL down or migration job blocked) |
+| All pods CreateContainerConfigError after helm upgrade | AF-7 (missing chart secret — run with enableBuiltInSecretEnvVars fix) |
+| Scheduler OOMKilled every few minutes after upgrade | AF-6 (2Gi memory limit needed for Airflow 3.x) |
+| helm upgrade accidentally jumped major versions, can't roll back | AF-8 (DB schema upgraded — move forward, don't roll back) |
 | Pod shows ImagePullBackOff | FL-2 (ECR token) or AF-3 (deleted image) |
 | Port unreachable, pod is Running | K8-3 or FL-5 (selector mismatch) |
 | Pod empty directory, files on EC2 | K8-1 (PV path mismatch) |
@@ -304,4 +337,4 @@ When something breaks, find the component showing symptoms below. Each failure m
 
 ---
 
-**Last updated:** 2026-04-05 — Added K8-6 (webserver OOMKill → static asset cascade); updated quick lookup table.
+**Last updated:** 2026-04-06 — Added AF-6 (scheduler OOMKill in 3.x), AF-7 (missing chart secret after upgrade), AF-8 (helm upgrade without version pin); updated AF-3; updated quick lookup table.

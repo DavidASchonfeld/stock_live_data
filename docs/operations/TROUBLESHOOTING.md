@@ -176,6 +176,105 @@ dag = my_dag_function()  # Assigned to module variable
 
 ---
 
+## Issue: All Pods `CreateContainerConfigError` After `helm upgrade` (Airflow Major Version)
+
+### Symptoms
+- Every pod in `airflow-my-namespace` is in `CreateContainerConfigError` or `Init:CrashLoopBackOff`
+- `kubectl describe pod <any-pod>` shows: `Error: secret "airflow-webserver-secret-key" not found`
+- No migration job is running or has recently run
+- `helm upgrade` keeps timing out
+
+### Why This Happens
+
+This occurs when upgrading from Airflow 2.x to 3.x. The Airflow 2.x Helm chart created a secret named `airflow-webserver-secret-key`. The 3.x chart does NOT create it (replaced by `airflow-api-secret-key`). But the chart's default settings still have `enableBuiltInSecretEnvVars.AIRFLOW__WEBSERVER__SECRET_KEY: true`, which injects that env var — referencing the nonexistent secret — into every pod spec.
+
+Because the migration job pod also has this issue, the migration job never starts. Without the migration, all other pods' init containers wait forever and crash. Everything is blocked by one missing chart default.
+
+### Diagnosis
+
+```bash
+# Confirm the secret is missing
+ssh ec2-stock "kubectl get secrets -n airflow-my-namespace | grep webserver"
+# Should show nothing — airflow-webserver-secret-key doesn't exist in 3.x
+
+# Confirm the pod error
+ssh ec2-stock "kubectl describe pod airflow-scheduler-0 -n airflow-my-namespace | grep -A2 'Error:'"
+# Expect: Error: secret "airflow-webserver-secret-key" not found
+
+# Check DB migration state (was the migration job ever able to run?)
+ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-postgresql-0 -- \
+  env PGPASSWORD=postgres psql -U postgres -d postgres \
+  -c 'SELECT version_num FROM alembic_version;'"
+# If it returns 686269002441 (or another 2.x revision), migration hasn't run yet
+```
+
+### Fix
+
+1. Add to `airflow/helm/values.yaml`:
+   ```yaml
+   enableBuiltInSecretEnvVars:
+     AIRFLOW__WEBSERVER__SECRET_KEY: false
+   ```
+
+2. Sync and upgrade:
+   ```bash
+   scp airflow/helm/values.yaml ec2-stock:~/airflow/helm/values.yaml
+   ssh ec2-stock "helm upgrade airflow apache-airflow/airflow \
+     -n airflow-my-namespace \
+     --version 1.20.0 \
+     -f ~/airflow/helm/values.yaml \
+     --atomic=false --timeout 2m"
+   ```
+
+3. If any StatefulSet pods (scheduler-0, triggerer-0) are still stuck with the old spec, force-recreate them:
+   ```bash
+   ssh ec2-stock "kubectl delete pod airflow-scheduler-0 -n airflow-my-namespace"
+   ssh ec2-stock "kubectl delete pod airflow-triggerer-0 -n airflow-my-namespace"
+   ```
+
+4. Confirm migration completed:
+   ```bash
+   ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-postgresql-0 -- \
+     env PGPASSWORD=postgres psql -U postgres -d postgres \
+     -c 'SELECT version_num FROM alembic_version;'"
+   # Expect: 509b94a1042d (Airflow 3.1.8 head)
+   ```
+
+---
+
+## Issue: Helm Upgrade Stuck — "another operation (install/upgrade/rollback) is in progress"
+
+### Symptoms
+- `helm upgrade` immediately fails with: `Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress`
+- The cluster seems idle — no active deploy running
+
+### Why This Happens
+
+A previous `helm upgrade` process was killed (e.g., terminal closed, timeout) while Helm had already written a `pending-upgrade` status secret. Helm uses this to lock against concurrent upgrades. If the process was killed instead of completing, the lock is never released.
+
+### Fix
+
+```bash
+# Find the stuck pending-upgrade release
+ssh ec2-stock "kubectl get secret -n airflow-my-namespace \
+  -l 'owner=helm,name=airflow' \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.status}{\"\\n\"}{end}'"
+# Look for a line ending in 'pending-upgrade'
+
+# Delete that specific secret to release the lock
+ssh ec2-stock "kubectl delete secret sh.helm.release.v1.airflow.vN -n airflow-my-namespace"
+# Replace vN with the actual revision number from the above output
+
+# Also check for and kill any lingering helm process on EC2
+ssh ec2-stock "ps aux | grep helm | grep -v grep"
+ssh ec2-stock "kill <PID>"  # if a process is still running
+
+# Now retry the upgrade
+ssh ec2-stock "helm upgrade airflow apache-airflow/airflow ..."
+```
+
+---
+
 ## How Deploy.sh Validates DAG Files (Deployment Best Practices)
 
 ### Pre-flight Checks

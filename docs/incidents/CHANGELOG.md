@@ -2,6 +2,124 @@
 
 ---
 
+## 2026-04-06: Airflow 3.1.8 Upgrade Recovery — All Pods Running ✅
+
+This incident began when a `helm upgrade` without a `--version` pin accidentally upgraded the cluster from Airflow 2.9.3 (chart 1.15.0) to Airflow 3.1.8 (chart 1.20.0). The DB schema was migrated to the 3.x format before the upgrade timed out, leaving the cluster in a broken state: DB at the 3.x migration head, pods running 2.9.3. Four subsequent `helm upgrade` attempts over the next several hours all timed out. Three separate root causes were found and fixed.
+
+---
+
+### How It Started — The Accidental Upgrade
+
+**Command run (by mistake — no version pin):**
+```bash
+helm upgrade airflow apache-airflow/airflow \
+  -n airflow-my-namespace \
+  -f ~/airflow/helm/values.yaml \
+  --timeout 10m --wait
+```
+
+Without `--version 1.15.0`, Helm pulled the latest chart (1.20.0 / Airflow 3.1.8). The pre-upgrade migration job ran and upgraded the metadata DB schema to the Airflow 3.x format (`686269002441` → eventually `509b94a1042d`). Then the upgrade timed out because pods never became ready — leaving the cluster with a 3.x DB but partially-started pods.
+
+Rollback to 1.15.0 / 2.9.3 was not possible — Airflow cannot downgrade its DB schema. Decision: move forward to Airflow 3.x.
+
+**Always pin the version on production helm upgrades:**
+```bash
+helm upgrade airflow apache-airflow/airflow \
+  --version 1.20.0 \            # ← required
+  -n airflow-my-namespace \
+  -f ~/airflow/helm/values.yaml \
+  --timeout 5m
+```
+
+---
+
+### Root Cause 1 — Missing Secret Blocked Every Pod (Including the Migration Job)
+
+**Symptom**: `airflow-scheduler-0` showed `CreateContainerConfigError`. All other pods stuck in `Init:CrashLoopBackOff` — every pod's init container timed out with:
+```
+TimeoutError: There are still unapplied migrations after 60 seconds.
+MigrationHead(s) in DB: {'686269002441'} | Migration Head(s) in Source Code: {'509b94a1042d'}
+```
+
+**Why the init container kept failing even though pods were running the right image:**
+
+Every Airflow pod (scheduler, api-server, dag-processor, triggerer) runs a `wait-for-airflow-migrations` init container that blocks until the DB is fully migrated. The migration is done by a separate `pre-upgrade` Helm hook job (`airflow-run-airflow-migrations`). That job was never completing — so the init containers waited 60 seconds, gave up, and crashed. Then the cycle repeated (CrashLoopBackOff).
+
+**Why the migration job never ran:**
+
+The migration job pod spec — like all other Airflow pod specs — had this environment variable injection, controlled by `enableBuiltInSecretEnvVars.AIRFLOW__WEBSERVER__SECRET_KEY: true` (the chart default):
+
+```
+AIRFLOW__WEBSERVER__SECRET_KEY: <from secret 'airflow-webserver-secret-key' key 'webserver-secret-key'>
+```
+
+But `airflow-webserver-secret-key` does not exist in Airflow 3.x. The Airflow 3.x Helm chart intentionally does not create it — the chart template (`webserver-secret-key-secret.yaml`) has a `semverCompare "<3.0.0"` guard, so it's a no-op for Airflow 3.x. The equivalent in 3.x is `airflow-api-secret-key` (which does exist and was created successfully).
+
+Because the secret was missing and `Optional: false`, every pod got `CreateContainerConfigError` the moment it tried to start — including the migration job. No migration job → DB never migrates → init containers wait forever → all pods time out → `helm upgrade` fails.
+
+**The chain:** one missing chart default caused every single pod in the cluster to fail before doing any work.
+
+**Fix — `airflow/helm/values.yaml`:**
+```yaml
+enableBuiltInSecretEnvVars:
+  AIRFLOW__WEBSERVER__SECRET_KEY: false
+```
+
+This tells the chart: "don't inject `AIRFLOW__WEBSERVER__SECRET_KEY` from a secret into pod specs." Airflow 3.x uses `AIRFLOW__API__SECRET_KEY` (from `airflow-api-secret-key`) instead — that was already being injected correctly. Disabling the 2.x env var removes the reference to the nonexistent secret, unblocking all pods.
+
+With this fix applied, the migration job started for the first time, `airflow db migrate` ran successfully (DB moved from `686269002441` to `509b94a1042d`), and the init containers passed on their next check.
+
+---
+
+### Root Cause 2 — Scheduler OOMKilled at 1 Gi
+
+**Symptom**: Scheduler pod started (no more `CreateContainerConfigError`), ran for ~3 minutes, then showed `OOMKilled` (exit code 137). Restarted, ran ~3 minutes, OOMKilled again.
+
+**Why**: Airflow 3.x replaced the 2.x process model with a **supervisor model**. In 2.x, the scheduler ran one process. In 3.x, the scheduler spawns approximately 15 concurrent worker subprocesses. Each subprocess loads the full Airflow codebase + all provider packages into memory. With ~15 workers × ~80–120 MB each, peak memory during startup significantly exceeds 1 Gi — the previous limit sized for the 2.x single-process model.
+
+**Fix — `airflow/helm/values.yaml`:**
+```yaml
+scheduler:
+  resources:
+    limits:
+      memory: "2Gi"   # was 1Gi — Airflow 3.x supervisor model needs this
+```
+
+---
+
+### Root Cause 3 — Startup and Liveness Probe Timeouts Too Short
+
+**Symptom**: After fixing the OOMKill, the scheduler started correctly but restarted every ~3–5 minutes even with no OOMKill. Events showed:
+```
+Startup probe failed: command timed out after 20s
+Liveness probe failed: command timed out
+```
+
+**Why**: The startup and liveness probes both run:
+```bash
+airflow jobs check --job-type SchedulerJob --local
+```
+In Airflow 3.x, this command loads the full provider stack before it can check anything — it needs ~30–45 seconds on a t3.large. The previous `timeoutSeconds: 20` was written for 2.x where this command returned nearly instantly.
+
+**Fix — `airflow/helm/values.yaml`:**
+```yaml
+scheduler:
+  startupProbe:
+    failureThreshold: 10
+    periodSeconds: 30
+    timeoutSeconds: 45   # was 20
+  livenessProbe:
+    timeoutSeconds: 45   # was 20
+```
+
+With 45 seconds the command completes reliably. The startup probe window is 10 × 30s = 5 minutes (enough to pip install pymysql + start the supervisor + pass the first check). The liveness probe checks every 60 seconds with a 45-second allowance, so no overlap.
+
+---
+
+**Verified**: All 6 pods running (`kubectl get pods`). All 3 DAGs visible (`airflow dags list`). Scheduler held 0 restarts over 5+ minutes, confirming startup and liveness probes both pass. Helm release at revision 27, status `deployed`.
+
+---
+
 ## 2026-04-05: Weather DAG "Missing from DagBag" + Scheduler CrashLoopBackOff Fixed ✅
 
 ### Part 1 — Weather DAG "Missing from DagBag"

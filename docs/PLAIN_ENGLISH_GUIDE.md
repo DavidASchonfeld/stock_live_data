@@ -612,6 +612,117 @@ Now every `deploy.sh` run automatically applies any `values.yaml` changes to the
 
 ---
 
+### Bug 14: The Accidental Upgrade — Running `helm upgrade` Without a Version Pin
+
+**What happened:** A `helm upgrade` command was run without specifying which version of the chart to install. Helm pulled the latest version — which happened to be a major version jump from Airflow 2.9.3 to Airflow 3.1.8. The database got upgraded to the new format before the upgrade timed out, leaving the cluster broken: the database expected Airflow 3.x but the pods still running were Airflow 2.x. Rolling back was impossible — Airflow cannot undo a database schema upgrade. The cluster was stuck pointing forward into Airflow 3.x.
+
+**Why it happened — in plain English:**
+
+The `helm upgrade` command installs a Helm chart (a package of Kubernetes configs). When you don't specify a version, it means "give me the latest." Like doing `pip install airflow` without a version number — you get whatever is newest, even if it's a breaking change.
+
+```bash
+# What was run (no version pin — dangerous):
+helm upgrade airflow apache-airflow/airflow -f values.yaml
+
+# What should always be run (version pinned):
+helm upgrade airflow apache-airflow/airflow --version 1.20.0 -f values.yaml
+```
+
+When Helm runs an upgrade, it runs a **migration job** first — a one-time task that updates the database schema to match the new software version. That migration job ran successfully (it upgraded the database from Airflow 2.x format to Airflow 3.x format). But then the rest of the upgrade timed out because Airflow 3.x has a different architecture and the old config (`values.yaml`) wasn't set up for it yet.
+
+After the timeout, the cluster was in a half-upgraded state:
+- Database: Airflow 3.x format ✓
+- Running pods: Airflow 2.9.3 ✗ (wrong version for the database)
+- Trying to rollback to 2.9.3: impossible (2.9.3 refuses to talk to a 3.x database)
+
+**The decision:** move forward to Airflow 3.x. The database was already there, 3.x is the current version, and our DAG code (using the TaskFlow API) is compatible.
+
+**The lesson:** Always use `--version` when running `helm upgrade` in production. The version you're upgrading FROM and TO should be a deliberate choice, not whatever happened to be released that day.
+
+---
+
+### Bug 15: Every Pod Crashed Because of a Missing Secret — The Upgrade Kept Failing
+
+**What happened:** After accepting the Airflow 3.x upgrade, we ran `helm upgrade --version 1.20.0` repeatedly — four times over several hours. Every attempt timed out. Every pod showed either `CreateContainerConfigError` or `Init:CrashLoopBackOff`. Nothing could start.
+
+**Why it happened — in plain English:**
+
+When Kubernetes starts a pod, it assembles all the environment variables that pod needs. Some of those variables come from **Secrets** — which are like locked boxes containing sensitive values (passwords, keys, etc.).
+
+One environment variable, `AIRFLOW__WEBSERVER__SECRET_KEY`, was configured to come from a Secret named `airflow-webserver-secret-key`. This was a 2.x thing — Airflow 2.x used this secret for the web UI's session encryption.
+
+In Airflow 3.x, this concept was replaced with `airflow-api-secret-key`. The Airflow 3.x chart creates `airflow-api-secret-key` but deliberately **does not create** `airflow-webserver-secret-key` anymore — it's 2.x-only. But the Helm chart's default settings still had `AIRFLOW__WEBSERVER__SECRET_KEY` turned on, pointing to the no-longer-created secret.
+
+Result: every pod tried to mount a secret that didn't exist → `CreateContainerConfigError` → pod couldn't start.
+
+This included the **migration job** — the one-time task that actually migrates the database. Because the migration job also couldn't start, the database was never migrated. And because the database wasn't migrated, every other pod's init container (which waits for migration to complete before allowing the main pod to start) waited forever, then crashed, then waited again.
+
+**The chain that caused everything:**
+```
+Chart default leaves AIRFLOW__WEBSERVER__SECRET_KEY=true
+    → every pod spec references 'airflow-webserver-secret-key' secret
+        → secret doesn't exist in Airflow 3.x
+            → every pod gets CreateContainerConfigError (can't start)
+                → migration job can't start
+                    → database never migrated
+                        → init containers wait forever
+                            → all pods crash after 60s
+                                → helm upgrade times out
+```
+
+**The fix:** Add one setting to `values.yaml` that tells the chart "don't inject this 2.x env variable":
+```yaml
+enableBuiltInSecretEnvVars:
+  AIRFLOW__WEBSERVER__SECRET_KEY: false
+```
+
+With this in place, no pod references the missing secret. The migration job can now start, upgrades the database, and all other pods can begin initializing normally.
+
+**The lesson:** When upgrading between major versions of a Helm chart, read the migration guide. Airflow 2.x → 3.x is a major change — the webserver was split into separate components, secrets were renamed, and some defaults changed. What worked in 2.x won't necessarily work in 3.x.
+
+---
+
+### Bug 16: Scheduler Kept Dying — Memory and Probe Limits From the 2.x Era
+
+**What happened:** After fixing Bug 15, the scheduler started up... then crashed after ~3 minutes... then started again... then crashed again. This happened repeatedly. Looking at the events, two different things were killing it:
+
+1. The first few times: `OOMKilled` (Out of Memory Killed — Linux force-killed the process for using too much RAM)
+2. Later times: startup and liveness probes failing with "timed out after 20s"
+
+**Why the OOMKill happened — in plain English:**
+
+Airflow 3.x changed how the scheduler works internally. In Airflow 2.x, the scheduler was a single process. In Airflow 3.x, it uses a "supervisor" model — it spawns about 15 worker processes simultaneously. Each worker process loads all of Airflow's provider packages (the add-ons for AWS, Snowflake, etc.) into memory when it starts.
+
+With ~15 workers each using ~80-100 MB, the scheduler was briefly using well over 1 GB of RAM during startup. The old memory limit from Airflow 2.x was `1Gi` — sized for the 2.x single-process model. With 3.x's 15-worker model, it was almost guaranteed to hit that limit.
+
+**Fix:** Raise the scheduler memory limit to `2Gi` in `values.yaml`.
+
+**Why the probe timeout happened — in plain English:**
+
+Kubernetes regularly runs health checks on running pods. The check it uses for the scheduler is:
+```
+airflow jobs check --job-type SchedulerJob
+```
+
+This command has to load the full Airflow codebase before it can check anything. In Airflow 2.x, this was quick (~5 seconds). In Airflow 3.x, loading all the provider packages takes 30-45 seconds on a t3.large.
+
+The timeout setting was `20 seconds` — meaning: "if the check doesn't finish in 20 seconds, mark it as failed." In 3.x, the check always takes more than 20 seconds, so it always "failed," even though the scheduler itself was working perfectly.
+
+With 5 consecutive failures, Kubernetes kills the pod and restarts it. Then the same thing happens again. The scheduler was being killed by a health check that was misconfigured for 3.x's slower startup.
+
+**Fix:** Increase the timeout from 20 seconds to 45 seconds in `values.yaml`:
+```yaml
+scheduler:
+  startupProbe:
+    timeoutSeconds: 45   # was 20
+  livenessProbe:
+    timeoutSeconds: 45   # was 20
+```
+
+**The lesson:** When upgrading to a new major version, the old sizing values (memory limits, probe timeouts) were calibrated for the old architecture. Airflow 3.x is a more heavyweight process model than 2.x — it does more work in parallel, uses more memory, and takes longer to start. Old limits need to be recalibrated.
+
+---
+
 ### Bug 5: Alpha Vantage Rate Limits (API Errors)
 
 **What happened:** The Stock DAG would sometimes fail because the Alpha Vantage API stopped responding with data and instead gave an error message.
