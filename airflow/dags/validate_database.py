@@ -61,9 +61,9 @@ def validate_database():
         writer = OutputTextWriter("/opt/airflow/out")  # K8s pod path (PVC-mounted)
     except PermissionError:
         writer = OutputTextWriter("/tmp")  # Fallback for local EC2 execution (if PVC unavailable)
-    writer.print("=" * 80)
-    writer.print(f"Database Validation Started: {datetime.now()}")
-    writer.print("=" * 80)
+    writer.log("=" * 80)
+    writer.log(f"Database Validation Started: {datetime.now()}")
+    writer.log("=" * 80)
 
     try:
         # Create database engine using existing db_config credentials
@@ -72,36 +72,36 @@ def validate_database():
         # Test basic connection
         with engine.connect() as connection:
             result = connection.execute(text("SELECT 1"))
-            writer.print("✓ Database connection successful")
+            writer.log("✓ Database connection successful")
 
         # Use SQLAlchemy Inspector to examine schema
         inspector = inspect(engine)
         tables = inspector.get_table_names()
-        writer.print(f"\n✓ Tables in database: {tables}")
+        writer.log(f"\n✓ Tables in database: {tables}")
 
         # Validate company_financials table (SEC EDGAR XBRL data)
-        writer.print("\n" + "─" * 80)
-        writer.print("TABLE: company_financials")
-        writer.print("─" * 80)
+        writer.log("\n" + "─" * 80)
+        writer.log("TABLE: company_financials")
+        writer.log("─" * 80)
         _validate_table(engine, inspector, "company_financials", EXPECTED_SCHEMA_FINANCIALS, writer)
 
         # Validate weather_hourly table
-        writer.print("\n" + "─" * 80)
-        writer.print("TABLE: weather_hourly")
-        writer.print("─" * 80)
+        writer.log("\n" + "─" * 80)
+        writer.log("TABLE: weather_hourly")
+        writer.log("─" * 80)
         _validate_table(engine, inspector, "weather_hourly", EXPECTED_SCHEMA_WEATHER, writer)
 
-        writer.print("\n" + "=" * 80)
-        writer.print(f"Database Validation Completed: {datetime.now()}")
-        writer.print("=" * 80)
+        writer.log("\n" + "=" * 80)
+        writer.log(f"Database Validation Completed: {datetime.now()}")
+        writer.log("=" * 80)
 
         return True
 
     except SQLAlchemyError as e:
-        writer.print(f"✗ Database error: {str(e)}")
+        writer.log(f"✗ Database error: {str(e)}")
         raise
     except Exception as e:
-        writer.print(f"✗ Validation error: {str(e)}")
+        writer.log(f"✗ Validation error: {str(e)}")
         raise
 
 
@@ -112,34 +112,34 @@ def _validate_table(engine, inspector, table_name: str, expected_schema: dict, w
         # Check if table exists
         # Fails early if DAG hasn't run yet or table was accidentally dropped
         if table_name not in inspector.get_table_names():
-            writer.print(f"✗ Table {table_name} does NOT exist")
+            writer.log(f"✗ Table {table_name} does NOT exist")
             return False
 
-        writer.print(f"✓ Table exists")
+        writer.log(f"✓ Table exists")
 
         # Get actual schema
         # Inspector queries the database metadata; detects schema changes (dropped/renamed columns)
         columns = inspector.get_columns(table_name)
         actual_columns = {col["name"]: col["type"] for col in columns}
 
-        writer.print(f"\n  Columns found:")
+        writer.log(f"\n  Columns found:")
         for col_name, col_type in actual_columns.items():
-            writer.print(f"    - {col_name}: {col_type}")
+            writer.log(f"    - {col_name}: {col_type}")
 
         # Check for expected columns (not strict — extras are OK)
         # Detects if critical columns were accidentally deleted; warns on schema drift
         missing_columns = set(expected_schema.keys()) - set(actual_columns.keys())
         if missing_columns:
-            writer.print(f"\n  ✗ Missing expected columns: {missing_columns}")
+            writer.log(f"\n  ✗ Missing expected columns: {missing_columns}")
         else:
-            writer.print(f"\n  ✓ All expected columns present")
+            writer.log(f"\n  ✓ All expected columns present")
 
         # Get row count
         # Increasing row count over time = data flowing; zero rows = data not arriving
         with engine.connect() as conn:
             count_result = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
             row_count = count_result.scalar()
-            writer.print(f"  ✓ Row count: {row_count} rows")
+            writer.log(f"  ✓ Row count: {row_count} rows")
 
             # Get freshness info (latest date/time in table)
             # Stale timestamps indicate DAG failure; fresh data means pipeline is healthy
@@ -147,18 +147,18 @@ def _validate_table(engine, inspector, table_name: str, expected_schema: dict, w
                 freshness = conn.execute(
                     text(f"SELECT MAX(filed_date) as latest_filed FROM {table_name}")
                 ).scalar()
-                writer.print(f"  ✓ Latest filing date: {freshness}")
+                writer.log(f"  ✓ Latest filing date: {freshness}")
 
             elif table_name == "weather_hourly":
                 freshness = conn.execute(
                     text(f"SELECT MAX(time) as latest_time FROM {table_name}")
                 ).scalar()
-                writer.print(f"  ✓ Latest data time: {freshness}")
+                writer.log(f"  ✓ Latest data time: {freshness}")
 
         return True
 
     except SQLAlchemyError as e:
-        writer.print(f"  ✗ Error validating table: {str(e)}")
+        writer.log(f"  ✗ Error validating table: {str(e)}")
         return False
 
 

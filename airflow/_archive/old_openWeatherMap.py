@@ -1,3 +1,5 @@
+# Archived: replaced by dag_weather.py using Open-Meteo (free, no API key required)
+
 ## Python Libraries
 # import os
 # from typing import Any, Dict

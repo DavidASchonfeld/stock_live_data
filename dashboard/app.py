@@ -82,7 +82,7 @@ dash_app.layout = html.Div(
 
         html.H1("Stock Market Analytics Pipeline", style={"color": "#1f2937"}),
         html.P(
-            "Live data pulled daily by Airflow → stored in MariaDB (→ Snowflake in Step 2).",
+            "SEC EDGAR financial data pulled daily by Airflow → stored in MariaDB (→ Snowflake in Step 2).",
             style={"color": "#6b7280"}
         ),
 
@@ -96,10 +96,10 @@ dash_app.layout = html.Div(
             style={"width": "200px", "marginBottom": "20px"},
         ),
 
-        # ── Closing price chart ───────────────────────────────────────────
+        # ── Revenue & Net Income grouped bar chart ────────────────────────
         dcc.Graph(id="price-chart"),
 
-        # ── Volume bar chart ──────────────────────────────────────────────
+        # ── Net Income standalone bar chart ───────────────────────────────
         dcc.Graph(id="volume-chart"),
 
         # ── Summary stats table ───────────────────────────────────────────
@@ -109,20 +109,38 @@ dash_app.layout = html.Div(
 
 
 def _load_ticker_data(ticker: str) -> pd.DataFrame:
-    """Query MariaDB for all rows matching the given ticker, ordered by date.
+    """Query MariaDB for annual Revenue and Net Income rows from company_financials.
 
     Private helper (leading underscore) because it's only called by the Dash
     callback above — not part of the public API of this module.
     A new DB connection is opened per call; SQLAlchemy's connection pool
     handles reuse and cleanup automatically.
+    Filters to fiscal_period='FY' to return one row per metric per annual filing.
     """
     # :ticker is a SQLAlchemy named bind parameter; its value is supplied by params={"ticker": ticker} below
-    query = text("SELECT date, open, high, low, close, volume FROM stock_daily_prices WHERE ticker = :ticker ORDER BY date ASC")
+    query = text("""
+        SELECT metric, label, period_end, value, fiscal_year, fiscal_period
+        FROM company_financials
+        WHERE ticker = :ticker
+          AND metric IN ('Revenues', 'NetIncomeLoss')
+          AND fiscal_period = 'FY'
+        ORDER BY period_end ASC
+    """)
     with DB_ENGINE.connect() as conn:
         df = pd.read_sql(query, conn, params={"ticker": ticker})
-    # Cast date column to proper datetime so Plotly renders the x-axis correctly
-    df["date"] = pd.to_datetime(df["date"])
+    # Cast period_end to datetime so Plotly renders the x-axis correctly
+    df["period_end"] = pd.to_datetime(df["period_end"])
     return df
+
+
+# Stub: wire up when stock_daily_prices DAG is added in Step 2
+def _load_ohlcv_data(ticker: str) -> pd.DataFrame:  # noqa: ARG001
+    """Placeholder for OHLCV price query — not yet called.
+
+    When a DAG that populates stock_daily_prices (OHLCV) is implemented in Step 2,
+    wire this function into update_charts() to restore the candlestick chart.
+    """
+    raise NotImplementedError("stock_daily_prices DAG not yet implemented (Step 2)")
 
 
 @dash_app.callback(
@@ -146,57 +164,55 @@ def update_charts(ticker: str):
         empty_fig.add_annotation(text=f"DB error: {e}", showarrow=False, font={"size": 14})
         return empty_fig, empty_fig, html.P(f"Could not load data: {e}", style={"color": "red"})
 
-    # ── Candlestick chart (OHLC) ──────────────────────────────────────────
-    # A candlestick chart shows price movement for each time period as a "candle":
-    #   - Open  (O): price at the start of the period
-    #   - High  (H): highest price reached during the period
-    #   - Low   (L): lowest price reached during the period
-    #   - Close (C): price at the end of the period
-    # The "body" of the candle spans Open→Close; the thin "wicks" extend to High/Low.
-    # Green (or hollow) candles = price rose; Red (or filled) candles = price fell.
-    price_fig = go.Figure(data=[go.Candlestick(
-        x=df["date"],
-        open=df["open"],
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        name=ticker,
-    )])
-    # Simple Moving Average (SMA): smooths out daily price noise by averaging the
-    # last N closing prices. A 7-day SMA at any given day = mean of that day's
-    # close plus the 6 preceding days' closes.
-    #
-    # .rolling(window=7) — creates a sliding 7-row window that moves one row at a
-    #   time through the DataFrame. The first 6 rows produce NaN (not enough data).
-    # .mean()            — computes the arithmetic average of each window.
-    df["sma_7"] = df["close"].rolling(window=7).mean()
+    # Split into per-metric DataFrames for separate traces
+    revenue_df    = df[df["metric"] == "Revenues"].copy()
+    net_income_df = df[df["metric"] == "NetIncomeLoss"].copy()
 
-    # go.Scatter is Plotly's general-purpose "connect points" trace.
-    # A scatter plot maps two variables onto X/Y axes as individual points;
-    # with mode="lines" those points are connected into a continuous line instead
-    # of being shown as dots.
-    #   x=df["date"]            — the dates go on the horizontal axis (matches the candlestick)
-    #   y=df["sma_7"]           — the computed SMA values go on the vertical axis
-    #   mode="lines"            — draw a line through the points, not individual markers
-    #   name="7-day SMA"        — label shown in the chart legend
-    #   line={"color": "orange"} — makes the SMA line orange so it stands out from the candles
-    #
-    # add_trace() layers this new line on top of the existing candlestick figure
-    # (price_fig) without replacing it.
-    price_fig.add_trace(go.Scatter(x=df["date"], y=df["sma_7"], mode="lines", name="7-day SMA", line={"color": "orange"}))
+    # ── Revenue & Net Income grouped bar chart ────────────────────────────
+    # go.Bar groups two traces (Revenue + Net Income) side-by-side per fiscal year.
+    # Values are divided by 1e9 to display in billions (e.g. 394_328_000_000 → 394.33).
+    # barmode="group" places bars for the same x position next to each other (not stacked).
+    price_fig = go.Figure()
+    price_fig.add_trace(go.Bar(
+        x=revenue_df["fiscal_year"],
+        y=revenue_df["value"] / 1e9,
+        name="Revenue",
+        marker_color="#3b82f6",  # blue
+    ))
+    price_fig.add_trace(go.Bar(
+        x=net_income_df["fiscal_year"],
+        y=net_income_df["value"] / 1e9,
+        name="Net Income",
+        marker_color="#10b981",  # green
+    ))
     price_fig.update_layout(
-        title=f"{ticker} — Daily Close + 7-Day SMA",
-        xaxis_title="Date",
-        yaxis_title="Price (USD)",
-        xaxis_rangeslider_visible=False,  # hide the range slider for cleaner look
+        title=f"{ticker} — Annual Revenue & Net Income",
+        xaxis_title="Fiscal Year",
+        yaxis_title="USD (Billions)",
+        barmode="group",
     )
 
-    # ── Volume bar chart ──────────────────────────────────────────────────
-    volume_fig = go.Figure(data=[go.Bar(x=df["date"], y=df["volume"], name="Volume", marker_color="#3b82f6")])
-    volume_fig.update_layout(title=f"{ticker} — Daily Volume", xaxis_title="Date", yaxis_title="Volume")
+    # ── Net Income standalone bar chart ───────────────────────────────────
+    # Separate chart lets the user compare net income magnitude without Revenue dwarfing it.
+    volume_fig = go.Figure(data=[go.Bar(
+        x=net_income_df["fiscal_year"],
+        y=net_income_df["value"] / 1e9,
+        name="Net Income",
+        marker_color="#10b981",
+    )])
+    volume_fig.update_layout(
+        title=f"{ticker} — Annual Net Income",
+        xaxis_title="Fiscal Year",
+        yaxis_title="USD (Billions)",
+    )
 
     # ── Summary stats table ───────────────────────────────────────────────
-    latest = df.iloc[-1]  # most recent row
+    # Pull the most recent annual row for each metric (last row after ORDER BY period_end ASC)
+    latest_rev = revenue_df.iloc[-1]    if len(revenue_df)    > 0 else None
+    latest_ni  = net_income_df.iloc[-1] if len(net_income_df) > 0 else None
+    latest_year = latest_rev["fiscal_year"] if latest_rev is not None else "N/A"
+    rev_str = f"${latest_rev['value']/1e9:.2f}B"   if latest_rev is not None else "N/A"
+    ni_str  = f"${latest_ni['value']/1e9:.2f}B"    if latest_ni  is not None else "N/A"
 
     # html.Table / html.Thead / html.Tbody / html.Tr / html.Th / html.Td are
     # Dash HTML components that map directly to standard HTML tags:
@@ -206,48 +222,15 @@ def update_charts(ticker: str):
         style={"borderCollapse": "collapse", "width": "100%"},
         children=[
             # ── Header row ──────────────────────────────────────────────
-            # html.Thead wraps the <thead> section; html.Tr is one table row.
-            # `c` gets its value by simply stepping through the literal list below,
-            # one item at a time, left to right:
-            #   1st iteration: c = "Ticker"      → builds html.Th("Ticker")
-            #   2nd iteration: c = "Latest Date" → builds html.Th("Latest Date")
-            #   ... and so on for every string in the list.
-            # `c` has no other source — it is not a parameter, not defined elsewhere.
-            # The name `c` (convention for "column") only exists during the loop.
+            # `c` steps through the column name list left-to-right, one per iteration
             html.Thead(html.Tr([html.Th(c, style={"border": "1px solid #e5e7eb", "padding": "8px", "background": "#f9fafb"})
-                for c in [
-                    "Ticker", "Latest Date", "Open", "High", "Low", "Close", "Volume"
-                ]
+                for c in ["Ticker", "Latest Fiscal Year", "Revenue", "Net Income"]
             ])),
 
             # ── Data row ────────────────────────────────────────────────
-            # html.Tbody wraps the <tbody> section.
-            # `v` gets its value by simply stepping through the list below,
-            # one item at a time, left to right:
-            #   1st iteration: v = ticker                      → builds html.Td(ticker)
-            #   2nd iteration: v = str(latest["date"].date())  → builds html.Td("2025-08-07")
-            #   3rd iteration: v = f"${latest['open']:.2f}"   → builds html.Td("$173.40")
-            #   ... and so on for every item in the list.
-            # `v` has no other source — it is not a parameter, not defined elsewhere.
-            # The name `v` (convention for "value") only exists during the loop.
-            # The items in the list come from two places:
-            #   - `ticker`: the stock symbol passed in as the callback input argument
-            #   - `latest[...]`: fields from the last DataFrame row (defined on line 185)
+            # `v` steps through the value list left-to-right, one per iteration
             html.Tbody(html.Tr([html.Td(v, style={"border": "1px solid #e5e7eb", "padding": "8px"})
-                for v in [
-                    ticker,
-                    str(latest["date"].date()),
-                    # f"${latest['open']:.2f}" — the :.2f format spec means:
-                    #   : = start of format specification
-                    #   .2 = round to 2 decimal places
-                    #   f  = format as a fixed-point (decimal) number
-                    # Result example: 173.4 → "$173.40"
-                    f"${latest['open']:.2f}",
-                    f"${latest['high']:.2f}",
-                    f"${latest['low']:.2f}",
-                    f"${latest['close']:.2f}",
-                    f"{int(latest['volume']):,}",  # :, adds thousands separator  e.g. 1234567 → "1,234,567"
-                ]
+                for v in [ticker, latest_year, rev_str, ni_str]
             ])),
         ]
     )
@@ -290,20 +273,20 @@ def validation():
         }
 
         with DB_ENGINE.connect() as conn:
-            # Validate stock_daily_prices table
+            # Validate company_financials table (SEC EDGAR data written by dag_stocks.py)
             # COUNT(*) detects if data is flowing in; row count trends indicate pipeline health
-            stock_count = conn.execute(text("SELECT COUNT(*) FROM stock_daily_prices")).scalar()
-            # MAX(date) shows data freshness; stale dates indicate pipeline failure
-            stock_latest = conn.execute(text("SELECT MAX(date) FROM stock_daily_prices")).scalar()
-            # Sample 5 rows to catch schema changes or data corruption (bad prices, wrong formats)
+            stock_count = conn.execute(text("SELECT COUNT(*) FROM company_financials")).scalar()
+            # MAX(period_end) shows data freshness; stale dates indicate pipeline failure
+            stock_latest = conn.execute(text("SELECT MAX(period_end) FROM company_financials")).scalar()
+            # Sample 5 rows to catch schema changes or data corruption
             stock_sample = pd.read_sql(
-                text("SELECT * FROM stock_daily_prices ORDER BY date DESC LIMIT 5"),
+                text("SELECT * FROM company_financials ORDER BY period_end DESC LIMIT 5"),
                 conn
             )
             # Convert count to int (SQL returns generic object); dates/data to string for JSON serialization
-            validation_info["tables"]["stock_daily_prices"] = {
+            validation_info["tables"]["company_financials"] = {
                 "row_count": int(stock_count),
-                "latest_date": str(stock_latest),
+                "latest_period_end": str(stock_latest),
                 # to_dict('records') converts DataFrame rows to list of dicts (JSON-friendly format)
                 "sample_data": stock_sample.to_dict('records') if len(stock_sample) > 0 else []
             }

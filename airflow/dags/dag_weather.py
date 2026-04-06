@@ -1,5 +1,6 @@
 # General Libraries
 
+import os
 import json
 from typing import Annotated, Any, cast
 from datetime import datetime, timedelta
@@ -15,7 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
-from weather_client import sendRequest_openMeteo  # renamed from api_weather_requests
+from weather_client import fetch_weather_forecast  # renamed from sendRequest_openMeteo
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
 from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
@@ -28,42 +29,25 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
 # but it required a paid plan for hourly data. Open-Meteo provides hourly forecasts
 # at no cost and with no rate limits — ideal for learning and practice.
 #
-# Schedule: every 2 minutes (vs. daily for stocks) because:
-#   1. Open-Meteo has no rate limit, so frequent polling is fine
-#   2. Provides a fast feedback loop for testing the Airflow → MariaDB path
-#   3. Exercises Airflow's sub-hourly scheduling for learning purposes
-#   (Weather itself only updates every hour, so rows will repeat — that's OK for now)
+# Schedule: hourly (matching Open-Meteo's own forecast refresh rate).
+#   Open-Meteo returns 168 rows per call (7 days × 24 hours). Running more frequently
+#   than once per hour would fetch identical data and create duplicate rows.
+#   The deduplication logic in load() guards against this, but hourly is the correct cadence.
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-# default_args =
 
 @dag(  # type:ignore
     "API_Weather-Pull_Data",
     default_args={
-        # Brought these "default_args" section from Airflow tutorial codes
-        # [START default_args]
-        # These args will get passed on to each operator
-        # You can override them on a per-task basis during operator initialization
         "depends_on_past": False,
         "retries": 1,
         "retry_delay": timedelta(minutes=5),
-        # 'queue': 'bash_queue',
-        # 'pool': 'backfill',
-        # 'priority_weight': 10,
-        # 'end_date': datetime(2016, 1, 1),
-        # 'wait_for_downstream': False,
-        # 'execution_timeout': timedelta(seconds=300),
         'on_failure_callback': on_failure_alert,  # Slack + PVC log on task failure
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
-        # 'sla_miss_callback': yet_another_function, # or list of functions
-        # 'on_skipped_callback': another_function, #or list of functions
-        # 'trigger_rule': 'all_success'
-        # [END default_args]
     },
     description="Pulling weather info from Meteo Weather API",
-    schedule=timedelta(minutes=5),  # Short interval for development/demo — increase for production
+    schedule=timedelta(hours=1),  # Hourly: Open-Meteo refreshes its forecast data once per hour
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
     start_date=pendulum.datetime(2025, 6, 8, 0, 0, tz="America/New_York"),
     # Note: start_date has to be in the past if you want it to run today/later
@@ -71,7 +55,7 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
     tags=["learning","weather","external api pull"]
 )
 
-def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a name in the @dag section above
+def weather_pipeline():
     """
     ### Weather Data Pipeline
 
@@ -96,21 +80,21 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         # Halt this task (and downstream transform/load) if vacation mode is active
         check_vacation_mode()
 
-        dictGotten : dict = sendRequest_openMeteo(inLatitude=40, inLongitude=40, inFarenheit=True)
-        print(dictGotten)
+        raw_data : dict = fetch_weather_forecast(latitude=40, longitude=40, fahrenheit=True)
+        print(raw_data)
         # Validate API response structure
-        if not all(key in dictGotten for key in ["hourly", "hourly_units"]):
+        if not all(key in raw_data for key in ["hourly", "hourly_units"]):
             raise ValueError("API response missing required keys: 'hourly', 'hourly_units'")
-        if "temperature_2m" not in dictGotten["hourly"]:
+        if "temperature_2m" not in raw_data["hourly"]:
             raise ValueError("API response missing 'temperature_2m' in hourly data")
-        return dictGotten
-    
-    
-    # @task(multiple_outputs=True) 
+        return raw_data
+
+
+    # @task(multiple_outputs=True)
     #   Only best used if downstream (tasks after this one) tasks need to use different parts of the outputted dictionary-like object.
     #   Returns a dictioanry-like object, separating top level key-value pairs into different XComArg objects
     #   To access the results, it would be similar to accessing dictionary values. For example: load(stuff, transformed["timestamp"])
-    @task
+    @task()
     # def transform(inData: Annotated[XComArg, dict[str, Any]]):
     def transform(inData):
         # Not adding type hinting since type hinting for
@@ -123,7 +107,7 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         ### Transform task. aka clean/format the data
         """
 
-        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push 
+        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer : OutputTextWriter = OutputTextWriter("/opt/airflow/out")
 
         # Transform the incoming JSON into a SQL table, each with a different row for each time (and therfore smae or different temperature)
@@ -134,7 +118,7 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         # ------But maybe a city is larger than 1 latitude/longitude
 
         # Open-Meteo returns paired arrays under "hourly" — zip them into one row per hour
-        newDataFrame : pd.DataFrame = pd.DataFrame({
+        df : pd.DataFrame = pd.DataFrame({
             "time"            : inData["hourly"]["time"],
             "temperature_2m"  : inData["hourly"]["temperature_2m"],
             "latitude"        : inData["latitude"],
@@ -145,45 +129,42 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
             "imported_at"     : datetime.now().isoformat(),  # audit column: when this row was loaded
         })
 
-        writer.print("----Transform Preview----")
-        writer.print(str(newDataFrame.head()))
-        writer.print(str(newDataFrame.dtypes))
+        writer.log("----Transform Preview----")
+        writer.log(str(df.head()))
+        writer.log(str(df.dtypes))
 
         # Convert to list-of-dicts so Airflow XCom can serialize it as JSON
-        return newDataFrame.to_dict(orient="records")
+        return df.to_dict(orient="records")
+
     @task()
     def load(inData):
         """
         ### Load Task
-        Push to the storage
-        (In this case, push to Kafka topic,
-        and a different script will take
-        the data from the kafka topic
-        and put it into the SQL database))
+        Push transformed rows into MariaDB (table: weather_hourly) via SQLAlchemy.
+        Deduplicates on (time, latitude, longitude) before inserting to prevent
+        unbounded table growth when the DAG reruns within the same forecast window.
         """
         # Location of Logs
         # writer : OutputTextWriter = OutputTextWriter("/home/ec2-user/myK3Spods_files/myAirflow/dag-mylogs")
 
-        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push 
+        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer : OutputTextWriter = OutputTextWriter("/opt/airflow/out")
 
 
         # NOTE: I must declare this inside a @task object so the task only connects to that folder when the task runs.
-        # If I had declared this constructor in the main area (outside of a task method etc.), it would run whe nthe DAG is initalized,
+        # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
         # which would cause issues.
 
         # Validate DB secrets at task-execution time (not parse time) — prevents DAG parse failures when secrets aren't yet mounted
-        import os
         _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
         if _missing:
             raise RuntimeError(f"Missing Kubernetes secrets: {_missing}. Ensure db-credentials secret is mounted.")
 
         print(str(inData))
-        writer.print(str(inData))  # inData is now a list of row-dicts from transform()
+        writer.log(str(inData))  # inData is now a list of row-dicts from transform()
 
         #TODO: Move this conversion to Pandas Dataframe object
-        # myDataFrameThing = pd.DataFrame([inData])
-        myDataFrameThing = pd.DataFrame(inData)  # list-of-dicts → flat DataFrame ready for SQL
+        df = pd.DataFrame(inData)  # list-of-dicts → flat DataFrame ready for SQL
 
         ## Testing/Learning about Python to SQL (with Pandas)
 
@@ -197,57 +178,57 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
 
             with engine.connect() as connection:
                 result_one = connection.execute(text("SELECT 1"))  # text() wrapper required by SQLAlchemy 2.x
-                print("Success! "+str(result_one.scalar()))
+                print(f"Success! {result_one.scalar()}")
 
-            writer.print("----AAA----")
-            writer.print(str(myDataFrameThing.head()))
-            writer.print(str(myDataFrameThing.dtypes))
-            writer.print("----BBB----")
+            writer.log("--- Pre-insert DataFrame preview ---")
+            writer.log(str(df.head()))
+            writer.log(str(df.dtypes))
 
-            ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOAMTICALLY CONVERTING IT INTO A SQL OBJECT
-            myDataFrameThing.to_sql("weather_hourly", con=engine, if_exists="append", index=False)
+            # Deduplication: skip rows whose (time, latitude, longitude) already exist in the DB
+            # to prevent unbounded table growth when the DAG runs more frequently than data refreshes.
+            lat = df["latitude"].iloc[0]
+            lon = df["longitude"].iloc[0]
+            with engine.connect() as dedup_conn:
+                existing_times = pd.read_sql(
+                    text("SELECT time FROM weather_hourly WHERE latitude=:lat AND longitude=:lon"),
+                    dedup_conn, params={"lat": lat, "lon": lon}
+                )["time"].tolist()
+            new_rows = df[~df["time"].isin(existing_times)]
+            writer.log(f"Dedup: {len(existing_times)} existing, {len(new_rows)} new rows to insert")
 
-            # index = False means: don't write the Pandas Dataframe's index into the SQL table
-            writer.print(f"Loaded {len(myDataFrameThing)} rows into weather_hourly table")  # confirm row count written
+            if len(new_rows) == 0:
+                writer.log("No new rows to insert — all timestamps already present in weather_hourly")
+            else:
+                ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOMATICALLY CONVERTING IT INTO A SQL OBJECT
+                new_rows.to_sql("weather_hourly", con=engine, if_exists="append", index=False)
+                # index = False means: don't write the Pandas Dataframe's index into the SQL table
+                writer.log(f"Loaded {len(new_rows)} new rows into weather_hourly table")
 
             # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
             try:
                 from snowflake_client import write_df_to_snowflake
-                # overwrite=False: append rows to match MariaDB if_exists="append" (weather accumulates)
-                write_df_to_snowflake(myDataFrameThing.copy(), "WEATHER_HOURLY", overwrite=False)
-                writer.print(f"Loaded {len(myDataFrameThing)} rows into Snowflake WEATHER_HOURLY")
+                # Mirror the same dedup-filtered rows to Snowflake (overwrite=False = append)
+                write_df_to_snowflake(new_rows.copy(), "WEATHER_HOURLY", overwrite=False)
+                writer.log(f"Loaded {len(new_rows)} rows into Snowflake WEATHER_HOURLY")
             except Exception as sf_err:
-                writer.print(f"Snowflake write skipped (not yet configured): {sf_err}")
+                writer.log(f"Snowflake write skipped (not yet configured): {sf_err}")
 
         except SQLAlchemyError as e:
-            writer.print(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")  # write to PVC so error is readable without the Airflow UI (UI has 404 encoding bug on run IDs with '+')
-            print("Connection failed. Error: "+str(e))
+            writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")  # write to PVC so error is readable without the Airflow UI (UI has 404 encoding bug on run IDs with '+')
+            print(f"[ERROR] Connection failed: {e}")
             raise
         except Exception as e:
-            writer.print(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors (e.g. ValueError, TypeError) that would otherwise only appear in stdout
+            writer.log(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors (e.g. ValueError, TypeError) that would otherwise only appear in stdout
             raise
 
-        # def flattenDictIntoJSON(inCell):
-        #     return "horshoe"
-        # myDataFrameThing : pd.DataFrame = myDataFrameThing.applymap(flattenDictIntoJSON)
-
-
-        # Still have to install MySQL etc. the d
-        # Would need "pip install pymysql"
-        # Also, URL for SQL might be different since this script will be in kuberentes pod
-        # and my SQL db will be outside the Kubernetes pod
-
-
-
-    
-    # Airflow auomatically converts all tsak method outputs to XComArg objects.
-    # If I want the objects treated as the types I want
+    # Airflow automatically converts all task method return values to XComArg objects for cross-task data passing.
 
     # ── Wiring the pipeline ───────────────────────────────────────────────────
     # Calling the @task functions here defines the execution order for Airflow.
     # Airflow reads these at parse time to build the DAG graph; the functions
     # themselves run later at scheduled execution time.
-    order_data : XComArg = extract()
-    order_summary : XComArg = transform(order_data)
-    load(order_summary)
-dag = zero_nameThatAirflowUIsees()  # assign to module-level variable — Airflow best practice for DAG discovery
+    raw_data : XComArg = extract()
+    records : XComArg = transform(raw_data)
+    load(records)
+
+dag = weather_pipeline()  # assign to module-level variable — Airflow best practice for DAG discovery

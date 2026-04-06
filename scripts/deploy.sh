@@ -42,6 +42,24 @@ FLASK_IMAGE="my-flask-app:latest"
 FLASK_POD="my-kuber-pod-flask"
 ECR_IMAGE="$ECR_REGISTRY/my-flask-app:latest"
 
+# ── Rollback procedure ───────────────────────────────────────────────────────
+# If the Flask pod fails to start after a deploy, recover using the previous image:
+#
+#   1. SSH into EC2:
+#        ssh ec2-stock
+#   2. Re-tag the previous image as latest and re-apply the manifest:
+#        docker tag my-flask-app:previous my-flask-app:latest
+#        docker tag my-flask-app:previous $ECR_REGISTRY/my-flask-app:latest
+#        docker push $ECR_REGISTRY/my-flask-app:latest
+#   3. Delete and recreate the Flask pod so K3S pulls the restored image:
+#        kubectl delete pod my-kuber-pod-flask -n default --ignore-not-found=true
+#        kubectl apply -f ~/dashboard/manifests/pod-flask.yaml
+#        kubectl wait pod/my-kuber-pod-flask -n default --for=condition=Ready --timeout=90s
+#
+# The `my-flask-app:previous` image is tagged at the start of Step 4 on every deploy,
+# so it always points to whatever was running before the current deploy started.
+# ─────────────────────────────────────────────────────────────────────────────
+
 echo "=== Step 1: Ensuring target directories exist on EC2 ==="
 ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs \
     && chmod 777 $EC2_HOME/airflow/dag-mylogs"  # 777 so Airflow pod (UID 50000) can write to the PVC-backed log dir
@@ -55,12 +73,13 @@ ssh "$EC2_HOST" "sudo chmod 644 /etc/rancher/k3s/k3s.yaml"
 echo "=== Step 1b: Pre-flight validation ==="
 
 # Validate Python syntax in all DAG files (catches typos, indentation errors, missing colons)
+# Check exit code directly — py_compile exits non-zero on syntax error (grep on output is unreliable)
 echo "Checking Python syntax in DAG files..."
-if ! python3 -m py_compile airflow/dags/*.py 2>&1 | grep -q "error"; then
+if python3 -m py_compile airflow/dags/*.py 2>/dev/null; then
     echo "✓ All DAG files have valid Python syntax"
 else
     echo "✗ Syntax error in DAG files. Fix before deploying."
-    python3 -m py_compile airflow/dags/*.py
+    python3 -m py_compile airflow/dags/*.py  # re-run to display the error
     exit 1
 fi
 
@@ -174,6 +193,8 @@ print('ECR credential helper configured')
 "
 
 echo "=== Step 4: Building Docker image on EC2 and pushing to ECR ==="
+# Tag the currently running image as 'previous' before overwriting — enables rollback (see procedure above)
+ssh "$EC2_HOST" "docker tag $FLASK_IMAGE my-flask-app:previous 2>/dev/null || true"
 # WHY we push to ECR instead of keeping the image local:
 #   K3S now uses its default containerd runtime (not the legacy --docker mode).
 #   containerd and Docker have separate image stores, so a "docker build" image is NOT
@@ -283,8 +304,13 @@ ssh "$EC2_HOST" "
     kubectl delete pod airflow-scheduler-0 -n airflow-my-namespace --ignore-not-found=true &&
     echo 'Restarting DAG Processor pod(s)...' &&
     kubectl delete pod -l component=dag-processor -n airflow-my-namespace --ignore-not-found=true &&
-    echo 'Waiting 60s for pods to restart...' &&
-    sleep 60 &&
+    echo 'Restarting Triggerer pod...' &&
+    kubectl delete pod airflow-triggerer-0 -n airflow-my-namespace --ignore-not-found=true &&
+    echo 'Waiting for pods to become Ready (up to 120s each)...' &&
+    sleep 10 &&
+    kubectl wait pod/airflow-scheduler-0 -n airflow-my-namespace --for=condition=Ready --timeout=120s &&
+    kubectl wait pod -l component=dag-processor -n airflow-my-namespace --for=condition=Ready --timeout=120s &&
+    kubectl wait pod/airflow-triggerer-0 -n airflow-my-namespace --for=condition=Ready --timeout=120s &&
     echo 'Verifying DAGs are visible...' &&
     kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- airflow dags list
 " || {

@@ -123,7 +123,7 @@ def on_failure_alert(context: dict) -> None:
     # Deduplicate: skip Slack if this DAG+task already alerted within the cooldown window
     key = _alert_variable_key(dag_id, task_id)
     if not _should_send_alert(key, ALERT_COOLDOWN_MINUTES):
-        writer.print(f"[FAILURE ALERT - suppressed, within cooldown] {dag_id}.{task_id}")
+        writer.log(f"[FAILURE ALERT - suppressed, within cooldown] {dag_id}.{task_id}")
         return
 
     msg = (
@@ -133,7 +133,7 @@ def on_failure_alert(context: dict) -> None:
         f"Error: {exception}"
     )
 
-    writer.print(f"[FAILURE ALERT] {msg}")
+    writer.log(f"[FAILURE ALERT] {msg}")
     _send_slack_message(msg)
     _record_alert_sent(key)  # record timestamp so subsequent failures within the window are suppressed
 
@@ -149,7 +149,7 @@ def on_retry_alert(context: dict) -> None:
     # Suppress retry alert if a failure alert was already sent within the cooldown window
     key = _alert_variable_key(dag_id, task_id)
     if not _should_send_alert(key, ALERT_COOLDOWN_MINUTES):
-        writer.print(f"[RETRY ALERT - suppressed, failure already reported] {dag_id}.{task_id} attempt {try_number}")
+        writer.log(f"[RETRY ALERT - suppressed, failure already reported] {dag_id}.{task_id} attempt {try_number}")
         return
 
     msg = (
@@ -158,7 +158,7 @@ def on_retry_alert(context: dict) -> None:
         f"Attempt: {try_number}"
     )
 
-    writer.print(f"[RETRY ALERT] {msg}")
+    writer.log(f"[RETRY ALERT] {msg}")
     _send_slack_message(msg)
     _record_alert_sent(key)  # record timestamp for the unlikely case a retry fires before a failure alert
 
@@ -185,7 +185,7 @@ def on_success_alert(context: dict) -> None:
         f"Task is now succeeding after a previous failure."
     )
 
-    writer.print(f"[RECOVERY ALERT] {msg}")
+    writer.log(f"[RECOVERY ALERT] {msg}")
     _send_slack_message(msg)
     _clear_alert_state(key)  # reset so the next failure starts a fresh cooldown cycle
 
@@ -198,7 +198,7 @@ def check_data_staleness() -> None:
     staleness thresholds. Called by the staleness monitoring DAG.
     """
     writer = _get_writer()
-    writer.print(f"Staleness check started: {datetime.now()}")
+    writer.log(f"Staleness check started: {datetime.now()}")
 
     engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
     alerts = []
@@ -213,7 +213,7 @@ def check_data_staleness() -> None:
             if latest_filed:
                 latest_dt = datetime.strptime(str(latest_filed), "%Y-%m-%d")
                 age_hours = (datetime.now() - latest_dt).total_seconds() / 3600
-                writer.print(f"  company_financials: latest filed_date={latest_filed}, age={age_hours:.1f}h, threshold={STALENESS_THRESHOLD_HOURS_STOCKS}h")
+                writer.log(f"  company_financials: latest filed_date={latest_filed}, age={age_hours:.1f}h, threshold={STALENESS_THRESHOLD_HOURS_STOCKS}h")
 
                 if age_hours > STALENESS_THRESHOLD_HOURS_STOCKS:
                     # Only alert if outside the cooldown window
@@ -225,7 +225,7 @@ def check_data_staleness() -> None:
                         )
                         _record_alert_sent(staleness_key_stocks)  # suppress repeat alerts within window
                     else:
-                        writer.print("  [STALENESS ALERT - suppressed, within cooldown] company_financials")
+                        writer.log("  [STALENESS ALERT - suppressed, within cooldown] company_financials")
                 else:
                     # Table is fresh — send a recovery message if we previously alerted on it
                     if _should_send_staleness_recovery(staleness_key_stocks):
@@ -233,7 +233,7 @@ def check_data_staleness() -> None:
                             f":green_circle: *Staleness Resolved: company_financials*\n"
                             f"Latest filing: {latest_filed} — now within threshold."
                         )
-                        writer.print(f"[STALENESS RECOVERY] {recovery_msg}")
+                        writer.log(f"[STALENESS RECOVERY] {recovery_msg}")
                         _send_slack_message(recovery_msg)
                         _clear_alert_state(staleness_key_stocks)  # reset cooldown after recovery
             else:
@@ -242,7 +242,7 @@ def check_data_staleness() -> None:
                     alerts.append(":clock1: *No data in company_financials table*")
                     _record_alert_sent(staleness_key_stocks)
                 else:
-                    writer.print("  [STALENESS ALERT - suppressed, within cooldown] company_financials (empty)")
+                    writer.log("  [STALENESS ALERT - suppressed, within cooldown] company_financials (empty)")
 
             # Check weather_hourly freshness (imported_at is ISO format like "2025-03-31T14:30:00")
             result = conn.execute(text("SELECT MAX(imported_at) FROM weather_hourly"))
@@ -252,7 +252,7 @@ def check_data_staleness() -> None:
             if latest_imported:
                 latest_dt = datetime.fromisoformat(str(latest_imported))
                 age_hours = (datetime.now() - latest_dt).total_seconds() / 3600
-                writer.print(f"  weather_hourly: latest imported_at={latest_imported}, age={age_hours:.1f}h, threshold={STALENESS_THRESHOLD_HOURS_WEATHER}h")
+                writer.log(f"  weather_hourly: latest imported_at={latest_imported}, age={age_hours:.1f}h, threshold={STALENESS_THRESHOLD_HOURS_WEATHER}h")
 
                 if age_hours > STALENESS_THRESHOLD_HOURS_WEATHER:
                     # Only alert if outside the cooldown window
@@ -264,7 +264,7 @@ def check_data_staleness() -> None:
                         )
                         _record_alert_sent(staleness_key_weather)  # suppress repeat alerts within window
                     else:
-                        writer.print("  [STALENESS ALERT - suppressed, within cooldown] weather_hourly")
+                        writer.log("  [STALENESS ALERT - suppressed, within cooldown] weather_hourly")
                 else:
                     # Table is fresh — send a recovery message if we previously alerted on it
                     if _should_send_staleness_recovery(staleness_key_weather):
@@ -272,7 +272,7 @@ def check_data_staleness() -> None:
                             f":green_circle: *Staleness Resolved: weather_hourly*\n"
                             f"Latest import: {latest_imported} — now within threshold."
                         )
-                        writer.print(f"[STALENESS RECOVERY] {recovery_msg}")
+                        writer.log(f"[STALENESS RECOVERY] {recovery_msg}")
                         _send_slack_message(recovery_msg)
                         _clear_alert_state(staleness_key_weather)  # reset cooldown after recovery
             else:
@@ -281,16 +281,16 @@ def check_data_staleness() -> None:
                     alerts.append(":clock1: *No data in weather_hourly table*")
                     _record_alert_sent(staleness_key_weather)
                 else:
-                    writer.print("  [STALENESS ALERT - suppressed, within cooldown] weather_hourly (empty)")
+                    writer.log("  [STALENESS ALERT - suppressed, within cooldown] weather_hourly (empty)")
 
     except SQLAlchemyError as e:
-        writer.print(f"  Database error during staleness check: {e}")
+        writer.log(f"  Database error during staleness check: {e}")
         raise
 
     # Send one Slack message per stale table (only those that passed the cooldown gate)
     for alert_msg in alerts:
-        writer.print(f"[STALENESS ALERT] {alert_msg}")
+        writer.log(f"[STALENESS ALERT] {alert_msg}")
         _send_slack_message(alert_msg)
 
     if not alerts:
-        writer.print("  All tables within freshness thresholds — no alerts.")
+        writer.log("  All tables within freshness thresholds — no alerts.")

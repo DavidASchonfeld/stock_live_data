@@ -1,3 +1,5 @@
+# NOTE: Apply via deploy.sh only — ${ECR_REGISTRY} is substituted by envsubst/sed at deploy time.
+# Running `kubectl apply -f pod-flask.yaml` directly will fail with ImagePullBackOff.
 apiVersion: v1
 kind: Pod
 metadata:

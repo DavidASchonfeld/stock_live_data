@@ -156,6 +156,12 @@ apiServer:
 triggerer:
   # Runs deferred operators (async sensors). Baseline is lightweight (~100 MB).
   # 512Mi limit: observed OOMKill at 256Mi on t3.large with providers loaded at startup.
+  # Airflow 3.x loads full provider stack per jobs-check call; needs 45s. Same fix as scheduler/api-server/dagProcessor.
+  livenessProbe:
+    initialDelaySeconds: 10
+    timeoutSeconds: 45  # Airflow 3.x provider loading takes 30-45s
+    failureThreshold: 5
+    periodSeconds: 60
   resources:
     requests:
       memory: "128Mi"
@@ -167,6 +173,13 @@ triggerer:
 dagProcessor:
   # Continuously re-parses DAG files. 256Mi request covers normal cycles.
   # 512Mi limit: if exceeded it signals a DAG code problem (e.g. import loop), not a sizing issue.
+  # dagProcessor schema doesn't support startupProbe — only livenessProbe fields.
+  # Raise timeout from default 20s: Airflow 3.x loads full provider stack per jobs-check call (30-45s).
+  livenessProbe:
+    initialDelaySeconds: 10
+    timeoutSeconds: 45  # Airflow 3.x provider loading takes 30-45s (same fix as scheduler/api-server)
+    failureThreshold: 5
+    periodSeconds: 60
   resources:
     requests:
       memory: "256Mi"

@@ -2,10 +2,10 @@
 
 **Quick Navigation**
 - **[docs/INDEX.md](docs/INDEX.md)** — Complete documentation hub (find any topic here)
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Why K3S? How Kubernetes/Docker/ETL work?
-- **[docs/GLOSSARY.md](docs/GLOSSARY.md)** — Define technical terms (SMA, PV, PVC, DAG, K3S, etc.)
-- **[docs/DEBUGGING.md](docs/DEBUGGING.md)** — Troubleshooting guide (systematic approach)
-- **[docs/COMMANDS.md](docs/COMMANDS.md)** — Explain cryptic shell commands (`ss -tlnp`, `kubectl`, etc.)
+- **[docs/architecture/SYSTEM_OVERVIEW.md](docs/architecture/SYSTEM_OVERVIEW.md)** — Why K3S? How Kubernetes/Docker/ETL work?
+- **[docs/reference/GLOSSARY.md](docs/reference/GLOSSARY.md)** — Define technical terms (SMA, PV, PVC, DAG, K3S, etc.)
+- **[docs/operations/DEBUGGING.md](docs/operations/DEBUGGING.md)** — Troubleshooting guide (systematic approach)
+- **[docs/reference/COMMANDS.md](docs/reference/COMMANDS.md)** — Explain cryptic shell commands (`ss -tlnp`, `kubectl`, etc.)
 
 ---
 
@@ -86,7 +86,6 @@ AWS EC2 t3.large  (Elastic IP <YOUR_EC2_IP>)
 data_pipeline/
 ├── OVERVIEW.md                          # This file
 ├── README.md                            # High-level architecture sketch
-├── notes.txt                            # Detailed setup/deployment notes (~69KB)
 ├── .gitignore
 ├── .env.deploy.example                  # Template for deploy secrets — copy to .env.deploy and fill in
 ├── .env.deploy                          # Real AWS values for deploy.sh (NOT committed — gitignored)
@@ -98,7 +97,6 @@ data_pipeline/
 │   │   ├── dag_stocks.py                # Main DAG: SEC EDGAR XBRL financials → MariaDB
 │   │   ├── dag_weather.py               # Secondary DAG: Open-Meteo hourly temp → MariaDB
 │   │   ├── edgar_client.py              # SEC EDGAR API client (RateLimiter, CIK resolution, XBRL parsing)
-│   │   ├── stock_client.py              # Thin re-export layer pointing to edgar_client.py
 │   │   ├── weather_client.py            # Open-Meteo API client (free, no key needed)
 │   │   ├── file_logger.py               # OutputTextWriter: logs to PVC + stdout
 │   │   ├── api_key.py                   # Legacy file — no longer used (SEC EDGAR needs no API key); gitignored

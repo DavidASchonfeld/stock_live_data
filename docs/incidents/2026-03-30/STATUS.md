@@ -10,7 +10,7 @@
 
 ---
 
-## Executive Summary
+## TL;DR
 
 ✅ **Fixed**: K8s PersistentVolume path mismatch (infrastructure issue)
 ✅ **Fixed**: Stock DAG discovery issue (DAG object assignment)

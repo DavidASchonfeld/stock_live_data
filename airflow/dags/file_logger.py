@@ -32,14 +32,14 @@ class OutputTextWriter:
         # Soft-fail if PVC isn't mounted or writable — file logging is debug-only, never crash the task
         if not os.access(inPath, os.W_OK):
             print(f"WARNING: OutputTextWriter cannot write to '{inPath}' (PVC not mounted or wrong permissions) — stdout only.")
-            self._file_enabled = False  # flag used by print() to skip file writes
+            self._file_enabled = False  # flag used by log() to skip file writes
             self.outputTextFileName = None
             return
         self._file_enabled = True  # PVC is writable; file logging is active
         # Filename = current timestamp so each DAG task run gets its own log file
         self.outputTextFileName : str = os.path.join(inPath, str(datetime.now())+".txt")
 
-    def print(self, inString: str) -> str:
+    def log(self, inString: str) -> str:  # renamed from print() — avoids shadowing Python's built-in print function
         # Always write to stdout; only write to file if PVC is mounted and writable
         print(inString)
         if self._file_enabled:
@@ -65,4 +65,4 @@ class OutputTextWriter:
 
         ## Regular String Printing (aka non-Pretty Print)
         else: ## Not Pretty Print
-            return self.print(str(inDict))
+            return self.log(str(inDict))  # delegate to log() — self.print() was renamed to self.log()

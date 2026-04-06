@@ -1,5 +1,6 @@
 # General Libraries
 
+import os
 import json
 import time
 from typing import Any
@@ -15,7 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
-from stock_client import resolve_cik, fetch_company_facts, flatten_company_financials  # re-exported from edgar_client.py
+from edgar_client import resolve_cik, fetch_company_facts, flatten_company_financials  # SEC EDGAR XBRL API calls and data flattening
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
 from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
 from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
@@ -41,36 +42,22 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
 # ── Tickers to track ─────────────────────────────────────────────────────────
 # 3 tickers × 2 API calls each (CIK lookup + companyfacts) = 6 calls total
 # SEC EDGAR allows 10 requests/second with no daily limit — no quota concern
-TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]
+TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]  # Must match TICKERS in dashboard/app.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @dag(  # type:ignore
     "Stock_Market_Pipeline",
     default_args={
-        # Brought these "default_args" section from Airflow tutorial codes
-        # [START default_args]
-        # These args will get passed on to each operator
-        # You can override them on a per-task basis during operator initialization
         "depends_on_past": False,
         "retries": 1,
         "retry_delay": timedelta(minutes=5),
-        # 'queue': 'bash_queue',
-        # 'pool': 'backfill',
-        # 'priority_weight': 10,
-        # 'end_date': datetime(2016, 1, 1),
-        # 'wait_for_downstream': False,
-        # 'execution_timeout': timedelta(seconds=300),
         'on_failure_callback': on_failure_alert,  # Slack + PVC log on task failure
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
-        # 'sla_miss_callback': yet_another_function, # or list of functions
-        # 'on_skipped_callback': another_function, #or list of functions
-        # 'trigger_rule': 'all_success'
-        # [END default_args]
     },
     description="Company financials pipeline: SEC EDGAR XBRL → MariaDB (→ Snowflake in Step 2)",
-    schedule=timedelta(minutes=5),  # Short interval for development/demo — increase for production
+    schedule=timedelta(days=1),  # Daily: SEC EDGAR companyfacts updates only when companies file (≈annually)
     # start_date must be in the past for Airflow to schedule the first run immediately
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
     start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York"),
@@ -135,12 +122,12 @@ def stock_market_pipeline():
         results: list[dict[str, Any]] = []
 
         for ticker in TICKERS:
-            writer.print(f"Resolving CIK for: {ticker}")
+            writer.log(f"Resolving CIK for: {ticker}")
             # SEC EDGAR uses CIK numbers, not ticker symbols — resolve_cik() handles the mapping
             cik = resolve_cik(ticker)
-            writer.print(f"  CIK: {cik}")
+            writer.log(f"  CIK: {cik}")
 
-            writer.print(f"Fetching company facts for: {ticker}")
+            writer.log(f"Fetching company facts for: {ticker}")
             # fetch_company_facts() calls SEC EDGAR's XBRL API with built-in rate limiting
             raw_response = fetch_company_facts(cik)
 
@@ -154,12 +141,12 @@ def stock_market_pipeline():
             results.append({"ticker": ticker, "cik": cik, "raw": raw_response})
             # Count how many US-GAAP concepts were returned for logging visibility
             gaap_count = len(raw_response["facts"]["us-gaap"])
-            writer.print(f"  ✓ {ticker}: {gaap_count} US-GAAP concepts received")
+            writer.log(f"  ✓ {ticker}: {gaap_count} US-GAAP concepts received")
 
         # Write full payload to PVC — XCom carries only the path string (~100 bytes)
         with open(staging_path, "w") as f:
             json.dump(results, f)
-        writer.print(f"Raw data staged to: {staging_path}")
+        writer.log(f"Raw data staged to: {staging_path}")
 
         return staging_path
 
@@ -176,7 +163,6 @@ def stock_market_pipeline():
                                     "period_end", "value", "filed_date", "form_type",
                                     "fiscal_year", "fiscal_period", "frame" }, ...]
         """
-        import os
 
         # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
@@ -192,17 +178,17 @@ def stock_market_pipeline():
             # flatten_company_financials() lives in edgar_client.py — keeps transform() clean
             rows = flatten_company_financials(ticker, item["raw"], annual_only=True)
             all_records.extend(rows)
-            writer.print(f"  {ticker}: {len(rows)} rows after flatten (10-K annual filings only)")
+            writer.log(f"  {ticker}: {len(rows)} rows after flatten (10-K annual filings only)")
 
         # Preview the transformed data
         preview_df: pd.DataFrame = pd.DataFrame(all_records)
-        writer.print("----Transform Preview----")
-        writer.print(str(preview_df.head()))
-        writer.print(str(preview_df.dtypes))
+        writer.log("----Transform Preview----")
+        writer.log(str(preview_df.head()))
+        writer.log(str(preview_df.dtypes))
 
         # Remove staging file — data now lives in XCom as compact flat records
         os.remove(staging_path)
-        writer.print(f"Staging file cleaned up: {staging_path}")
+        writer.log(f"Staging file cleaned up: {staging_path}")
 
         # Convert to list-of-dicts so Airflow XCom can serialize it as JSON
         return all_records
@@ -234,13 +220,12 @@ def stock_market_pipeline():
         # which would cause issues.
 
         # Validate DB secrets at task-execution time (not parse time) — prevents DAG parse failures when secrets aren't yet mounted
-        import os
         _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
         if _missing:
             raise RuntimeError(f"Missing Kubernetes secrets: {_missing}. Ensure db-credentials secret is mounted.")
 
         print(str(records[:2]))  # log first 2 rows so Airflow task log shows data arrived
-        writer.print(str(records[:2]))
+        writer.log(str(records[:2]))
 
         # list-of-dicts → flat DataFrame ready for SQL
         df: pd.DataFrame = pd.DataFrame(records)
@@ -254,36 +239,36 @@ def stock_market_pipeline():
 
             with engine.connect() as connection:
                 result_one = connection.execute(text("SELECT 1"))  # text() wrapper required by SQLAlchemy 2.x
-                print("Success! "+str(result_one.scalar()))
+                print(f"Success! {result_one.scalar()}")
 
-            writer.print("----AAA----")
-            writer.print(str(df.head()))
-            writer.print(str(df.dtypes))
-            writer.print("----BBB----")
+            writer.log("--- Pre-insert DataFrame preview ---")
+            writer.log(str(df.head()))
+            writer.log(str(df.dtypes))
+            writer.log("--- DataFrame dtypes ---")
 
-            ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOAMTICALLY CONVERTING IT INTO A SQL OBJECT
+            ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOMATICALLY CONVERTING IT INTO A SQL OBJECT
             # if_exists="replace": SEC EDGAR returns ALL historical data each call, so we
             # replace the entire table to avoid duplicates. Unlike Alpha Vantage (which
             # returned only recent data and needed "append"), EDGAR gives us everything.
             df.to_sql("company_financials", con=engine, if_exists="replace", index=False)
 
             # index = False means: don't write the Pandas Dataframe's index into the SQL table
-            writer.print(f"Loaded {len(df)} rows into company_financials table")  # confirm row count written
+            writer.log(f"Loaded {len(df)} rows into company_financials table")  # confirm row count written
 
             # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
             try:
                 from snowflake_client import write_df_to_snowflake
                 write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
-                writer.print(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
+                writer.log(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
             except Exception as sf_err:
-                writer.print(f"Snowflake write skipped (not yet configured): {sf_err}")
+                writer.log(f"Snowflake write skipped (not yet configured): {sf_err}")
 
         except SQLAlchemyError as e:
             # Re-raise so task fails and Airflow can retry (instead of silent failure)
-            writer.print(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")
+            writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")
             raise
         except Exception as e:
-            writer.print(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors so they appear in PVC log, not just stdout
+            writer.log(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors so they appear in PVC log, not just stdout
             raise
 
 

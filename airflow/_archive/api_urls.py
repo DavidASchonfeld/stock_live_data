@@ -1,3 +1,4 @@
+# Archived: OpenWeatherMap URL constants, replaced by Open-Meteo direct URL in weather_client.py
 
 # API Url Information
 

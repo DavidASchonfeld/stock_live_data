@@ -10,7 +10,7 @@
 
 ---
 
-## Executive Summary
+## TL;DR
 
 ✅ **FIXED (Phase 1)**: Stock DAG disappearance (dynamic start_date causing configuration drift)
 ✅ **FIXED (Phase 2)**: Stock DAG 90-second staleness (K8s processor cache issue)

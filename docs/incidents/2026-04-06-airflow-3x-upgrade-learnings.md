@@ -5,7 +5,7 @@
 
 ---
 
-## The Short Version
+## TL;DR
 
 A single `helm upgrade` command without a version pin accidentally upgraded Airflow from 2.9.3 to 3.1.8. The database got upgraded to the new format before the upgrade failed, making it impossible to roll back. Then four more attempts to complete the upgrade all timed out for reasons that had nothing to do with the upgrade itself — they all failed because of a single missing secret that wasn't obvious at first. Once the root cause was found, it took about 10 minutes to fix. Three small config changes and all pods came up.
 

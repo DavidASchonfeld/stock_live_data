@@ -1,6 +1,6 @@
 # Stock DAG Investigation Summary - Session 2026-03-31
 
-## Executive Summary
+## TL;DR
 
 **Status**: Stock DAG still not permanently visible in Airflow UI, but **ROOT CAUSE IDENTIFIED**.
 

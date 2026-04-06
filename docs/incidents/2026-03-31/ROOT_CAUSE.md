@@ -5,7 +5,7 @@
 
 ---
 
-## Executive Summary
+## TL;DR
 
 **The Stock DAG marked as stale is NOT due to code issues or Airflow configuration.**
 

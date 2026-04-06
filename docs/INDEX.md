@@ -70,6 +70,7 @@ Complete navigation guide for all project documentation.
 | Document | What it covers |
 |----------|---------------|
 | [CHANGELOG.md](incidents/CHANGELOG.md) | All fixes and changes over time |
+| [2026-04-06-airflow-3x-upgrade-learnings.md](incidents/2026-04-06-airflow-3x-upgrade-learnings.md) | Airflow 3.x upgrade incident: 7 root causes, cascade failure, full recovery, and plain-English lessons |
 | [2026-03-31/](incidents/2026-03-31/) | Stock DAG disappearance: config drift, processor cache staleness, root cause analysis |
 | [2026-03-30/](incidents/2026-03-30/) | Airflow infra fixes: PostgreSQL image deletion, PV path mismatch, DB credential injection |
 
@@ -106,15 +107,16 @@ docs/
 │   └── GLOSSARY.md                   ← Technical terms
 │
 └── incidents/
-    ├── CHANGELOG.md                  ← History of all changes
+    ├── CHANGELOG.md                              ← History of all changes
+    ├── 2026-04-06-airflow-3x-upgrade-learnings.md ← Airflow 3.x upgrade incident
     ├── 2026-03-30/
-    │   ├── FIXES_AIRFLOW.md          ← PostgreSQL + PV + secrets incident
-    │   └── STATUS.md                 ← Operational snapshot
+    │   ├── FIXES_AIRFLOW.md                      ← PostgreSQL + PV + secrets incident
+    │   └── STATUS.md                             ← Operational snapshot
     └── 2026-03-31/
-        ├── INVESTIGATION.md          ← Stock DAG persistence investigation
-        ├── ROOT_CAUSE.md             ← Root cause analysis
-        ├── STATUS.md                 ← Operational snapshot
-        └── SESSION_SUMMARY.md        ← Full session summary
+        ├── INVESTIGATION.md                      ← Stock DAG persistence investigation
+        ├── ROOT_CAUSE.md                         ← Root cause analysis
+        ├── STATUS.md                             ← Operational snapshot
+        └── SESSION_SUMMARY.md                    ← Full session summary
 ```
 
 ---
@@ -136,4 +138,4 @@ docs/
 
 ---
 
-**Last updated:** 2026-04-04
+**Last updated:** 2026-04-06 (code cleanup pass: naming conventions, dead code removal, deploy reliability fixes)

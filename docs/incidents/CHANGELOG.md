@@ -2,6 +2,55 @@
 
 ---
 
+## 2026-04-06: Pre-Snowflake Health Check — dag-processor and triggerer probe timeouts fixed ✅
+
+**Problem found during health check:** `airflow-dag-processor` was in CrashLoopBackOff (41 restarts) and `airflow-triggerer-0` was failing its liveness probe every ~5 minutes (103+ kills over 9h). Both were showing exit code 0 / signal 15 — not real crashes, but K8s killing them because the liveness probe command timed out.
+
+**Root cause:** The liveness probe for both `dagProcessor` and `triggerer` used the default 20s timeout. The probe runs `airflow jobs check --job-type <Component>Job`, which loads the full Airflow 3.x provider stack before returning — takes 30-45s on this cluster. This is **the same issue previously fixed for `scheduler` and `apiServer`** (probe timeout raised to 45s on 2026-04-06), but was not applied to the other two components.
+
+**Why it was missed:** When the scheduler and api-server probes were fixed, the dag-processor and triggerer may not have been exhibiting the same symptom yet (or were restarting less visibly). The Helm chart's `dagProcessor` schema does not support `startupProbe` (discovered during this fix), only `livenessProbe`.
+
+**Fix:**
+- `airflow/helm/values.yaml` — Added `livenessProbe.timeoutSeconds: 45` to both `dagProcessor` and `triggerer` sections
+- `scripts/deploy.sh` Step 7 — Added `kubectl delete pod airflow-triggerer-0` and `kubectl wait pod/airflow-triggerer-0` alongside the existing scheduler and dag-processor restarts (triggerer is a StatefulSet so it doesn't pick up new spec until pod is manually deleted)
+- Applied `helm upgrade` (revision 52 → 53); force-deleted `airflow-triggerer-0` to pick up new probe settings
+
+**Verified state after fix:**
+- All 6 Airflow pods: `Running` with 0 restarts
+- Both DAGs: 85 (Stock) + 214 (Weather) successful runs recorded
+- `company_financials`: 1,768 rows, latest filing date 2026-02-05 (GOOGL 2025 10-K)
+- `weather_hourly`: 65,352 rows, latest forecast time 2026-04-12T23:00
+- Dashboard `/health` and `/validation` endpoints: OK
+- System confirmed ready for Step 2 (Snowflake integration)
+
+**Files changed:** `airflow/helm/values.yaml`, `scripts/deploy.sh`
+
+---
+
+## 2026-04-06: Code Cleanup Pass — Naming, Dead Code, Deploy Reliability ✅
+
+A systematic cleanup of the full codebase addressing naming conventions, dead code, and deploy reliability issues that had accumulated during Step 1 development.
+
+**What changed:**
+
+- **`weather_client.py`** — Renamed `sendRequest_openMeteo` → `fetch_weather_forecast`; renamed `inLatitude/inLongitude/inFarenheit` parameters to `latitude/longitude/fahrenheit` (dropped non-Pythonic `in` prefix, fixed "Farenheit" typo); removed 4 unused imports (`urlencode`, `urljoin`, `copy`, `DataFrame`); removed commented-out Kafka producer block from `__main__` (Kafka is a Step 2 concern with its own module).
+- **`dag_weather.py`** — Renamed DAG function `zero_nameThatAirflowUIsees` → `weather_pipeline`; renamed camelCase variables (`dictGotten`, `newDataFrame`, `myDataFrameThing`) to `raw_data`, `df`, `df`; renamed wiring variables `order_data`/`order_summary` → `raw_data`/`records`; fixed `@task` → `@task()` for decorator consistency; moved `import os` to module level; updated `load()` docstring (was describing Kafka, now describes actual MariaDB/SQLAlchemy load); removed boilerplate tutorial default_args comments; fixed f-string.
+- **`dag_stocks.py`** — Updated import from `stock_client` → `edgar_client` (direct, no re-export middleman); removed boilerplate tutorial default_args comments; replaced `"----AAA----"` / `"----BBB----"` debug labels with descriptive strings; moved `import os` to module level; added TICKERS coupling comment; fixed f-strings.
+- **`stock_client.py`** — Deleted. It was a 3-line re-export wrapper from the Alpha Vantage → SEC EDGAR migration with no further purpose. `dag_stocks.py` now imports `edgar_client` directly.
+- **`file_logger.py`** — Renamed `print()` → `log()` to stop shadowing Python's built-in `print` function; updated all callers across `dag_stocks.py`, `dag_weather.py`, `alerting.py`, `validate_database.py`.
+- **`deploy.sh`** — Fixed py_compile syntax check: old check used `grep -q "error"` which silently passed broken files (because `SyntaxError` has uppercase E, not lowercase). Now checks py_compile exit code directly. Replaced `sleep 60` with `kubectl wait --for=condition=Ready --timeout=120s` so deploy only blocks as long as pods actually need.
+- **`dashboard/requirements.txt`** — Commented out Snowflake packages under `# Step 2 dependencies` label; they add ~200 MB to the Docker image and are not needed until Snowflake is activated.
+- **`dashboard/manifests/pod-flask.yaml`** — Added warning comment: file must be run through `envsubst` (via `deploy.sh`), not applied directly with `kubectl apply`.
+- **`airflow/manifests/pv-pvc-dags.yaml.old`** — Deleted stale backup file (recoverable from git history).
+- **`airflow/_archive/*.py`** — Added one-line archived comment to each file explaining why it was archived.
+- **Incident docs** — Standardized summary section heading to `## TL;DR` across all incident files.
+
+**Files changed:** `airflow/dags/weather_client.py`, `airflow/dags/dag_weather.py`, `airflow/dags/dag_stocks.py`, `airflow/dags/file_logger.py`, `airflow/dags/alerting.py`, `airflow/dags/validate_database.py`, `scripts/deploy.sh`, `dashboard/requirements.txt`, `dashboard/manifests/pod-flask.yaml`
+
+**Files deleted:** `airflow/dags/stock_client.py`, `airflow/manifests/pv-pvc-dags.yaml.old`
+
+---
+
 ## 2026-04-06: Fix `kubectl` Permission Denied on K3s Kubeconfig ✅
 
 **Problem:** `deploy.sh` Step 2e (and all subsequent `kubectl` steps) failed with:
