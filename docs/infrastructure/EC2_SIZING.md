@@ -16,7 +16,7 @@ These are practical estimates for this specific stack at low/portfolio traffic l
 | Component | Where it runs | Approx RAM |
 |-----------|--------------|-----------|
 | K3s (kubelet + control plane) | EC2 host | ~500MB |
-| Airflow webserver pod | K3s pod | ~500MB–1GB |
+| Airflow webserver pod | K3s pod | ~600MB–1.2GB (2 workers × ~300MB each; was ~1.2–1.6GB with 4 workers) |
 | Airflow scheduler pod | K3s pod | ~300–500MB |
 | Airflow dag-processor pod | K3s pod | ~200–300MB |
 | Airflow triggerer pod | K3s pod | ~100–200MB |
@@ -50,22 +50,24 @@ Every pod has explicit `requests` and `limits` to prevent a single runaway compo
 
 - **`requests`** — the amount K8s guarantees and uses to decide which node to schedule the pod on.
 - **`limits`** — the hard ceiling; exceeding memory causes an OOMKill restart (pod is killed and restarted by the OS); exceeding CPU causes throttling (slowed down, not killed).
-- **Amounts chosen at ~2× observed baseline** to absorb startup spikes, while keeping the total K8s limit ceiling ~4.25 Gi — safely under 8 GB even with K3s and MariaDB running on the host.
+- **Amounts chosen at ~2× observed baseline** to absorb startup spikes, while keeping the total K8s limit ceiling ~5.25 Gi — safely under 8 GB even with K3s and MariaDB running on the host.
 
 | Component | Memory request | Memory limit | CPU request | CPU limit | Source file |
 |-----------|---------------|--------------|-------------|-----------|-------------|
 | Flask/Dash | 256 Mi | 512 Mi | 100m | 500m | `dashboard/manifests/pod-flask.yaml` |
-| Airflow webserver | 512 Mi | 1 Gi | 200m | 1000m | `airflow/helm/values.yaml` |
+| Airflow webserver | 512 Mi | 2 Gi | 200m | 1000m | `airflow/helm/values.yaml` |
 | Airflow scheduler | 512 Mi | 1 Gi | 200m | 1000m | `airflow/helm/values.yaml` |
-| Airflow triggerer | 128 Mi | 256 Mi | 100m | 300m | `airflow/helm/values.yaml` |
+| Airflow triggerer | 128 Mi | 512 Mi | 100m | 300m | `airflow/helm/values.yaml` |
 | Airflow dag-processor | 256 Mi | 512 Mi | 100m | 500m | `airflow/helm/values.yaml` |
-| **K8s limits total** | **1.66 Gi** | **4.25 Gi** | | | |
+| **K8s limits total** | **1.66 Gi** | **5.25 Gi** | | | |
 | K3s system (host) | — | ~500 Mi | — | — | not a K8s pod |
 | MariaDB (host, pre-Snowflake) | — | ~500 Mi | — | — | not a K8s pod |
-| **Worst-case total** | | **~5.25 Gi** | | | **~2.75 Gi free** |
+| **Worst-case total** | | **~6.25 Gi** | | | **~1.75 Gi free** |
 
 > Kafka (Step 3) adds ~1 Gi limit. After Snowflake removes MariaDB (~500 Mi), net headroom stays positive.
 > See the inline YAML comments in the source files above for per-field rationale.
+>
+> **Webserver memory history (2026-04-05):** Originally 1 Gi — OOMKilled under load when 4 gunicorn workers × ~300 MB each exceeded the ceiling. Raised to 2 Gi and workers reduced to 2 (set via `webserver.env: AIRFLOW__WEBSERVER__WORKERS=2` in `values.yaml`). Observed baseline with 2 workers: ~670 Mi.
 
 ---
 
@@ -162,4 +164,4 @@ for p in data['items']:
 
 ---
 
-**Last updated:** 2026-04-04 — Added K8s resource limits table; limits now set in pod-flask.yaml and values.yaml.
+**Last updated:** 2026-04-05 — Webserver memory limit raised from 1 Gi to 2 Gi; workers reduced to 2; updated RAM estimates and limits table.

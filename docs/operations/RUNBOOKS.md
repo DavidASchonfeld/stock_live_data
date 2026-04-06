@@ -26,6 +26,8 @@ Step-by-step playbooks for common operations. Each runbook is a complete procedu
 13. [Migrate EC2 to a New Region](#13-migrate-ec2-to-a-new-region)
 14. [Set Up and Activate Snowflake](#14-set-up-and-activate-snowflake)
 15. [Migrate EC2 from AL2023 to Ubuntu 24.04 LTS](#15-migrate-ec2-from-al2023-to-ubuntu-2404-lts)
+16. [Fix DAG Parse Errors / ERR_NETWORK on Grid View](#16-fix-dag-parse-errors--err_network-on-grid-view)
+17. [Fix Static Assets Failing (OOMKill → Network Connection Lost)](#17-fix-static-assets-failing-oomkill--network-connection-lost)
 
 ---
 
@@ -945,13 +947,45 @@ for NS in airflow-my-namespace default; do
 done
 ```
 
-**Helm values** — add `snowflake-credentials` to `extraEnvFrom` in `airflow/helm/values.yaml`:
+**Helm values** — make two changes to `airflow/helm/values.yaml`:
+
+1. Add `snowflake-credentials` to `extraEnvFrom` (injects creds into all Airflow pods):
 ```yaml
 extraEnvFrom: |
   - secretRef:
       name: db-credentials
   - secretRef:
       name: snowflake-credentials
+```
+
+2. Add `_PIP_ADDITIONAL_REQUIREMENTS` to install the Snowflake provider package in Airflow pods.
+   Add this block anywhere in `values.yaml` (e.g. after `extraEnvFrom`):
+```yaml
+# Install Snowflake provider — required for SnowflakeHook in snowflake_client.py
+# NOTE: _PIP_ADDITIONAL_REQUIREMENTS runs pip on every pod restart (~60s extra startup).
+# For production use, build a custom Docker image instead (see note below).
+env:
+  - name: _PIP_ADDITIONAL_REQUIREMENTS
+    value: "apache-airflow-providers-snowflake==5.6.1 snowflake-connector-python==3.10.1"
+```
+> **Production note:** `_PIP_ADDITIONAL_REQUIREMENTS` is convenient for dev/portfolio but adds
+> ~60s to every pod restart. The production pattern is to extend the Airflow base image:
+> `FROM apache/airflow:2.9.3` + `RUN pip install apache-airflow-providers-snowflake==5.6.1`
+> then push to ECR and reference it in `values.yaml` under `defaultAirflowRepository`.
+> For a portfolio project, `_PIP_ADDITIONAL_REQUIREMENTS` is acceptable.
+
+After editing `values.yaml`, run `helm upgrade` to apply (NOT just `./scripts/deploy.sh` — Helm
+changes require an explicit upgrade):
+```bash
+ssh ec2-stock
+helm upgrade airflow apache-airflow/airflow \
+  -n airflow-my-namespace \
+  --version 1.15.0 \
+  -f ~/airflow/helm/values.yaml
+```
+Wait 3–5 minutes for pods to restart and packages to install, then verify:
+```bash
+kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- pip show apache-airflow-providers-snowflake
 ```
 
 **Pod manifest** — add to `envFrom` in `dashboard/manifests/pod-flask.yaml`:
@@ -962,6 +996,7 @@ envFrom:
 - secretRef:
     name: snowflake-credentials
 ```
+Then run `./scripts/deploy.sh` to apply the updated pod manifest.
 
 ### Phase D — Register Airflow Connection
 
@@ -1461,4 +1496,100 @@ ssh ec2-stock           # should connect to Ubuntu instance as 'ubuntu'
 
 ---
 
-**Last updated:** 2026-04-05
+## 16. Fix DAG Parse Errors / ERR_NETWORK on Grid View
+
+**When to use:** Airflow UI shows `ERR_NETWORK` / "network connection was lost" on the `/object/grid_data` API call, OR the DAGs list shows a red "Import Error" badge on a DAG.
+
+**Root cause:** Module-level code in a DAG file raised an exception at parse time. Airflow re-parses every DAG file every few seconds. Any `raise` outside a `@task` function fires during parsing — if a Kubernetes secret isn't mounted yet (e.g., after a pod restart or region migration), the parse fails. In Airflow 3.x, the `api-server` (FastAPI) may drop the TCP connection mid-response rather than return a clean HTTP error, producing `ERR_NETWORK` in the browser.
+
+**Rule: Never raise exceptions at DAG module level.** Secret validation, DB connections, and file I/O belong inside `@task` functions.
+
+```bash
+# Step 1 — Check for import errors in the dag-processor logs
+kubectl logs -n airflow-my-namespace -l component=dag-processor --tail=100 | grep -i "error\|import\|broken"
+
+# Step 2 — Confirm which DAGs have parse errors
+kubectl exec -n airflow-my-namespace deploy/airflow-scheduler -- airflow dags list-import-errors
+
+# Step 3 — After fixing the DAG file and redeploying, confirm clean parse
+kubectl logs -n airflow-my-namespace -l component=dag-processor --tail=50 | grep -i "weather\|stocks\|error"
+```
+
+**Fix pattern — move validation inside the task:**
+```python
+# WRONG — runs at parse time, breaks DAG discovery if secret not mounted
+import os
+if not os.getenv("DB_PASSWORD"):
+    raise RuntimeError("Missing secret")
+
+# CORRECT — runs only when the task executes
+@task()
+def load(inData):
+    import os  # validate at task-execution time, not parse time
+    _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
+    if _missing:
+        raise RuntimeError(f"Missing Kubernetes secrets: {_missing}")
+```
+
+**Verify fix:**
+1. Airflow UI → DAGs list → no red "Import Error" badge
+2. Browser DevTools → Network tab → reload grid page → `/object/grid_data` returns HTTP 200
+
+---
+
+## 17. Fix Static Assets Failing (OOMKill → Network Connection Lost)
+
+**When to use:** Airflow UI loads as a blank/unstyled page. Browser DevTools shows 10+ simultaneous "network connection was lost" errors for CSS and JS files (e.g. `main.js`, `bootstrap.min.js`, `ab.css`). All static assets fail at once — not just one.
+
+**Root cause:** The webserver pod exceeded its memory limit and was OOMKilled. When Kubernetes force-kills a pod, all open HTTP connections are dropped at once — including the browser's in-flight CSS/JS requests. The page HTML may have loaded before the kill, but all subsequent static file downloads are cut off together.
+
+**Diagnosis:**
+```bash
+# Confirm OOMKill on the webserver pod
+kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A5 -i "oom\|killed\|limits"
+
+# Check recent pod restarts and reason
+kubectl get pod -n airflow-my-namespace -l component=webserver
+
+# View memory usage of running pods
+kubectl top pod -n airflow-my-namespace
+```
+
+**Fix:**
+
+1. In `airflow/helm/values.yaml`, raise the memory limit and reduce workers:
+   ```yaml
+   airflow:
+     config:
+       AIRFLOW__WEBSERVER__WORKERS: "2"   # 2 workers × ~300 MB = ~600 MB vs 4 × ~300 MB = ~1.2 GB
+
+   webserver:
+     resources:
+       limits:
+         memory: "2Gi"   # raised from 1Gi — baseline ~600 MB + headroom for spikes
+   ```
+
+2. `deploy.sh` Step 2d runs `helm upgrade` automatically — just run the deploy script:
+   ```bash
+   ./scripts/deploy.sh
+   ```
+
+**Verify fix:**
+```bash
+# Confirm workers env var took effect
+kubectl exec -n airflow-my-namespace airflow-webserver-0 -- printenv AIRFLOW__WEBSERVER__WORKERS
+
+# Confirm no OOMKill events since restart
+kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -i oom
+
+# Confirm memory stays under limit
+kubectl top pod -n airflow-my-namespace
+```
+
+Then reload `http://localhost:30080/home` — all CSS/JS should load cleanly.
+
+**Note:** If `deploy.sh` was previously only syncing `values.yaml` without a `helm upgrade` step, values changes will have had no effect on the live cluster. Step 2d in `deploy.sh` closes this gap.
+
+---
+
+**Last updated:** 2026-04-05 — Added Runbook 17 (static assets OOMKill); updated Runbook 16 reference; added helm upgrade to TOC.

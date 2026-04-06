@@ -175,8 +175,10 @@ ec2_ssh "mkdir -p /home/ubuntu/airflow/dags \
     /home/ubuntu/airflow/dag-mylogs \
     /home/ubuntu/airflow/helm \
     /home/ubuntu/airflow/manifests \
+    && chmod 777 /home/ubuntu/airflow/dag-mylogs \
     && sudo mkdir -p /opt/airflow/logs /opt/airflow/out \
     && sudo chown -R ubuntu:ubuntu /opt/airflow"
+# chmod 777 on dag-mylogs: Airflow pod runs as UID 50000, not ubuntu (1000) — needs world-write to reach PVC-backed log dir
 
 echo "=== Phase E: Syncing manifests to EC2 ==="
 for f in pv-dags.yaml pv-airflow-logs.yaml pv-output-logs.yaml \

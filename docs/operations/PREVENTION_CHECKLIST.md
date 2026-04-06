@@ -21,7 +21,7 @@ Run through this mentally (or literally) every time you deploy code changes.
   grep -n "pendulum.now\|datetime.now" airflow/dags/dag_*.py
   ```
 - [ ] **Module-level DAG variable exists** — Each DAG file ends with `dag = function_name()` assignment
-- [ ] **Required secrets validated at import** — `_required_secrets` list present in each DAG
+- [ ] **Secret validation inside tasks, not at module level** — Secret checks (`os.getenv(...)`) must be inside `@task` functions, never at the top level of the DAG file. Module-level raises cause DAG parse failures when secrets aren't yet mounted.
 - [ ] **PV path matches deploy path** — Compare `EC2_DAG_PATH` in `deploy.sh` with `hostPath.path` in `airflow/manifests/pv-dags.yaml`. Must match.
   ```bash
   grep EC2_DAG_PATH scripts/deploy.sh
@@ -32,6 +32,7 @@ Run through this mentally (or literally) every time you deploy code changes.
 
 - [ ] **deploy.sh completes all steps** — Watch for errors in each numbered step. Don't ignore warnings.
 - [ ] **rsync shows expected file count** — Verify the right number of files transferred
+- [ ] **Step 2d (`helm upgrade`) succeeds** — Confirms any `values.yaml` changes (memory limits, worker count, env vars) are applied to the live cluster. Syncing `values.yaml` to EC2 alone does NOT update running pods.
 
 ### After Deploy
 
@@ -69,6 +70,7 @@ For changes to K8s manifests, Helm values, PV/PVC configs, or service definition
   ssh ec2-stock kubectl get pods -n <namespace> --show-labels
   ```
 - [ ] **Helm values.yaml changes backported** — If you made manual `kubectl patch` fixes earlier, are they reflected in `values.yaml`? Next `helm upgrade` will overwrite manual changes.
+- [ ] **Component env vars use correct chart key** — Pod environment variables for specific Airflow components must use `<component>.env` (e.g. `webserver.env`), NOT `airflow.config`. The `airflow.config` key only writes to `airflow.cfg` — it does not set K8s pod env vars and silently has no effect.
 
 ### After Applying
 
@@ -101,6 +103,10 @@ Helm upgrades are the highest-risk operation — they can change multiple resour
 
 ### Before Upgrade
 
+- [ ] **`_PIP_ADDITIONAL_REQUIREMENTS` includes `pymysql`** — Check `values.yaml` top-level `env:` block. A full `helm delete` + reinstall starts with a clean Python environment; without this, `load()` fails with `ModuleNotFoundError: No module named 'pymysql'` (see [DEBUGGING.md section N](DEBUGGING.md#n-load-task-fails-with-modulenotfounderror-no-module-named-pymysql))
+  ```bash
+  grep -A2 "_PIP_ADDITIONAL_REQUIREMENTS" airflow/helm/values.yaml
+  ```
 - [ ] **Current state is healthy** — Don't upgrade into an already-broken cluster
 - [ ] **Helm diff** (if helm-diff plugin installed) or review `values.yaml` changes carefully
 - [ ] **No manual patches outstanding** — Any `kubectl patch` fixes must be in `values.yaml` first
@@ -261,4 +267,4 @@ When creating or modifying a DAG file.
 
 ---
 
-**Last updated:** 2026-03-31
+**Last updated:** 2026-04-05 — Added helm upgrade check to deploy checklist; clarified `webserver.env` vs `airflow.config`; updated secret validation guidance (task-level not module-level).

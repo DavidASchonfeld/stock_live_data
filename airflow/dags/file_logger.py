@@ -29,21 +29,22 @@ class OutputTextWriter:
     outputTextFileName : str
 
     def __init__(self, inPath : str = outputTextsFolder_folderPath):
-        # Check write permission before creating the file — gives a clear error
-        # if the PVC isn't mounted or the directory doesn't exist yet on the host.
-        try:
-            if (os.access(inPath, os.W_OK) == False):
-                raise PermissionError
-        except PermissionError as e:
-            raise PermissionError("outputTextWriter.py does not have permission to create/write a folder for and/or the text file in the target location ("+inPath+").")
+        # Soft-fail if PVC isn't mounted or writable — file logging is debug-only, never crash the task
+        if not os.access(inPath, os.W_OK):
+            print(f"WARNING: OutputTextWriter cannot write to '{inPath}' (PVC not mounted or wrong permissions) — stdout only.")
+            self._file_enabled = False  # flag used by print() to skip file writes
+            self.outputTextFileName = None
+            return
+        self._file_enabled = True  # PVC is writable; file logging is active
         # Filename = current timestamp so each DAG task run gets its own log file
         self.outputTextFileName : str = os.path.join(inPath, str(datetime.now())+".txt")
 
     def print(self, inString: str) -> str:
-        # Write to both stdout (captured by Airflow task logs) and the PVC file
+        # Always write to stdout; only write to file if PVC is mounted and writable
         print(inString)
-        with open(self.outputTextFileName, "a") as textFile:
-            textFile.write("\n"+inString)
+        if self._file_enabled:
+            with open(self.outputTextFileName, "a") as textFile:
+                textFile.write("\n"+inString)
         return inString
 
     def print_dict(self, inDict: dict, prettyPrint : bool = False) -> str:
@@ -54,9 +55,10 @@ class OutputTextWriter:
             ## Terminal
             pprint(inDict)
 
-            ## Print to Text File
-            with open(self.outputTextFileName, "a") as textFile:
-                pprint(inDict, stream=textFile)
+            ## Only write to file if PVC is active
+            if self._file_enabled:
+                with open(self.outputTextFileName, "a") as textFile:
+                    pprint(inDict, stream=textFile)
 
             return pformat(inDict, indent = 4)
     

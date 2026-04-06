@@ -172,6 +172,16 @@ When something breaks, find the component showing symptoms below. Each failure m
 | **Blast radius** | Cascading evictions. K8s evicts lowest-priority pods first, which may include MariaDB (total data loss if PV not configured) or the scheduler (all DAGs stop). |
 | **Prevention** | Set resource requests and limits on all pods. Monitor node memory usage. Identify which pods are critical vs. evictable. |
 
+### K8-6: Webserver OOMKill Cascades to "Network Connection Was Lost"
+
+| Field | Detail |
+|-------|--------|
+| **Symptoms** | Airflow UI loads but ALL CSS/JS static assets fail simultaneously with "network connection was lost". Browser DevTools shows 10+ identical errors at once (main.js, bootstrap.min.js, ab.css, etc.). Page may render as unstyled HTML. |
+| **Root cause** | Webserver pod exceeds its memory limit → Kubernetes force-kills the pod (OOMKill) → pod restarts → all open HTTP connections drop at once. The browser had already received the page HTML but the CSS/JS downloads were cut off mid-transfer. |
+| **Blast radius** | Airflow UI unusable (no styles or JavaScript). Affects all browser sessions during the restart window (~30–90 seconds). No data loss — DAGs keep running; only the UI is disrupted. |
+| **Prevention** | Keep webserver memory limit at 2 Gi. Keep `AIRFLOW__WEBSERVER__WORKERS=2` (set via `webserver.env` in `values.yaml`). Ensure `helm upgrade` is run after any `values.yaml` change — syncing the file to EC2 alone does NOT apply changes to running pods. |
+| **Real incident?** | Yes — 2026-04-05. Root cause: 4 workers × ~300 MB = ~1.2 Gi exceeded the 1 Gi limit. Additionally, `AIRFLOW__WEBSERVER__WORKERS` was nested under `airflow.config` (silently ignored by the chart) instead of `webserver.env` (the correct key). |
+
 ---
 
 ## AWS EC2 / Infrastructure
@@ -286,10 +296,12 @@ When something breaks, find the component showing symptoms below. Each failure m
 | Port unreachable, pod is Running | K8-3 or FL-5 (selector mismatch) |
 | Pod empty directory, files on EC2 | K8-1 (PV path mismatch) |
 | Fix deployed but pod still crashing | K8-2 (backoff inertia) |
+| All static assets fail simultaneously | K8-6 (webserver OOMKill) |
+| values.yaml change has no effect | K8-6 / missing helm upgrade step |
 | SSH timeout from new location | EC-1 (IP restriction) |
 | API returns data but it's wrong | API-2 (schema change) |
 | Dashboard shows old data, no errors | FL-4 (stale data, silent DAG failure) |
 
 ---
 
-**Last updated:** 2026-03-31
+**Last updated:** 2026-04-05 — Added K8-6 (webserver OOMKill → static asset cascade); updated quick lookup table.

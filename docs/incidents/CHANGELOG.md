@@ -2,6 +2,155 @@
 
 ---
 
+## 2026-04-05: Weather DAG "Missing from DagBag" + Scheduler CrashLoopBackOff Fixed ✅
+
+### Part 1 — Weather DAG "Missing from DagBag"
+
+**Symptom**: Clicking the Weather DAG in the Airflow UI showed:
+```
+DAG "API_Weather-Pull_Data" seems to be missing from DagBag.
+```
+The Stocks DAG (`Stock_Market_Pipeline`) was unaffected and loaded normally.
+
+---
+
+**Why this error appears at all — how Airflow's DagBag works**
+
+Airflow has two separate stores of DAG information:
+
+1. **Metadata DB (PostgreSQL)** — persists DAG identifiers, run history, task states. Populated the last time a file was successfully parsed.
+2. **DagBag (in-memory)** — the live set of DAG objects built by actually importing each `.py` file in `/opt/airflow/dags/`. Rebuilt periodically by the scheduler and dag-processor.
+
+The DAG list page reads from the **metadata DB**, so a DAG that was once valid continues to appear in the list even after its file starts failing to parse. But when you click a DAG to view its detail page, the UI needs the live **DagBag** object (to show the task graph, next run time, etc.). If the file is currently failing to parse, the DagBag has no entry for that dag_id → "seems to be missing from DagBag."
+
+This is why the Stocks DAG appeared fine (it parsed correctly) while the Weather DAG showed the error (its file was failing to parse on every DagBag rebuild cycle).
+
+---
+
+**Root cause — the import chain that broke parsing**
+
+When Airflow imports `dag_weather.py`, Python executes every top-level statement in the file. One of those is:
+
+```python
+from weather_client import sendRequest_openMeteo   # dag_weather.py line 19
+```
+
+This causes Python to import `weather_client.py`, which at its own top level had:
+
+```python
+from api_key import api_keys                       # weather_client.py line 22
+```
+
+`api_key.py` is gitignored and contains API keys for services like Alpha Vantage and OpenWeatherMap. After the Ubuntu 24.04 EC2 migration, if the pod was recreated and files weren't re-synced, `api_key.py` could be absent from the pod. When Python can't find the module, it raises `ModuleNotFoundError`, which propagates up through the import chain and causes the entire `dag_weather.py` parse to fail.
+
+The critical detail: **`api_keys` was never used**. The comment in `weather_client.py` even said so explicitly — it was a leftover from when the file also handled OpenWeatherMap (which needed a key). Open-Meteo is free and keyless. The import served no purpose and was a latent landmine waiting for a pod recreation to detonate it.
+
+The Stocks DAG imports `stock_client`, which has no dependency on `api_key.py` — this is why it was unaffected.
+
+**Secondary issue — `snowflake_client.py` top-level imports**
+
+A recent modification to `snowflake_client.py` moved these to the module top level:
+```python
+from snowflake.connector.pandas_tools import write_pandas
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+```
+If either package is absent, any `import snowflake_client` fails immediately. Both DAGs import `snowflake_client` lazily (inside their `load()` task body, inside a `try/except`) so this wasn't the immediate parse-time cause — but it was a correctness risk: if `snowflake_client` ever got imported at module level in the future, it would cause the same class of breakage.
+
+---
+
+**Fixes applied**
+
+1. **`weather_client.py`** — Removed the unused `from api_key import api_keys` import. `sendRequest_openMeteo()` never referenced `api_keys`; removing it eliminates the dependency on a gitignored file at parse time.
+
+   **Why this fixes the error**: Without the `api_key` import, `weather_client.py` loads cleanly. `dag_weather.py` can then be fully imported, the `@dag`-decorated function runs at module level (`dag = zero_nameThatAirflowUIsees()`), and Airflow registers `API_Weather-Pull_Data` in the DagBag. On the next DagBag rebuild cycle, the scheduler finds the DAG and the UI detail page loads.
+
+2. **`snowflake_client.py`** — Moved both Snowflake imports inside `write_df_to_snowflake()` as lazy imports:
+   ```python
+   def write_df_to_snowflake(...):
+       from snowflake.connector.pandas_tools import write_pandas     # lazy — only fails at execution time
+       from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+   ```
+   **Why this is the right pattern**: Lazy imports mean "only load this when the function is actually called." Since `write_df_to_snowflake()` is called from inside a `@task` body that runs at DAG execution time (not parse time), any missing Snowflake package becomes a soft execution error (already caught by the surrounding `try/except`) rather than a hard parse failure that prevents the entire DAG from loading.
+
+3. **`docs/operations/TROUBLESHOOTING.md`** — Added a dedicated "DAG missing from DagBag" entry explaining the DagBag vs metadata DB split, diagnosis commands, and fix pattern.
+
+**Verified**: `airflow dags list` from inside the scheduler pod shows `API_Weather-Pull_Data` in the DagBag. Weather DAG detail page loads without error.
+
+---
+
+### Part 2 — Scheduler CrashLoopBackOff (discovered during deploy)
+
+**Symptom**: After deploying the DAG fix, `airflow-scheduler-0` entered `CrashLoopBackOff`. Pod was 1/2 Ready with 3–5 restarts in the first 10 minutes.
+
+**Root cause**: The scheduler pod startup sequence is:
+1. Container starts
+2. `pip install pymysql` runs (from `_PIP_ADDITIONAL_REQUIREMENTS`) — takes ~30–45s
+3. Airflow scheduler process starts
+4. Kubernetes startup probe fires: `airflow jobs check --job-type SchedulerJob --local`
+
+The default startup probe has `failureThreshold: 6` and `periodSeconds: 10` (= 60 seconds total). If pip install + Airflow initialization takes longer than 60s (which it did on the t3.large), the probe declares failure and kills the container — which then restarts, repeating the cycle.
+
+The webserver had already received an extended probe (`failureThreshold: 18` = 180s) to handle its own slow startup. The scheduler was missed.
+
+**Fix applied**:
+
+`airflow/helm/values.yaml` — Added matching startup probe override for the scheduler:
+```yaml
+scheduler:
+  startupProbe:
+    failureThreshold: 18   # 18 × 10s = 180s to complete startup
+    periodSeconds: 10
+    timeoutSeconds: 20
+```
+
+**Why this fixes the crash**: The probe now waits up to 180 seconds before declaring failure. pip finishes (~40s), Airflow starts, the SchedulerJob registers its first heartbeat, and the probe finds a live job — passing on the first check after startup. No more CrashLoopBackOff.
+
+**Verified**: `kubectl get pods -n airflow-my-namespace` shows `airflow-scheduler-0` at 2/2 Running, 0 restarts on the current cycle. `airflow dags list` runs successfully from inside the pod.
+
+---
+
+## 2026-04-05: Weather DAG `load()` Fixed — `pymysql` Missing After EC2 Migration ✅
+
+**Root cause**: The `load()` task failed with `ModuleNotFoundError: No module named 'pymysql'` on every run. The DAGs use SQLAlchemy's `mysql+pymysql://` dialect to connect to MariaDB, which requires `pymysql` as the database driver. The Apache Airflow Docker image does not include it by default. After the Ubuntu 24.04 EC2 migration, the Helm release was redeployed on a fresh instance — the new pods started with a clean Python environment and `pymysql` was absent. `extract()` and `transform()` succeeded because neither opens a database connection; `load()` was the first task to call `create_engine("mysql+pymysql://...")`, which triggered the missing import.
+
+The failure was initially invisible because the Airflow 2.9.3 UI has a `+`→`%20` URL encoding bug that returns 404 when clicking into task logs from the grid view. The actual error was found by reading the task log directly from the log PVC via kubectl.
+
+**Fixes applied**:
+1. **`airflow/helm/values.yaml`**: Added `_PIP_ADDITIONAL_REQUIREMENTS: "pymysql"` under the top-level `env:` block. The Airflow Helm chart reads this variable at pod startup and runs `pip install pymysql` before any Airflow process starts — ensuring all pods (scheduler, triggerer, dag-processor) have the driver available.
+2. **`dag_weather.py` + `dag_stocks.py`**: Added `writer.print(f"[ERROR] ...")` inside `except SQLAlchemyError` and a new `except Exception` fallback so all errors are written to the PVC log file. Previously, errors only went to stdout (Airflow task logs), which requires the UI to read — the UI 404 bug made that impossible.
+3. **`docs/operations/DEBUGGING.md`**: Added sections N (pymysql missing module) and M (404 URL encoding bug) documenting both issues and their workarounds.
+
+**Verified**: After `./scripts/deploy.sh`, pods restart and install `pymysql` at startup. `load()` task succeeds; `weather_hourly` rows appear in MariaDB.
+
+---
+
+## 2026-04-05: Weather DAG Transform PermissionError Fixed ✅
+
+**Root cause**: `transform()` calls `OutputTextWriter("/opt/airflow/out")` as its first action. The underlying host directory (`/home/ubuntu/airflow/dag-mylogs`) was owned by `ubuntu` (UID 1000) with permissions 755 — the Airflow pod process runs as UID 50000, which had no write access. `os.access(..., os.W_OK)` returned `False` and raised `PermissionError`, crashing the task before any data was touched. `extract()` has no `OutputTextWriter` call, which is why it succeeded while `transform()` failed.
+
+**Fixes applied**:
+1. **`file_logger.py` soft-fail**: `OutputTextWriter` now falls back to stdout-only logging when the path isn't writable, instead of raising a hard `PermissionError`. PVC issues can no longer crash DAG tasks.
+2. **`deploy.sh` Step 1**: Added `dag-mylogs` to the `mkdir -p` block and a `chmod 777` so every deploy ensures correct permissions for the Airflow UID.
+3. **`bootstrap_ec2.sh`**: Added `chmod 777 /home/ubuntu/airflow/dag-mylogs` so fresh bootstraps also set correct permissions.
+
+**Verified**: Trigger a manual DAG run — all three tasks (extract → transform → load) should go green.
+
+---
+
+## 2026-04-05: Webserver OOMKill Fixed — Memory Limit + Workers + deploy.sh Helm Integration ✅
+
+**Root cause of "network connection was lost" errors**: All static assets (CSS, JS, fonts) failed simultaneously on every page load because the webserver pod was being OOMKilled. 4 gunicorn workers × ~300 MB each = ~1.2 Gi, exceeding the 1 Gi memory limit. Kubernetes force-killed the pod; any in-flight browser requests were dropped mid-connection.
+
+**Fixes applied**:
+1. **Webserver memory limit raised**: 1 Gi → 2 Gi in `airflow/helm/values.yaml`
+2. **Gunicorn workers reduced to 2**: Set via `webserver.env` (NOT `airflow.config` — which is not the correct Helm chart key for pod env vars; it only writes to `airflow.cfg`)
+3. **deploy.sh Step 2d added**: `helm upgrade` now runs after syncing `values.yaml` to EC2. Previously, edits to `values.yaml` were copied to EC2 but never applied to the running Helm release — the live cluster kept the old 1 Gi limit indefinitely.
+4. **DAG module-level raises removed**: Secret validation in `dag_stocks.py` and `dag_weather.py` moved from module level (parse time) into `load()` task (execution time), eliminating DAG parse failures when secrets aren't yet mounted.
+
+**Verified**: webserver pod uses 670 Mi RAM, 2 gunicorn workers, 0 restarts, `AIRFLOW__WEBSERVER__WORKERS=2` confirmed in pod env.
+
+---
+
 ## 2026-04-05: Ubuntu 24.04 Migration — Phase H Cutover + Phase I Initiated ✅
 
 **What Changed**: Completed Phase H (Elastic IP cutover) — EIP `52.70.211.1` moved from old AL2023 instance to the new Ubuntu 24.04 instance. `ec2-stock` SSH alias now resolves to Ubuntu. `deploy.sh` confirmed working end-to-end against `ec2-stock` post-cutover: all 3 DAGs visible, Flask pod Running (1/1 Ready), ECR image pushed.

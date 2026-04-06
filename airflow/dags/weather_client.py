@@ -14,12 +14,7 @@ from pandas import DataFrame
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
 
 
-
-# My Files
-# Note: api_keys is imported here but Open-Meteo doesn't require an API key.
-# This import is a leftover from when this file also handled OpenWeatherMap
-# (which did need a key). Kept for reference; would be used if a keyed API is added.
-from api_key import api_keys  # My api_key Python file is in .gitignore
+# Removed: from api_key import api_keys — Open-Meteo is free/keyless; import was unused leftover from OpenWeatherMap era
 # Removed: from api_urls import open_weather — api_urls.py is archived; open_weather was never used by sendRequest_openMeteo
 
 

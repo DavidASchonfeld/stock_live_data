@@ -526,6 +526,92 @@ Then re-applied the manifest (`kubectl apply -f`). Endpoints populated immediate
 
 ---
 
+### Bug 12: ERR_NETWORK on the Airflow Grid View — Module-Level raise in a DAG File
+
+**What happened:** Opening `http://localhost:30080/dags/API_Weather-Pull_Data/grid` showed a browser console error: "network connection was lost" / `ERR_NETWORK` on the `/object/grid_data` API call. The page itself loaded, but the grid of task runs was blank.
+
+**Why it happened — in plain English:**
+
+Airflow re-reads (parses) every DAG file every few seconds to detect changes. Parsing means Python literally runs the top-level code in the file — the code outside any function. If any of that top-level code raises an exception, the DAG file fails to load.
+
+`dag_weather.py` and `dag_stocks.py` both had this block at module level (outside any function):
+
+```python
+import os
+_required_secrets = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"]
+_missing_secrets = [k for k in _required_secrets if not os.getenv(k)]
+if _missing_secrets:
+    raise RuntimeError(f"Missing Kubernetes secrets...")
+```
+
+After the EC2 region migration and Ubuntu 24.04 migration, Kubernetes secrets weren't guaranteed to be mounted before the DAG processor pod finished starting. So when the `dag-processor` pod parsed `dag_weather.py`, the environment variables weren't set yet → the `RuntimeError` fired → the DAG failed to load → the `api-server` had an incomplete DAG registry → it dropped the HTTP connection mid-response → the browser saw `ERR_NETWORK` instead of a proper error message.
+
+**Why did it drop the connection instead of showing an error page?**
+
+In Airflow 3.x the `api-server` uses FastAPI instead of Flask. When the DAG registry is broken, FastAPI abandons the response rather than sending a clean error page. The browser sees the TCP connection close before any HTTP bytes arrive, which shows as a network error — not a 404 or 500.
+
+**The fix:** Moved the secret validation inside the `load()` task function, where it only runs when the task actually executes — not during parse time:
+
+```python
+@task()
+def load(inData):
+    # Validate DB secrets at task-execution time (not parse time)
+    import os
+    _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
+    if _missing:
+        raise RuntimeError(f"Missing Kubernetes secrets: {_missing}. Ensure db-credentials secret is mounted.")
+    # ... rest of task
+```
+
+Also added `dag = zero_nameThatAirflowUIsees()` at the end of `dag_weather.py` to follow Airflow's documented best practice of assigning the DAG to a module-level variable.
+
+**The bigger lesson:** In Airflow, the DAG file is a Python module that gets imported repeatedly. Think of the top level of your DAG file like `__init__.py` — it should only define structure. Never put I/O, network calls, secret checks, or anything that can raise an exception at module level. Anything that might fail belongs inside a `@task` function, which only runs when Airflow actually schedules that task.
+
+---
+
+### Bug 13: All Static Assets Fail with "Network Connection Was Lost" — Webserver OOMKilled
+
+**What happened:** The Airflow UI at `http://localhost:30080/home` showed a blank, unstyled page. The browser console had 20+ identical errors: `"network connection was lost"` for every static file — `main.js`, `bootstrap.min.js`, `ab.css`, and all the rest.
+
+**Why it happened — in plain English:**
+
+When a _single_ API call fails (like Bug 12's grid view), you suspect a DAG parse problem. But when _every_ file fails _simultaneously_, that's a different diagnosis: the web server process was killed mid-page-load.
+
+Here's what was happening on the server:
+
+Airflow's web server uses **gunicorn** — a process that spawns multiple worker processes to handle requests. We had 4 workers configured. Each worker has to load all the Airflow provider packages (Azure, Snowflake, etc.) into memory when it starts. Each loaded worker uses ~300 MB of RAM.
+
+4 workers × 300 MB = **~1.2 GB just for the web server**, plus Kubernetes overhead. The memory limit in `values.yaml` was set to `1Gi`. So the pod kept exceeding its limit, Kubernetes force-killed it (called an **OOMKill** — Out of Memory Kill), and the pod restarted.
+
+The browser opened the page, started downloading CSS and JS files, then the pod got killed mid-download. Every file transfer was cut off. The browser reported this as "network connection was lost" — technically accurate, but not very helpful.
+
+**Why did every file fail, not just some?**
+
+When the pod is killed, ALL open HTTP connections are dropped at once. The page HTML might have already been delivered (which is why you saw a page at all), but all the CSS/JS/font requests that followed were cut off together.
+
+**The fix (two parts):**
+
+1. Increase the memory limit in `values.yaml` from `1Gi` to `2Gi` — gives headroom above the 1.2 GB baseline.
+2. Reduce gunicorn workers from 4 to 2 (via `AIRFLOW__WEBSERVER__WORKERS: "2"`) — cuts memory footprint roughly in half.
+3. Add a `helm upgrade` step to `deploy.sh` — `values.yaml` changes are just a text file until Helm applies them to the live cluster.
+
+**The lesson about `helm upgrade` vs. file sync:**
+
+`deploy.sh` used `rsync` to copy `values.yaml` to EC2, but never ran `helm upgrade`. The file was updated on disk but the running Kubernetes pods were still configured with the old settings. Think of it like editing a config file for a service but forgetting to restart the service — the changes don't take effect until you apply them.
+
+Added **Step 2d** to `deploy.sh`:
+```bash
+ssh "$EC2_HOST" "helm upgrade airflow apache-airflow/airflow \
+    -n airflow-my-namespace \
+    --version 1.15.0 \
+    --reuse-values \
+    -f $EC2_HELM_PATH/values.yaml"
+```
+
+Now every `deploy.sh` run automatically applies any `values.yaml` changes to the live cluster.
+
+---
+
 ### Bug 5: Alpha Vantage Rate Limits (API Errors)
 
 **What happened:** The Stock DAG would sometimes fail because the Alpha Vantage API stopped responding with data and instead gave an error message.
@@ -809,4 +895,155 @@ See [infrastructure/EC2_SIZING.md](infrastructure/EC2_SIZING.md) for the full te
 
 ---
 
-**Last updated:** 2026-04-05 — Added resource limits explanation (Part 9); added Bug 6 (envsubst Apple Silicon fallback); updated deploy.sh step 3 to explain ECR_REGISTRY placeholder substitution. Added Bugs 7–10 (EC2 Ubuntu migration: Bitnami image removal from Docker Hub, webserver startup probe timeout, triggerer OOMKill, deploy.sh venv PATH). Updated SSH KEX warning section: migration to Ubuntu 24.04 LTS resolved the issue permanently. Added Bug 11 (Airflow UI port 30080 unreachable — service selector mismatch: `api-server` vs `webserver`).
+## Part 10: What Is dbt, and Why Does It Matter?
+
+### The problem dbt solves
+
+Right now your pipeline does three things inside the `transform()` task in each DAG:
+
+1. Pulls raw data from the API
+2. Reshapes it (flattens JSON, renames columns, filters rows) using Python + Pandas
+3. Writes the result directly to the database
+
+This works fine for two tables. But imagine you have 20 tables. Now every transformation is buried in Python functions spread across multiple DAG files. If a business rule changes ("only use 10-K filings, not 10-Q"), you have to find which Python function implements that, edit it, redeploy the pod, and hope nothing broke.
+
+dbt (data build tool) solves this by moving all transformation logic into **SQL files** that live in version control — one file per table, with a clear name, documented purpose, and automated tests.
+
+### How dbt fits into your pipeline
+
+Your pipeline becomes a two-stage process:
+
+```
+Stage 1 (Airflow DAG): Extract → Load raw data into Snowflake
+  extract() → loads raw API data into PIPELINE_DB.RAW.COMPANY_FINANCIALS
+                                  and PIPELINE_DB.RAW.WEATHER_HOURLY
+
+Stage 2 (dbt): Transform raw → clean analytics tables
+  dbt run → creates PIPELINE_DB.ANALYTICS.fct_company_financials
+                 and PIPELINE_DB.ANALYTICS.dim_company
+                 and PIPELINE_DB.ANALYTICS.fct_weather_hourly
+```
+
+The Airflow DAG handles "get the data in." dbt handles "make the data useful."
+
+### What dbt models look like
+
+Each dbt "model" is just a `.sql` file. For example, `models/marts/fct_company_financials.sql`:
+
+```sql
+-- Annual revenue for each company — cleaned and filtered
+SELECT
+    ticker,
+    entity_name,
+    period_end,
+    fiscal_year,
+    value AS revenue_usd,
+    filed_date
+FROM {{ ref('stg_company_financials') }}
+WHERE metric = 'Revenues'
+  AND fiscal_period = 'FY'
+ORDER BY ticker, period_end
+```
+
+That `{{ ref('stg_company_financials') }}` is dbt's magic — it knows to run the staging model first, then this one. It builds a **lineage graph** automatically.
+
+### dbt tests — built-in data quality
+
+dbt has built-in tests you define in a YAML file alongside the SQL:
+
+```yaml
+# models/marts/fct_company_financials.yml
+models:
+  - name: fct_company_financials
+    columns:
+      - name: ticker
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['AAPL', 'MSFT', 'GOOGL']
+      - name: revenue_usd
+        tests:
+          - not_null
+```
+
+Run `dbt test` and it checks every rule. If revenue ever comes back null or a new ticker appears unexpectedly, the test fails and you know immediately. This is **data quality** — one of the most valued skills in data engineering.
+
+### How dbt integrates with Airflow (using Cosmos)
+
+`astronomer-cosmos` is an Airflow provider that turns dbt models into Airflow tasks automatically. Your DAG goes from:
+
+```
+extract → transform (Python) → load
+```
+
+to:
+
+```
+extract → load_raw → [dbt] stg_company_financials → fct_company_financials
+```
+
+Each dbt model becomes its own Airflow task, visible in the UI with its own logs. If `fct_company_financials` fails, you see exactly which SQL model broke, without digging through Python.
+
+### Why recruiters care about dbt
+
+dbt is the most common tool in modern data engineering stacks. A 2024 survey found it in over 60% of data teams. When a recruiter sees "Airflow + Snowflake + dbt" in your resume, they recognize that as the real-world production stack — not just a learning project. Adding dbt to your pipeline demonstrates you know how professional data teams work.
+
+---
+
+## Part 11: The Full Step 2 Roadmap — What Comes Next and Why
+
+Here's the sequence after Step 1 (which you've now completed):
+
+### Step 2a: Snowflake (in progress)
+
+**What:** Replace MariaDB with Snowflake as your database layer.
+
+**Why:** Snowflake is the dominant cloud data warehouse in the industry. It separates storage from compute, scales automatically, and handles SQL analytics far better than a single-machine database like MariaDB. It also frees ~300–500 MB of RAM on your EC2 instance because MariaDB is uninstalled after the migration.
+
+**Status:** Scaffolding complete (dual-write code, dashboard switch, Runbook #14). You need to sign up for Snowflake (free trial, $400 credits) and run the activation steps.
+
+**Recruiter signal:** "Knows Snowflake" appears in nearly every data engineering job posting.
+
+### Step 2b: dbt (after Snowflake)
+
+**What:** Move transformation logic out of Pandas/Python and into SQL models with dbt.
+
+**Why:** Cleaner code, automatic lineage, built-in data quality tests, and the industry-standard pattern for transformations on top of Snowflake.
+
+**Recruiter signal:** dbt is on nearly as many job postings as Snowflake itself. Together they're the modern data stack.
+
+### Step 2c: Kafka (after dbt)
+
+**What:** Add a streaming layer between your DAGs and Snowflake. Instead of Airflow writing directly to Snowflake on a schedule, each API response becomes a Kafka event. A Kafka consumer (or the Kafka Connect Snowflake Sink connector) writes the events to Snowflake in real time.
+
+**Why:** Demonstrates you can build both batch pipelines (what you have now) and streaming pipelines — two distinct, in-demand skill sets. Also makes the pipeline more resilient: if Snowflake is temporarily unavailable, Kafka buffers the events rather than losing them.
+
+**Memory note for t3.large:** Use KRaft mode (no Zookeeper) and set `KAFKA_HEAP_OPTS="-Xmx768m -Xms768m"` to cap Kafka's Java heap. This limits Kafka to 768 MB, well within the ~2–3 GB of free RAM after Snowflake replaces MariaDB.
+
+**Recruiter signal:** Kafka appears on senior engineer roles, but seeing it on a junior portfolio project stands out strongly. It shows range beyond basic batch ETL.
+
+### Portfolio extras that make recruiters notice
+
+These are not required for the pipeline to work, but they significantly increase the project's impact on a resume:
+
+| Extra | Why It Matters |
+|---|---|
+| **Architecture diagram** (Mermaid or draw.io PNG in README) | Visual diagrams show systems thinking; recruiters scan READMEs quickly |
+| **GitHub Actions CI/CD** (run `dbt test` on every PR) | Shows you know DevOps basics — a differentiator for junior candidates |
+| **Public dashboard URL** (open port 32147 in Security Group) | Lets recruiters click a link and see a live pipeline in action |
+| **Cost callout in README** ("$60/month on t3.large vs $121 on t3.xlarge") | Business awareness is rare in junior candidates — this stands out |
+| **dbt docs site** (`dbt docs generate && dbt docs serve`) | Auto-generated HTML showing all models, lineage graph, test results |
+| **Slack alerting** (connect the webhook to a real workspace) | Operational maturity — shows you think about what happens when things break |
+| **Data quality section in dashboard** (counts, freshness timestamp) | Product thinking — shows you care about data consumers, not just pipelines |
+
+The things you already have that are already impressive:
+- Real data sources (SEC EDGAR, Open-Meteo) — not toy datasets
+- Production deployment on AWS (not just localhost)
+- Kubernetes orchestration
+- Vacation mode kill switch
+- PVC-backed task logs that survive pod restarts
+- Ubuntu + post-quantum SSH (shows you care about security and future-proofing)
+
+---
+
+**Last updated:** 2026-04-05 — Added resource limits explanation (Part 9); added Bug 6 (envsubst Apple Silicon fallback); updated deploy.sh step 3 to explain ECR_REGISTRY placeholder substitution. Added Bugs 7–10 (EC2 Ubuntu migration: Bitnami image removal from Docker Hub, webserver startup probe timeout, triggerer OOMKill, deploy.sh venv PATH). Updated SSH KEX warning section: migration to Ubuntu 24.04 LTS resolved the issue permanently. Added Bug 11 (Airflow UI port 30080 unreachable — service selector mismatch: `api-server` vs `webserver`). Added Bugs 12–13 (module-level raise in DAG causing ERR_NETWORK on grid view; webserver OOMKill causing all static assets to fail with "network connection was lost" — fixed by raising memory limit to 2 Gi, reducing workers to 2 via `webserver.env`, and adding `helm upgrade` Step 2d to deploy.sh). Added Parts 10–11 (dbt explanation and full Step 2 roadmap for portfolio).

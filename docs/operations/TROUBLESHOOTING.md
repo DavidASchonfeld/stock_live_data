@@ -10,6 +10,100 @@
 
 ---
 
+## Issue: "DAG seems to be missing from DagBag" in Airflow UI
+
+### Symptoms
+- You can see a DAG in the Airflow UI list (e.g. `API_Weather-Pull_Data`)
+- Clicking it shows: `DAG "API_Weather-Pull_Data" seems to be missing from DagBag`
+- Other DAGs work fine
+
+### Why This Error Exists — DagBag vs Metadata DB
+
+Airflow stores DAG information in two separate places:
+
+| Store | What it holds | When it's updated |
+|-------|--------------|-------------------|
+| **Metadata DB** (PostgreSQL) | DAG IDs, run history, task states | Updated after every *successful* parse |
+| **DagBag** (in-memory) | Live DAG objects built by importing `.py` files | Rebuilt continuously by scheduler/dag-processor |
+
+The **DAG list page** reads from the metadata DB — so a DAG that previously parsed successfully continues to show up in the list, even after its file starts failing. But when you **click a DAG**, the UI needs the live DagBag object to render the task graph, next run time, and run history. If the file is currently failing to parse, the DagBag has no entry for that dag_id, and you get "seems to be missing."
+
+This split is why one DAG can disappear from detail view while others remain fine — it's not about the file being deleted, it's about the file failing to import.
+
+### Root Cause: Parse-Time Import Failures
+
+Airflow "parses" a DAG file by importing it as a Python module. Every top-level statement in the file runs immediately at import time — including all `import` and `from x import y` lines. If any of those fail (package not installed, file not found), Python raises an exception, the entire file import fails, and Airflow has nothing to register in the DagBag.
+
+**The specific failure in this project** (April 2026):
+
+`dag_weather.py` imports `weather_client` at the top level. `weather_client.py` imported `api_key` at its top level — a gitignored file containing API keys that was a leftover from when the file handled OpenWeatherMap. Open-Meteo (the current API) is free and keyless; `api_keys` was never referenced in the function body. After a pod recreation (Ubuntu 24.04 migration), `api_key.py` may not have been present on the pod, causing:
+
+```
+ModuleNotFoundError: No module named 'api_key'
+  → weather_client.py fails to import
+    → dag_weather.py fails to import
+      → API_Weather-Pull_Data missing from DagBag
+```
+
+The Stocks DAG was unaffected because `stock_client.py` has no dependency on `api_key.py`.
+
+### What "Parse Time" vs "Execution Time" Means
+
+This distinction matters for imports:
+
+```python
+# ✗ TOP-LEVEL IMPORT — runs at parse time, breaks the whole DAG file if it fails
+from some_optional_package import something
+
+@dag(...)
+def my_pipeline():
+    @task
+    def load():
+        # ✓ LAZY IMPORT — runs only when the task executes, failure is contained
+        from some_optional_package import something
+        ...
+    load()
+
+dag = my_pipeline()
+```
+
+When Airflow parses a DAG file, it calls the `@dag`-decorated function (e.g. `dag = my_pipeline()`) to discover the task graph. This runs the function body at parse time. **But it does NOT run the code inside `@task` functions** — those are wrapped by the decorator and only execute later when Airflow actually runs the task. So a lazy import inside a `@task` body is safe at parse time.
+
+This is why `snowflake_client.py` having top-level Snowflake imports is a risk: if it ever got imported at module level in a DAG file, any missing package would cause a parse failure. The fix is to keep those imports inside the function that actually needs them.
+
+### Diagnosis
+
+```bash
+# 1. Check what the scheduler sees when it tries to import the file
+ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
+  python3 -c 'import sys; sys.path.insert(0, \"/opt/airflow/dags\"); import dag_weather' 2>&1"
+
+# 2. Scan dag-processor logs for import errors
+ssh ec2-stock "kubectl logs -n airflow-my-namespace -l component=dag-processor --tail=100 | grep -i 'error\|traceback\|weather'"
+
+# 3. Confirm which DAGs are currently in the DagBag
+ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- airflow dags list 2>/dev/null"
+```
+
+### Fix Pattern
+
+1. **Find the failing import** using the diagnostic commands above — look for `ModuleNotFoundError` or `ImportError` in the traceback
+2. **Remove or lazy-ify the import**:
+   - If unused: delete it
+   - If optional (e.g. Snowflake packages not yet configured): move inside the function body
+3. **Redeploy**: `./scripts/deploy.sh`
+4. **Force reserialize** if the UI still shows the error after deploy:
+   ```bash
+   ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- airflow dags reserialize"
+   ```
+
+### Prevention
+
+- Never import gitignored files (`api_key.py`, `constants.py`, `db_config.py`) in library modules that other DAGs import — only import them inside the DAG file itself or lazily inside task bodies
+- Any package that isn't guaranteed to be installed (Snowflake, Kafka, etc.) should be imported lazily inside the function that uses it, not at the top of the file
+
+---
+
 ## Issue: DAG File Exists but Not Discoverable by Airflow
 
 ### Symptoms
@@ -508,13 +602,41 @@ Host ec2-stock
 
 ---
 
+## Issue: All Static Assets Fail — "Network Connection Was Lost" (OOMKill)
+
+**Symptoms:** Airflow UI loads but has no styling. Browser DevTools shows 10+ simultaneous "network connection was lost" errors for every CSS/JS file (`main.js`, `bootstrap.min.js`, `ab.css`, etc.) — all failing at once.
+
+**Root cause:** The webserver pod exceeded its memory limit and was OOMKilled. Kubernetes force-kills the pod; all in-flight HTTP connections drop simultaneously, including the browser's CSS/JS requests. If you see a *single* API endpoint fail, suspect a DAG parse error (see [Fix DAG Parse Errors runbook](RUNBOOKS.md#16-fix-dag-parse-errors--err_network-on-grid-view)). If *all* static files fail at once, suspect a pod restart.
+
+```bash
+# Confirm OOMKill — look for "OOMKilled" in last state
+kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A5 "Last State:"
+
+# Check current memory limit (should be 2Gi, not 1Gi)
+kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A3 "Limits:"
+
+# Check live memory usage
+kubectl top pod -n airflow-my-namespace
+```
+
+**Fix:** The webserver memory limit is 2 Gi and workers are set to 2 in `values.yaml`. If you see this again, check that `values.yaml` wasn't reverted. See [Runbook #17](RUNBOOKS.md#17-fix-static-assets-failing-oomkill--network-connection-lost).
+
+---
+
 ## Issue: Deploy.sh Changes Not Reflected in Cluster
 
 ### Possible Causes
 
 1. **DAG files synced, but PV pointing to old location** → See "DAG Files Not Visible" above
 
-2. **Kubernetes manifests not applied** → Run:
+2. **values.yaml changed but `helm upgrade` not run** → deploy.sh Step 2d handles this automatically. Syncing the file to EC2 does NOT apply the changes to the live cluster — only `helm upgrade` does:
+   ```bash
+   ./scripts/deploy.sh  # includes Step 2d: helm upgrade
+   # Or run manually on EC2:
+   ssh ec2-stock "helm upgrade airflow apache-airflow/airflow -n airflow-my-namespace --version 1.15.0 --reuse-values -f ~/airflow/helm/values.yaml"
+   ```
+
+3. **Kubernetes manifests not applied** → Run:
    ```bash
    # From Mac:
    ssh ec2-stock kubectl apply -f /home/ubuntu/airflow/manifests/

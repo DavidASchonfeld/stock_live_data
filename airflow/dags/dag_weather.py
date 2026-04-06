@@ -23,14 +23,6 @@ from dag_utils import check_vacation_mode  # shared guard: skips task if VACATIO
 from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
 
-# Validate required environment variables are available (fail fast if Kubernetes secrets not injected)
-import os
-_required_secrets = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"]
-_missing_secrets = [k for k in _required_secrets if not os.getenv(k)]
-if _missing_secrets:
-    raise RuntimeError(f"Missing Kubernetes secrets (environment variables): {_missing_secrets}. Ensure db-credentials secret is mounted.")
-
-
 # ── Why Open-Meteo instead of OpenWeatherMap? ────────────────────────────────
 # Open-Meteo (api.open-meteo.com) is completely free with no API key required.
 # The original version used OpenWeatherMap (archived in _archive/old_openWeatherMap.py),
@@ -181,6 +173,12 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
         # If I had declared this constructor in the main area (outside of a task method etc.), it would run whe nthe DAG is initalized,
         # which would cause issues.
 
+        # Validate DB secrets at task-execution time (not parse time) — prevents DAG parse failures when secrets aren't yet mounted
+        import os
+        _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
+        if _missing:
+            raise RuntimeError(f"Missing Kubernetes secrets: {_missing}. Ensure db-credentials secret is mounted.")
+
         print(str(inData))
         writer.print(str(inData))  # inData is now a list of row-dicts from transform()
 
@@ -216,13 +214,18 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
             # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
             try:
                 from snowflake_client import write_df_to_snowflake
-                write_df_to_snowflake(myDataFrameThing.copy(), "WEATHER_HOURLY")
+                # overwrite=False: append rows to match MariaDB if_exists="append" (weather accumulates)
+                write_df_to_snowflake(myDataFrameThing.copy(), "WEATHER_HOURLY", overwrite=False)
                 writer.print(f"Loaded {len(myDataFrameThing)} rows into Snowflake WEATHER_HOURLY")
             except Exception as sf_err:
                 writer.print(f"Snowflake write skipped (not yet configured): {sf_err}")
 
         except SQLAlchemyError as e:
+            writer.print(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")  # write to PVC so error is readable without the Airflow UI (UI has 404 encoding bug on run IDs with '+')
             print("Connection failed. Error: "+str(e))
+            raise
+        except Exception as e:
+            writer.print(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors (e.g. ValueError, TypeError) that would otherwise only appear in stdout
             raise
 
         # def flattenDictIntoJSON(inCell):
@@ -248,4 +251,4 @@ def zero_nameThatAirflowUIsees(): #nameThatAirflowUIsees if I don't specify a na
     order_data : XComArg = extract()
     order_summary : XComArg = transform(order_data)
     load(order_summary)
-zero_nameThatAirflowUIsees()
+dag = zero_nameThatAirflowUIsees()  # assign to module-level variable — Airflow best practice for DAG discovery

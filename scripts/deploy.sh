@@ -43,7 +43,8 @@ FLASK_POD="my-kuber-pod-flask"
 ECR_IMAGE="$ECR_REGISTRY/my-flask-app:latest"
 
 echo "=== Step 1: Ensuring target directories exist on EC2 ==="
-ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests"
+ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs \
+    && chmod 777 $EC2_HOME/airflow/dag-mylogs"  # 777 so Airflow pod (UID 50000) can write to the PVC-backed log dir
 
 echo "=== Step 1b: Pre-flight validation ==="
 
@@ -103,6 +104,18 @@ rsync -avz --progress airflow/dags/ "$EC2_HOST:$EC2_DAG_PATH/"
 
 echo "=== Step 2b: Syncing Helm values to EC2 ==="
 rsync -avz --progress airflow/helm/values.yaml "$EC2_HOST:$EC2_HELM_PATH/"
+
+echo "=== Step 2d: Applying Helm values to live Airflow release ==="
+# Syncing values.yaml to EC2 (step 2b) only copies the file — it does NOT update the running
+# Helm release. helm upgrade applies any changes (memory limits, worker count, probes) to the
+# live pods. Without this step, values.yaml edits have no effect until a manual helm upgrade.
+# --version 1.15.0: pins chart version (same as bootstrap_ec2.sh) to prevent accidental upgrades.
+# --reuse-values: keeps any runtime-set values not present in our file (e.g. generated secrets).
+ssh "$EC2_HOST" "helm upgrade airflow apache-airflow/airflow \
+    -n airflow-my-namespace \
+    --version 1.15.0 \
+    --reuse-values \
+    -f $EC2_HELM_PATH/values.yaml"
 
 echo "=== Step 2c: Syncing Kubernetes manifests to EC2 ==="
 # Reference copies of manifests on EC2 enable direct kubectl apply from EC2 if needed

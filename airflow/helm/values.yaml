@@ -1,5 +1,10 @@
 executor: LocalExecutor
 
+# Install pymysql so SQLAlchemy can connect to MariaDB via mysql+pymysql:// — must be declared here so all pods get it at startup
+env:
+  - name: _PIP_ADDITIONAL_REQUIREMENTS
+    value: "pymysql"
+
 # Override postgresql image: chart default tag (16.1.0-debian-11-r15) removed from Docker Hub; ECR Public has no rate limits from EC2
 postgresql:
   image:
@@ -60,35 +65,77 @@ scheduler:
   extraVolumeMounts:
    - name: out-volume
      mountPath: /opt/airflow/out
+  # Airflow 3.x loads full provider stack per jobs-check call; needs 45s. 10 chances × 30s = 5 min startup window.
+  startupProbe:
+    failureThreshold: 10
+    periodSeconds: 30
+    timeoutSeconds: 45
+  # Auto-restarts scheduler if it freezes without crashing (startup probe only fires once at boot)
+  livenessProbe:
+    initialDelaySeconds: 10   # wait 10s after startup probe passes before first check
+    timeoutSeconds: 45        # Airflow 3.x loads full provider stack per jobs-check call; needs up to 45s
+    failureThreshold: 5       # 5 consecutive failures (5 min) before K8s kills and restarts the pod
+    periodSeconds: 60         # check every 60s — scheduler heartbeats every 5s so this avoids false positives
+    command:
+      - sh
+      - -c
+      - |
+        airflow jobs check --job-type SchedulerJob --hostname "$(hostname)"  # hostname evaluated inside pod at runtime
   # Heart of Airflow — parses DAGs and triggers tasks. Guaranteed 512Mi prevents slow scheduling under load.
-  # 1Gi limit: DAG parsing can spike briefly; same ceiling as webserver keeps budget symmetric and predictable.
+  # 2Gi limit: Airflow 3.x supervisor model spawns ~15 worker subprocesses (each loads providers); OOMKilled at 1Gi.
   resources:
     requests:
       memory: "512Mi"
       cpu: "200m"
     limits:
-      memory: "1Gi"
+      memory: "2Gi"
       cpu: "1000m"
 
 # Resource limits required on t3.large (8 GB RAM). Without limits a runaway component can OOMKill (Out Of Memory Kill — OS force-kills the pod when it exceeds its RAM allowance) other pods.
 # requests = K8s scheduling guarantee; limits = hard ceiling. Amounts chosen at ~2x observed baseline
 # (EC2_SIZING.md) to absorb startup spikes while keeping total ceiling ~2.75Gi — safe headroom for Kafka later.
 
+webserverSecretKey: "c82a941d3c3dbada9432074fd29b3865933a3edd4930cc1596593172ead46fb2"  # static key prevents session invalidation on every helm upgrade/redeploy
+
+# Airflow 3.x no longer creates airflow-webserver-secret-key (that secret was 2.x only).
+# Disable the built-in env var injection so pods don't reference a secret that doesn't exist.
+enableBuiltInSecretEnvVars:
+  AIRFLOW__WEBSERVER__SECRET_KEY: false
+
 webserver:
-  # Airflow UI + REST API server. Peaks ~800 MB on cold start; 1Gi limit absorbs that spike.
+  # Airflow UI + REST API server. OOMKilled at 1Gi with azure+snowflake providers loaded across 4 workers.
+  # Increased to 2Gi limit + 2 workers (AIRFLOW__WEBSERVER__WORKERS=2) to stay well under ceiling.
   # 200m CPU: mostly idle between requests; 1000m cap handles page-render and DAG-graph bursts.
+  env:
+    - name: AIRFLOW__WEBSERVER__WORKERS  # reduce from 4→2 workers; each worker loads all providers (~300MB each)
+      value: "2"
   resources:
     requests:
       memory: "512Mi"
       cpu: "200m"
     limits:
-      memory: "1Gi"
+      memory: "2Gi"
       cpu: "1000m"
   # Provider loading across 4 gunicorn workers takes >60s on t3.large; give 3 min to start
   startupProbe:
     failureThreshold: 18
     periodSeconds: 10
     timeoutSeconds: 20
+
+apiServer:
+  # Airflow 3.x: REST API is now a separate process (split from webserver). Handles all API calls.
+  # Give 3 min to start — pymysql installs at startup before the HTTP endpoint comes up.
+  startupProbe:
+    failureThreshold: 18  # 180s — matches webserver/scheduler
+    periodSeconds: 10
+    timeoutSeconds: 20
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
 
 triggerer:
   # Runs deferred operators (async sensors). Baseline is lightweight (~100 MB).

@@ -71,7 +71,21 @@ kubectl get pods -n <namespace> --show-labels
 
 ## 3. Common Issues & Fixes
 
-### A. Service has `<none>` endpoints → port unreachable
+### A. DAG task fails with `PermissionError` on `/opt/airflow/out`
+
+**Symptoms:** `transform()` or `load()` fails immediately with `PermissionError` on `OutputTextWriter`. `extract()` succeeds (it has no writer).
+
+**Cause:** The PVC-backed host directory (`/home/ubuntu/airflow/dag-mylogs`) is owned by `ubuntu` (UID 1000) but the Airflow pod runs as UID 50000, which has no write access under default 755 permissions.
+
+**Fix (on EC2):**
+```bash
+chmod 777 /home/ubuntu/airflow/dag-mylogs
+```
+`deploy.sh` and `bootstrap_ec2.sh` now run this automatically. The fix is also baked into `file_logger.py` — `OutputTextWriter` soft-fails to stdout-only rather than crashing the task if the path isn't writable.
+
+---
+
+### B. Service has `<none>` endpoints → port unreachable
 
 **Symptoms:** Port 30080 or 32147 returns "Connection refused". `kubectl get endpoints` shows `<none>`.
 
@@ -443,6 +457,34 @@ kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
 
 ---
 
+### L. All Static Assets Fail — "Network Connection Was Lost" (Webserver OOMKill)
+
+**Symptoms:** Airflow UI loads but has no styling or JavaScript. Browser DevTools shows 10+ simultaneous "network connection was lost" errors for CSS/JS files — all failing at once, not selectively.
+
+**Key distinction:** A *single* API failure (e.g., the grid view) points to a DAG parse error (see Issue I). *All* files failing simultaneously points to a pod restart mid-connection.
+
+**Diagnose:**
+```bash
+# Check if webserver was OOMKilled
+kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A5 "Last State:"
+# Look for: Reason: OOMKilled
+
+# Check memory limit (should be 2Gi after the 2026-04-05 fix)
+kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A3 "Limits:"
+
+# Check live memory usage
+kubectl top pod -n airflow-my-namespace
+```
+
+**Fix:**
+1. Ensure `values.yaml` has `webserver.resources.limits.memory: 2Gi` and `webserver.env: AIRFLOW__WEBSERVER__WORKERS: "2"`
+2. Run `./scripts/deploy.sh` — Step 2d applies the Helm values via `helm upgrade`
+3. Verify workers: `kubectl exec -n airflow-my-namespace deploy/airflow-webserver -- env | grep WORKERS`
+
+**Common mistake:** Using `airflow.config.AIRFLOW__WEBSERVER__WORKERS` in `values.yaml` — this key is silently ignored by the Helm chart. Pod environment variables for specific components must use `<component>.env`, e.g. `webserver.env`.
+
+---
+
 ### I. Pods stuck in `CrashLoopBackOff` after a bad `helm upgrade`
 
 **Symptoms:** A `helm upgrade` timed out or was deployed with a bad config. The upgrade is now fixed and re-run successfully, but some pods (typically `airflow-scheduler-0`, `airflow-triggerer-0`) are still stuck in `CrashLoopBackOff` from the previous bad rollout — even though the new config is correct.
@@ -506,6 +548,96 @@ airflow tasks logs <dag_id> <task_id> <run_id>
 kubectl logs my-kuber-pod-flask -n default
 kubectl logs -f my-kuber-pod-flask -n default
 ```
+
+---
+
+### N. `load()` task fails with `ModuleNotFoundError: No module named 'pymysql'`
+
+**Symptoms:**
+- `extract()` and `transform()` succeed; `load()` fails immediately
+- Task log shows:
+  ```
+  ModuleNotFoundError: No module named 'pymysql'
+  File ".../dag_weather.py", line 197, in load
+      engine = create_engine(f"mysql+pymysql://...")
+  ```
+
+**Root Cause:**
+The DAGs use SQLAlchemy's `mysql+pymysql://` connection dialect, which requires the `pymysql` package as the underlying database driver. The Apache Airflow Docker image does not include `pymysql` by default. On a **fresh Helm deployment** (e.g. after an EC2 or Ubuntu migration), the pod starts with a clean Python environment and the package is missing.
+
+This only surfaces in `load()` — not `extract()` or `transform()` — because those tasks never open a database connection.
+
+**Why extract/transform succeed but load fails:**
+```
+extract()   → calls Open-Meteo API (HTTP) — no pymysql needed ✓
+transform() → pure Python/pandas data reshaping — no pymysql needed ✓
+load()      → create_engine("mysql+pymysql://...") → imports pymysql → ModuleNotFoundError ✗
+```
+
+**Fix — add `_PIP_ADDITIONAL_REQUIREMENTS` to `values.yaml`:**
+```yaml
+# Install pymysql so SQLAlchemy can connect to MariaDB via mysql+pymysql:// — must be declared here so all pods get it at startup
+env:
+  - name: _PIP_ADDITIONAL_REQUIREMENTS
+    value: "pymysql"
+```
+
+**How the fix works:**
+The Apache Airflow Helm chart checks for the `_PIP_ADDITIONAL_REQUIREMENTS` environment variable when any Airflow pod starts. If set, it runs `pip install <value>` during the container's init phase — before the scheduler, worker, or webserver processes start. Setting it in `values.yaml` ensures every pod type (scheduler, triggerer, dag-processor) gets the package, not just one.
+
+**Deploy the fix:**
+```bash
+# From your Mac:
+./scripts/deploy.sh
+# Step 2d (helm upgrade) applies the values.yaml change; pods restart and install pymysql
+```
+
+**Verify it's installed after pods restart:**
+```bash
+kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
+  python3 -c "import pymysql; print('pymysql', pymysql.__version__, '✓')"
+```
+
+**When to expect this again:** Any time the Airflow Helm release is fully uninstalled and reinstalled (e.g. `helm delete` + `helm install`). A `helm upgrade` preserves the existing `values.yaml` so the package stays installed.
+
+---
+
+### M. 404 on DAG Run API Call — Can't Click Into Task Logs (Airflow 2.9.3 UI Bug)
+
+**Symptoms:**
+- Browser DevTools shows: `Failed to load resource: 404 (NOT FOUND)` for a URL like `...dagRuns/scheduled__2026-04-05T18:40:00%2000:00`
+- Clicking a task in the grid view shows nothing or a blank panel
+- The task run clearly executed (other tasks show success/failure), but you can't read the log through the UI
+
+**Root Cause:**
+The `+` in timezone-offset run IDs (e.g. `scheduled__2026-04-05T18:40:00+00:00`) is incorrectly encoded as `%20` (space) by the Airflow 2.9.3 frontend instead of `%2B`. The REST API then can't find a run with a space in its ID → 404.
+
+This is a UI rendering bug — the task DID execute. Its state (failed/success) is correct; only the detail view is broken.
+
+**Workaround — read task logs directly without the UI:**
+
+```bash
+# Option A: read the most recent PVC log file (written by OutputTextWriter)
+# Both load() and transform() write errors here, including the new [ERROR] prefix lines
+kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
+  sh -c 'cat /opt/airflow/out/$(ls -t /opt/airflow/out | head -1)'
+
+# Option B: read Airflow's own task log from the log PVC
+# Task logs live at: logs/dag_id/task_id/execution_date/attempt_number.log
+kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
+  find /opt/airflow/logs/API_Weather-Pull_Data/load -type f | sort -r | head -3
+# Then cat the most recent one
+
+# Option C: tail scheduler logs and grep for the failing task
+kubectl logs airflow-scheduler-0 -n airflow-my-namespace --tail=200 | grep -E "\[ERROR\]|Connection failed|load.*failed"
+```
+
+**When this typically appears:**
+- After an EC2 or MariaDB migration — the `DB_HOST` in the K8s secret may point to the old instance IP, causing `OperationalError` in `load()`. Use Option A or C above to confirm.
+- After bootstrap on a new EC2 — the `weather_hourly` table doesn't exist yet, but `to_sql(if_exists="append")` auto-creates it on first successful connection.
+
+**Permanent fix:**
+None available through DAG code — this is an Airflow 2.9.3 frontend bug. Resolved in a later Airflow version. Workaround above is sufficient for development use.
 
 ---
 

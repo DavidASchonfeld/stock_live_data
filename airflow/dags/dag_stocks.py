@@ -23,14 +23,6 @@ from dag_utils import check_vacation_mode  # shared guard: skips task if VACATIO
 from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
 
-# Validate required environment variables are available (fail fast if Kubernetes secrets not injected)
-import os
-_required_secrets = ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"]
-_missing_secrets = [k for k in _required_secrets if not os.getenv(k)]
-if _missing_secrets:
-    raise RuntimeError(f"Missing Kubernetes secrets (environment variables): {_missing_secrets}. Ensure db-credentials secret is mounted.")
-
-
 # ── Why TaskFlow API (@dag / @task) instead of classic Airflow Operators? ─────
 # TaskFlow lets you write tasks as plain Python functions and pass data between
 # them using return values. Under the hood Airflow serializes the return value
@@ -215,6 +207,12 @@ def stock_market_pipeline():
         # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
         # which would cause issues.
 
+        # Validate DB secrets at task-execution time (not parse time) — prevents DAG parse failures when secrets aren't yet mounted
+        import os
+        _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
+        if _missing:
+            raise RuntimeError(f"Missing Kubernetes secrets: {_missing}. Ensure db-credentials secret is mounted.")
+
         print(str(records[:2]))  # log first 2 rows so Airflow task log shows data arrived
         writer.print(str(records[:2]))
 
@@ -256,7 +254,10 @@ def stock_market_pipeline():
 
         except SQLAlchemyError as e:
             # Re-raise so task fails and Airflow can retry (instead of silent failure)
-            writer.print(f"Database error loading records: {e}")
+            writer.print(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")
+            raise
+        except Exception as e:
+            writer.print(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors so they appear in PVC log, not just stdout
             raise
 
 
