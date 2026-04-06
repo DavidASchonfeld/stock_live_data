@@ -1,13 +1,15 @@
 # What I Learned: The Airflow 3.x Upgrade Disaster (and Recovery)
-**Date:** 2026-04-06
-**Duration:** ~6 hours across two sessions
-**Outcome:** All pods running on Airflow 3.1.8 ✅
+**Date:** 2026-04-05 → 2026-04-06
+**Duration:** ~6 hours (upgrade recovery) + follow-up session (UI fix)
+**Outcome:** All pods running on Airflow 3.1.8, UI accessible ✅
 
 ---
 
 ## The Short Version
 
-A single `helm upgrade` command without a version pin accidentally upgraded Airflow from 2.9.3 to 3.1.8. The database got upgraded to the new format before the upgrade failed, making it impossible to roll back. Then four more attempts to complete the upgrade all timed out for reasons that had nothing to do with the upgrade itself — they all failed because of a single missing secret that wasn't obvious at first. Once the root cause was found, it took about 10 minutes to fix. Three small config changes and everything worked.
+A single `helm upgrade` command without a version pin accidentally upgraded Airflow from 2.9.3 to 3.1.8. The database got upgraded to the new format before the upgrade failed, making it impossible to roll back. Then four more attempts to complete the upgrade all timed out for reasons that had nothing to do with the upgrade itself — they all failed because of a single missing secret that wasn't obvious at first. Once the root cause was found, it took about 10 minutes to fix. Three small config changes and all pods came up.
+
+Then, in a follow-up session, a fourth problem appeared: all pods were running but the Airflow UI at port 30080 was still dropping connections. This turned out to be a service selector that was still pointing at a pod label from Airflow 2.x — a label that no longer exists in 3.x. One line changed, applied in seconds, and the UI came up. While investigating, a second issue was found: the api-server was crash-looping for the exact same probe timeout reason that had already been fixed for the scheduler but hadn't been applied to the api-server. Same fix, same result.
 
 ---
 
@@ -378,3 +380,233 @@ When diagnosing pod failures, scroll to the `Events:` section at the bottom of `
 
 **7. `--atomic=false` is useful for unstable upgrades.**
 The default `--atomic` mode rolls back automatically if the upgrade times out. This is usually good, but during a migration recovery where you're iterating on fixes, it just adds noise. `--atomic=false` lets you apply the changes and observe the result without triggering automatic rollback.
+
+---
+
+## Part 9: The UI Was Still Broken After All Pods Came Up
+
+### What happened
+
+Even after fixing the missing secret, the OOMKill, and the probe timeouts — all pods were showing `Running` — there was still one more problem. Opening `http://localhost:30080` in the browser gave:
+
+> "Safari can't open the page because the server unexpectedly dropped the connection."
+
+The Airflow UI was completely unreachable. The Flask dashboard on port 32147 was loading fine, which meant the SSH tunnel was working. The problem was somewhere inside Kubernetes.
+
+---
+
+### Part 9a: Why the UI Wasn't Reachable — The Service Selector
+
+#### How Kubernetes routes traffic to pods
+
+When you type `http://localhost:30080` in your browser, here's what happens:
+
+1. Your browser connects through the SSH tunnel to port 30080 on EC2
+2. On EC2, port 30080 belongs to a Kubernetes **Service** — a resource whose job is to receive traffic and forward it to the right pod
+3. The Service finds the right pod using a **selector** — a set of labels that it looks for on pods
+4. If a pod has matching labels, the Service sends traffic there. If no pod matches, the Service has no destination and drops the connection immediately
+
+Think of the Service as a receptionist. When a call comes in, she checks her directory for someone with the right job title. If no one has that title, she hangs up — she doesn't ring anyone's desk.
+
+#### What the selector said vs. what actually existed
+
+The Kubernetes Service for the Airflow UI was defined in `airflow/manifests/service-airflow-ui.yaml`. It had:
+
+```yaml
+selector:
+  component: webserver
+  release: airflow
+```
+
+This means: "find a pod that has both `component=webserver` AND `release=airflow` in its labels."
+
+Here's the problem: **in Airflow 3.x, there is no `webserver` pod.**
+
+In Airflow 2.x, there was a pod called the "webserver" that served the UI. In Airflow 3.x, the team split and reorganized how the software works. The UI and the REST API are now both served by a single pod called the **api-server**. The old webserver was absorbed into it.
+
+So when the Service looked for a pod with `component=webserver`, it found nothing. The service had no endpoints — no destination to send traffic to. Every connection attempt was immediately dropped.
+
+You can see this with:
+
+```bash
+kubectl get endpoints airflow-service-expose-ui-port -n airflow-my-namespace
+# Result: ENDPOINTS = <none>
+```
+
+`<none>` means the selector matched zero pods. And a note that was already in the file said exactly what needed to happen:
+
+```yaml
+component: webserver  # Airflow 2.x label; update to api-server if/when upgrading to Airflow 3.x
+```
+
+The TODO was written correctly. It just never got acted on during the upgrade.
+
+#### Why helm upgrade didn't fix this automatically
+
+You might wonder: "If the upgrade changed everything else, why didn't it fix the Service?"
+
+The answer is that the Service was **not created by Helm**. It was created manually with `kubectl apply -f service-airflow-ui.yaml` when the cluster was first set up. Helm only manages resources that it created. It has no knowledge of this manually-created Service, so it never touches it.
+
+After the Airflow 3.x upgrade changed the pod labels, the Service just sat there pointing at a label that no longer existed — and nobody noticed until the browser refused to connect.
+
+#### The fix
+
+One word changed in `service-airflow-ui.yaml`:
+
+```yaml
+selector:
+  component: api-server  # Airflow 3.x label (was: webserver — 2.x only)
+  release: airflow
+```
+
+Then the updated file was applied to the cluster:
+
+```bash
+kubectl apply -f service-airflow-ui.yaml -n airflow-my-namespace
+```
+
+Kubernetes processes the change instantly. Within a second, the Service re-evaluated its selector against all running pods, found the `api-server` pod, and added it as an endpoint. The next browser request went through immediately.
+
+```bash
+kubectl get endpoints airflow-service-expose-ui-port -n airflow-my-namespace
+# Result: ENDPOINTS = 10.42.0.146:8080  ✅
+```
+
+---
+
+### Part 9b: The api-server Was Also Crash-Looping — Same Root Cause as the Scheduler
+
+While looking at the pods, the api-server showed `CrashLoopBackOff` — the same pattern the scheduler had before its probe timeout was fixed.
+
+#### The same root cause, a different pod
+
+Recall from Part 5: the scheduler's health probe had a 20-second timeout. In Airflow 3.x, loading all the providers before responding takes 30-45 seconds. So the probe timed out, Kubernetes declared the scheduler unhealthy, and killed it — even though the scheduler itself was working fine.
+
+The same fix was applied to the scheduler in `values.yaml`:
+
+```yaml
+scheduler:
+  startupProbe:
+    timeoutSeconds: 45   # raised from 20
+  livenessProbe:
+    timeoutSeconds: 45   # raised from 20
+```
+
+But `apiServer` was left at the old values:
+
+```yaml
+apiServer:
+  startupProbe:
+    timeoutSeconds: 20   # ← still 20 — never updated
+```
+
+The api-server loads the exact same provider packages at startup. It takes the same 30-45 seconds to be ready to respond. With a 20-second timeout on its startup probe, Kubernetes would ask "are you ready?" and the api-server wouldn't finish answering in time. Kubernetes marked it as failed, killed it, and restarted it. This repeated in a loop.
+
+The pod events showed the exact same fingerprint as the scheduler had:
+
+```
+Warning  Unhealthy  Startup probe failed: context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+Warning  BackOff    Back-off restarting failed container api-server
+```
+
+"Context deadline exceeded" is the technical way of saying "I asked, you didn't answer in time, I gave up."
+
+#### The fix
+
+The same timeout adjustment that was applied to the scheduler was applied to the api-server, plus a liveness probe configuration to prevent false-positive kills during normal operation:
+
+```yaml
+apiServer:
+  startupProbe:
+    failureThreshold: 18
+    periodSeconds: 10
+    timeoutSeconds: 45   # raised from 20 — provider loading takes 30-45s
+  livenessProbe:
+    initialDelaySeconds: 10
+    timeoutSeconds: 45   # same reason
+    failureThreshold: 5
+    periodSeconds: 60
+```
+
+This was applied by syncing `values.yaml` to EC2 and running `helm upgrade`. The Helm upgrade triggered a rolling restart of the api-server pod with the new probe configuration. The new pod started, completed its provider loading in ~40 seconds, responded to the startup probe successfully, and stayed up with 0 restarts.
+
+---
+
+### Part 9c: Preventing This in Future Deploys
+
+One more small problem was identified: `deploy.sh` was not applying the Airflow service manifest. It synced the file to EC2 but never ran `kubectl apply` on it. So even though the fix was committed to Git, a future redeploy wouldn't automatically push the corrected selector to the cluster.
+
+A new step was added to `deploy.sh`:
+
+```bash
+echo "=== Step 2e: Applying Airflow service manifest ==="
+ssh "$EC2_HOST" "kubectl apply -f $EC2_HOME/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace"
+```
+
+Now every deploy keeps the service definition in sync with whatever is in Git.
+
+---
+
+## Part 10: Updated Full Timeline
+
+| Problem | Root Cause | Fix |
+|---------|-----------|-----|
+| Accidental 2.x → 3.x upgrade | `helm upgrade` without `--version` pin | Nothing to undo; moved forward to 3.x |
+| Every pod `CreateContainerConfigError` | `enableBuiltInSecretEnvVars.AIRFLOW__WEBSERVER__SECRET_KEY: true` default references a 3.x-removed secret | Added `AIRFLOW__WEBSERVER__SECRET_KEY: false` to `values.yaml` |
+| Migration job never ran | Same as above — migration job pod also blocked by missing secret | Fixed by same change |
+| Init containers crash-looping | Migration never ran, so they waited forever | Fixed by same change (migration ran once pods could start) |
+| Scheduler OOMKilled every 3 minutes | Airflow 3.x spawns 15 worker subprocesses; 1 Gi limit sized for 2.x single-process model | Raised scheduler memory limit to `2Gi` |
+| Scheduler killed by health probe | `airflow jobs check` takes 30-45s in 3.x; probe timeout was 20s | Raised `timeoutSeconds` from 20 → 45 for startup and liveness probes |
+| `--reuse-values` schema errors | Old 2.x release state injected removed 3.x settings | Dropped `--reuse-values` from upgrade command |
+| Helm pending-upgrade lock | Previous upgrade process still running from old session | Killed old process + deleted pending-upgrade Helm secret |
+| StatefulSet pods stuck with old spec | Rolling update stuck on unhealthy pods | Manually deleted pods to force recreate |
+| Airflow UI unreachable (connection dropped) | Service selector `component: webserver` matched nothing — webserver pod doesn't exist in 3.x | Updated selector to `component: api-server` in `service-airflow-ui.yaml` and applied to cluster |
+| api-server CrashLoopBackOff | Same probe timeout issue as scheduler — 20s timeout, but 3.x provider loading takes 30-45s | Raised `timeoutSeconds` to 45 for api-server startup and liveness probes in `values.yaml` |
+| Service selector fix not persisted through future deploys | `deploy.sh` synced the manifest file but never ran `kubectl apply` on it | Added Step 2e to `deploy.sh` to apply the Airflow service manifest on every deploy |
+
+---
+
+## Part 11: Additional Key Lessons
+
+**8. Helm only manages what Helm created.**
+Resources applied manually with `kubectl apply` are invisible to Helm. When an upgrade changes pod labels, services, or other cluster objects that were created outside of Helm — they won't be updated automatically. After any major version upgrade, audit your manually-applied manifests and check whether their selectors, ports, or labels still match the new pod structure.
+
+**9. Fix one pod, check all similar pods.**
+When the scheduler probe timeout was raised to 45 seconds, the api-server wasn't checked. Both pods load the same provider packages at startup, so both had the same problem. When you fix a timeout or resource limit for one Airflow component, look at whether all other components are configured the same way.
+
+**10. A "connection dropped" error from a working SSH tunnel usually means no endpoints.**
+If your SSH tunnel is confirmed working (another port on the same tunnel responds) but one port drops connections, the first thing to check is `kubectl get endpoints <service-name>`. An empty endpoint list means the service selector matched nothing — a label mismatch, not a networking problem.
+
+---
+
+## Part 12: Follow-Up — SDK Import Migration (Deprecation Warnings)
+
+After all pods came up and the UI was accessible, the Airflow task logs and dag-processor logs showed a stream of `DeprecationWarning` messages on every DAG parse cycle:
+
+```
+WARNING - The `airflow.decorators.dag` attribute is deprecated. Please use `airflow.sdk.dag`.
+WARNING - The `airflow.decorators.task` attribute is deprecated. Please use `airflow.sdk.task`.
+WARNING - Using Variable.get from `airflow.models` is deprecated. Please use `airflow.sdk.Variable` instead.
+WARNING - Using Variable.delete from `airflow.models` is deprecated. Please use `airflow.sdk.Variable` instead.
+```
+
+### What happened
+
+In Airflow 3.x, the public DAG-authoring API was consolidated into `airflow.sdk`. The old import paths still work as compatibility shims but emit deprecation warnings on every parse, polluting the scheduler and dag-processor logs. The DAGs themselves continued running — these were warnings, not errors.
+
+### Files changed
+
+| File | Lines | Old import | New import |
+|------|-------|------------|------------|
+| `dag_stocks.py` | 10–11 | `from airflow.decorators import dag, task` + `from airflow.models.xcom_arg import XComArg` | `from airflow.sdk import dag, task, XComArg` |
+| `dag_weather.py` | 9–10 | same as above | `from airflow.sdk import dag, task, XComArg` |
+| `dag_staleness_check.py` | 7 | `from airflow.decorators import dag, task` | `from airflow.sdk import dag, task` |
+| `dag_utils.py` | 5 | `from airflow.models import Variable` | `from airflow.sdk import Variable` |
+| `alerting.py` | 5 local imports | `from airflow.models import Variable` | `from airflow.sdk import Variable` |
+
+**Not changed:** `from airflow.exceptions import AirflowSkipException` — this stays in `airflow.exceptions` in 3.x and does not need updating.
+
+### Lesson learned
+
+**11. After a major version upgrade, scan your DAGs for deprecated import paths.**
+The warnings won't break anything immediately, but they signal that the compatibility shims will eventually be removed. In Airflow 3.x, all DAG-authoring primitives (`dag`, `task`, `XComArg`, `Variable`) live under `airflow.sdk`. Run a quick `grep -r "airflow.decorators\|airflow.models" airflow/dags/` after any major Airflow upgrade to catch these early.

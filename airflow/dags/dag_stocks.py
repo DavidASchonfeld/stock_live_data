@@ -7,8 +7,7 @@ from datetime import timedelta
 
 import pendulum
 
-from airflow.decorators import dag, task
-from airflow.models.xcom_arg import XComArg
+from airflow.sdk import dag, task, XComArg, get_current_context  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 
 import pandas as pd
 from sqlalchemy import create_engine, text  # text() required for raw SQL in SQLAlchemy 2.x
@@ -103,11 +102,19 @@ def stock_market_pipeline():
     """
 
     @task()
-    def extract() -> list[dict[str, Any]]:
+    def extract() -> str:
         """
         ### Extract
         Fetch raw XBRL financial data for each ticker from SEC EDGAR.
-        Returns a list of raw API responses (one dict per ticker).
+        Stages the full raw payload to the PVC and returns the file path.
+
+        Why return a file path instead of the data directly?
+        SEC EDGAR companyfacts responses are 10–15 MB per ticker (~45 MB total).
+        Airflow XCom stores values in MariaDB as MEDIUMBLOB (16 MB max), so passing
+        the raw payload through XCom causes a silent OOM kill in the transform worker.
+        Instead we stage to the PVC (already mounted) and pass only the path — a
+        ~100-byte string — through XCom. This is the canonical Airflow pattern for
+        large inter-task data.
         """
 
         # Halt this task (and downstream transform/load) if vacation mode is active
@@ -119,6 +126,11 @@ def stock_market_pipeline():
         # NOTE: I must declare this inside a @task object so the task only connects to that folder when the task runs.
         # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
         # which would cause issues.
+
+        # Build a unique staging filename from the run_id so concurrent runs don't collide
+        context = get_current_context()
+        run_id: str = context["run_id"].replace(":", "_").replace("+", "_")  # sanitize for filesystem
+        staging_path: str = f"/opt/airflow/out/raw_{run_id}.json"
 
         results: list[dict[str, Any]] = []
 
@@ -144,24 +156,34 @@ def stock_market_pipeline():
             gaap_count = len(raw_response["facts"]["us-gaap"])
             writer.print(f"  ✓ {ticker}: {gaap_count} US-GAAP concepts received")
 
-        return results
+        # Write full payload to PVC — XCom carries only the path string (~100 bytes)
+        with open(staging_path, "w") as f:
+            json.dump(results, f)
+        writer.print(f"Raw data staged to: {staging_path}")
+
+        return staging_path
 
 
     @task()
-    def transform(raw_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def transform(staging_path: str) -> list[dict[str, Any]]:
         """
         ### Transform
         Flatten each ticker's nested XBRL JSON into a list of row-dicts.
         One row per ticker per financial metric per reporting period.
 
-        Input shape  (from extract):  [{ "ticker": "AAPL", "cik": "...", "raw": { ... } }, ...]
-        Output shape (to load):       [{ "ticker", "cik", "entity_name", "metric", "label",
-                                         "period_end", "value", "filed_date", "form_type",
-                                         "fiscal_year", "fiscal_period", "frame" }, ...]
+        Input:  path to PVC staging file written by extract() (tiny XCom string)
+        Output shape (to load):  [{ "ticker", "cik", "entity_name", "metric", "label",
+                                    "period_end", "value", "filed_date", "form_type",
+                                    "fiscal_year", "fiscal_period", "frame" }, ...]
         """
+        import os
 
         # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
+
+        # Read the full raw payload from PVC — avoids loading 45 MB through XCom
+        with open(staging_path, "r") as f:
+            raw_data: list[dict[str, Any]] = json.load(f)
 
         all_records: list[dict[str, Any]] = []
 
@@ -177,6 +199,10 @@ def stock_market_pipeline():
         writer.print("----Transform Preview----")
         writer.print(str(preview_df.head()))
         writer.print(str(preview_df.dtypes))
+
+        # Remove staging file — data now lives in XCom as compact flat records
+        os.remove(staging_path)
+        writer.print(f"Staging file cleaned up: {staging_path}")
 
         # Convert to list-of-dicts so Airflow XCom can serialize it as JSON
         return all_records
@@ -266,8 +292,8 @@ def stock_market_pipeline():
     # tells Airflow about the dependency order: extract → transform → load.
     # Airflow reads these calls at DAG-parse time to build the task graph; the
     # actual Python code inside each function runs later at execution time.
-    raw_data:    XComArg = extract()
-    transformed: XComArg = transform(raw_data)   # type: ignore[arg-type]
+    staging_path: XComArg = extract()
+    transformed:  XComArg = transform(staging_path)  # type: ignore[arg-type]
     load(transformed)                             # type: ignore[arg-type]
 
 

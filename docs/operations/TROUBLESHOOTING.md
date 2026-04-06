@@ -10,6 +10,104 @@
 
 ---
 
+## Issue: `apt upgrade -y` Appears Frozen / No Output for Several Minutes
+
+### Symptoms
+- `sudo apt upgrade -y` runs for a while then goes completely silent
+- No output, no progress indicator, cursor just sits there
+- Can happen mid-upgrade or at the start of a large package
+
+### Root Cause
+`apt upgrade` encountered a config file prompt for a package with locally-modified config files (e.g. `/etc/ssh/sshd_config`, `/etc/systemd/...`). The `-y` flag auto-confirms package installation but does **not** auto-answer config file diff prompts — those require explicit input.
+
+### Fix
+Press **Enter** to accept the default (keep the existing config file). The upgrade will resume immediately.
+
+If it's still frozen after pressing Enter, try pressing `n` (keep current) or `y` (use new version) depending on the prompt context.
+
+### Prevention (for scripts)
+Use `DEBIAN_FRONTEND=noninteractive` to suppress all interactive prompts and always keep the current config:
+```bash
+sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y
+```
+This is safe for automated/scripted use but not recommended interactively — you won't see what config choices were made.
+
+### Notes
+- This is harmless — the upgrade did not fail, it was just waiting
+- The prompt appears in the terminal output if you're actively watching, but is easy to miss in an overnight run
+- Real incident: 2026-04-06, `apt upgrade` waited ~6 hours overnight for an Enter keypress ([CHANGELOG.md](../incidents/CHANGELOG.md))
+
+---
+
+## Issue: Deprecation Warnings in Scheduler / DAG-Processor Logs After Airflow 3.x Upgrade
+
+### Symptoms
+- Scheduler or dag-processor logs show repeated lines like:
+  ```
+  DeprecationWarning: airflow.decorators.dag is deprecated. Use airflow.sdk.dag instead.
+  DeprecationWarning: Using Variable.get from airflow.models is deprecated. Use airflow.sdk.Variable instead.
+  ```
+- Warnings appear on every DAG parse cycle (every ~5–30 seconds)
+- DAGs still run correctly — these are warnings, not errors
+
+### Root Cause
+In Airflow 3.x, the public DAG-authoring API was consolidated into `airflow.sdk`. The legacy import paths (`airflow.decorators`, `airflow.models.Variable`, `airflow.models.xcom_arg.XComArg`) still work as compatibility shims but emit deprecation warnings on every parse.
+
+**Exception:** `airflow.exceptions.AirflowSkipException` does NOT need changing — it stays in `airflow.exceptions` in 3.x.
+
+### Fix
+Update each affected file:
+
+| File | Change |
+|------|--------|
+| `dag_stocks.py` | `from airflow.sdk import dag, task, XComArg` |
+| `dag_weather.py` | `from airflow.sdk import dag, task, XComArg` |
+| `dag_staleness_check.py` | `from airflow.sdk import dag, task` |
+| `dag_utils.py` | `from airflow.sdk import Variable` |
+| `alerting.py` (5 local imports) | `from airflow.sdk import Variable` |
+
+Then deploy: `./scripts/deploy.sh`
+
+### Verification
+```bash
+# After deploy, watch dag-processor logs — should produce no output
+ssh ec2-stock "kubectl logs -n airflow-my-namespace -l component=dag-processor --tail=200 | grep -i deprecat"
+
+# Confirm all DAGs still appear
+ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- airflow dags list"
+```
+
+---
+
+## Issue: Warnings in `./scripts/deploy.sh` output
+
+### Symptoms (resolved in April 2026 — documented for reference)
+
+Four warning categories appeared during deploy:
+
+```
+WARNING! Your credentials are stored unencrypted in '/home/ubuntu/.docker/config.json'.
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+RequestsDependencyWarning: urllib3 (2.6.3) or chardet .../charset_normalizer ... doesn't match a supported version!
+RemovedInAirflow4Warning: The airflow.security.permissions module is deprecated
+```
+
+### Root Causes & Fixes Applied
+
+| Warning | Root Cause | Fix |
+|---------|-----------|-----|
+| Unencrypted Docker credentials | `docker login` writes ECR tokens to `~/.docker/config.json` in plaintext | Switched to `amazon-ecr-credential-helper` — fetches tokens from IAM role on demand, nothing stored on disk |
+| Legacy Docker builder | Default `docker build` uses the old build engine | Added `DOCKER_BUILDKIT=1` env var to the docker build command in Step 4 |
+| `RequestsDependencyWarning` | Older `requests` version didn't declare support for `urllib3 2.x` | Pinned `requests>=2.32.3` in `_PIP_ADDITIONAL_REQUIREMENTS` in `values.yaml` |
+| `RemovedInAirflow4Warning` | `apache-airflow-providers-common-compat` (Airflow's own compat shim) was calling the deprecated `airflow.security.permissions` module | Upgraded `apache-airflow-providers-common-compat>=1.5.0` in `_PIP_ADDITIONAL_REQUIREMENTS` |
+
+### Notes
+- The `requests` and `providers-common-compat` warnings came from **Airflow's own provider packages**, not our DAG code — DAG files were fully audited and are clean
+- The ECR credential helper (`amazon-ecr-credential-helper`) is the [AWS-recommended approach](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry_auth.html) for ECR authentication; it uses the EC2 instance's IAM role and requires no stored credentials
+- `_PIP_ADDITIONAL_REQUIREMENTS` installs packages at every pod startup — this adds ~15–30s to restart time but is appropriate for this project; a custom Airflow image would be faster for high-churn environments
+
+---
+
 ## Issue: "DAG seems to be missing from DagBag" in Airflow UI
 
 ### Symptoms
@@ -703,22 +801,26 @@ Host ec2-stock
 
 ## Issue: All Static Assets Fail — "Network Connection Was Lost" (OOMKill)
 
-**Symptoms:** Airflow UI loads but has no styling. Browser DevTools shows 10+ simultaneous "network connection was lost" errors for every CSS/JS file (`main.js`, `bootstrap.min.js`, `ab.css`, etc.) — all failing at once.
+**Symptoms:**
+- Airflow UI loads but has no styling. Browser DevTools shows 10+ simultaneous "network connection was lost" errors for every CSS/JS file (`main.js`, `bootstrap.min.js`, `ab.css`, etc.) — all failing at once.
+- **Or:** You navigate away from the UI, come back a few minutes later, and get "server unexpectedly dropped the connection" / SSH tunnel reports `channel N: open failed: connect failed: Connection refused`. The pod OOMKilled while you were away; K3S NodePort has no endpoint to route to.
 
-**Root cause:** The webserver pod exceeded its memory limit and was OOMKilled. Kubernetes force-kills the pod; all in-flight HTTP connections drop simultaneously, including the browser's CSS/JS requests. If you see a *single* API endpoint fail, suspect a DAG parse error (see [Fix DAG Parse Errors runbook](RUNBOOKS.md#16-fix-dag-parse-errors--err_network-on-grid-view)). If *all* static files fail at once, suspect a pod restart.
+Both are the same root cause — the api-server pod was OOMKilled. The difference is only in timing: static-asset errors mean you were watching mid-crash; connection-refused means you returned after it already crashed and restarted (or is restarting).
+
+**Root cause:** The api-server pod exceeded its memory limit and was OOMKilled. Kubernetes force-kills the pod; all in-flight HTTP connections drop simultaneously, including the browser's CSS/JS requests. If you see a *single* API endpoint fail, suspect a DAG parse error (see [Fix DAG Parse Errors runbook](RUNBOOKS.md#16-fix-dag-parse-errors--err_network-on-grid-view)). If *all* static files fail at once, suspect a pod restart.
 
 ```bash
-# Confirm OOMKill — look for "OOMKilled" in last state
-kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A5 "Last State:"
-
-# Check current memory limit (should be 2Gi, not 1Gi)
-kubectl describe pod -l component=webserver -n airflow-my-namespace | grep -A3 "Limits:"
+# Confirm OOMKill — look for "OOMKilled" in last state (Airflow 3.x: component=api-server, not webserver)
+kubectl describe pod -l component=api-server -n airflow-my-namespace | grep -A5 "Last State:"
 
 # Check live memory usage
 kubectl top pod -n airflow-my-namespace
+
+# Check restart count — a high count confirms repeated OOMKills
+kubectl get pods -n airflow-my-namespace | grep api-server
 ```
 
-**Fix:** The webserver memory limit is 2 Gi and workers are set to 2 in `values.yaml`. If you see this again, check that `values.yaml` wasn't reverted. See [Runbook #17](RUNBOOKS.md#17-fix-static-assets-failing-oomkill--network-connection-lost).
+**Fix applied (2026-04-06):** Increased `apiServer` memory limit from `1Gi` → `2Gi` and added `AIRFLOW__API_SERVER__WORKERS=2` in `values.yaml` — same fix used for `webserver` in Airflow 2.x (OOMKilled at 1Gi with 4 gunicorn workers × ~300MB provider load each). If you see this again, check that `values.yaml` wasn't reverted and that `apiServer.resources.limits.memory` is `2Gi`. See [Runbook #17](RUNBOOKS.md#17-fix-static-assets-failing-oomkill--network-connection-lost).
 
 ---
 
@@ -732,7 +834,7 @@ kubectl top pod -n airflow-my-namespace
    ```bash
    ./scripts/deploy.sh  # includes Step 2d: helm upgrade
    # Or run manually on EC2:
-   ssh ec2-stock "helm upgrade airflow apache-airflow/airflow -n airflow-my-namespace --version 1.15.0 --reuse-values -f ~/airflow/helm/values.yaml"
+   ssh ec2-stock "helm upgrade airflow apache-airflow/airflow -n airflow-my-namespace --version 1.20.0 --atomic=false --timeout 2m -f ~/airflow/helm/values.yaml"
    ```
 
 3. **Kubernetes manifests not applied** → Run:
@@ -806,11 +908,10 @@ ssh ec2-stock "kubectl exec -n airflow-my-namespace airflow-scheduler-0 -- \
 - `http://localhost:30080` fails immediately: "server unexpectedly dropped the connection"
 - SSH tunnel is open and working (dashboard on 32147 loads fine)
 - All Airflow pods show `Running` with `0` restarts
-- Webserver logs show HTTP 200 responses to `/health` from `kube-probe`
 
 ### Root Cause: Service Selector Mismatch
 
-The NodePort service routes traffic to pods by matching **labels**. If the selector doesn't match any pod's labels, the service has no endpoints and rejects all connections.
+The NodePort service routes traffic to pods by matching **labels**. If the selector doesn't match any pod's labels, the service has no endpoints and drops all connections.
 
 Confirm this is the cause:
 ```bash
@@ -821,24 +922,24 @@ kubectl get endpoints -n airflow-my-namespace airflow-service-expose-ui-port
 Compare the service selector against the actual pod labels:
 ```bash
 kubectl describe svc -n airflow-my-namespace airflow-service-expose-ui-port | grep Selector
-kubectl get pods -n airflow-my-namespace --show-labels | grep webserver
+kubectl get pods -n airflow-my-namespace --show-labels
 ```
 
-**Known instance (2026-04-05):** The manifest `airflow/manifests/service-airflow-ui.yaml` had `component: api-server` (the Airflow 3.x label), but the cluster runs Airflow 2.9.3 which uses `component: webserver`. The selector matched zero pods.
+**Known instance (2026-04-05):** After upgrading Airflow 2.x → 3.x, `service-airflow-ui.yaml` still had `component: webserver` (the 2.x label). In Airflow 3.x the UI/API pod is labeled `component: api-server` — no `webserver` pod exists. The selector matched zero pods → `<none>` endpoints → connection dropped.
 
 ### Solution
 
-1. **Edit `airflow/manifests/service-airflow-ui.yaml`** — update the selector to match the actual pod label:
+1. **Edit `airflow/manifests/service-airflow-ui.yaml`** — set selector to `component: api-server` (Airflow 3.x):
    ```yaml
    selector:
-     component: webserver   # Airflow 2.x; change to api-server when upgrading to 3.x
+     component: api-server  # Airflow 3.x (was: webserver — 2.x only)
      release: airflow
    ```
 
 2. **Re-apply the manifest on EC2:**
    ```bash
-   # Copy updated manifest to EC2 and apply, or apply inline:
-   ssh ec2-stock 'kubectl apply -f ~/airflow/manifests/service-airflow-ui.yaml'
+   rsync -avz airflow/manifests/service-airflow-ui.yaml ec2-stock:/home/ubuntu/airflow/manifests/
+   ssh ec2-stock 'kubectl apply -f ~/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace'
    ```
 
 3. **Verify endpoints populate:**
@@ -849,9 +950,88 @@ kubectl get pods -n airflow-my-namespace --show-labels | grep webserver
 
 4. **Test the port:**
    ```bash
-   ssh ec2-stock 'curl -s -o /dev/null -w "%{http_code}" http://localhost:30080/health'
+   ssh ec2-stock 'curl -s -o /dev/null -w "%{http_code}" http://localhost:30080/api/v2/monitor/health'
    # Should return: 200
    ```
+
+---
+
+## Issue: `Variable.get() got an unexpected keyword argument 'default_var'`
+
+### Symptoms
+- Task fails immediately with:
+  ```
+  TypeError: Variable.get() got an unexpected keyword argument 'default_var'
+  ```
+- Affects any task that calls `check_vacation_mode()` or the alerting cooldown helpers
+
+### Root Cause
+In Airflow 3.x (`airflow.sdk`), `Variable.get()` renamed `default_var` to `default`. The old kwarg no longer exists.
+
+### Fix
+Replace `default_var=` with `default=` everywhere `Variable.get()` is called:
+```python
+# Before (Airflow 2.x)
+Variable.get("VACATION_MODE", default_var="false")
+
+# After (Airflow 3.x)
+Variable.get("VACATION_MODE", default="false")
+```
+Affected files: `dag_utils.py` and `alerting.py`.
+
+---
+
+## Issue: `TypeError: undefined is not an object (evaluating 'moment.tz')` in Browser Console
+
+### Symptoms
+- Browser console shows on the Airflow Home Page:
+  ```
+  [Error] TypeError: undefined is not an object (evaluating 'moment.tz')
+      (anonymous function) (jquery-latest.js:...)
+  ```
+- Airflow UI still works correctly — this is cosmetic only
+
+### Root Cause
+A known Airflow 3.x bug in the legacy Flask-AppBuilder (FAB) components still embedded in some pages. The `AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE` env var (set in `values.yaml`) prevents `moment.tz.guess()` (auto-detect timezone), but FAB also calls `moment.tz(date, tz)` to format dates, which requires `moment-timezone.js` to be loaded synchronously. The script loading order in Airflow 3.x does not guarantee this. The fix would be a one-line change to a Jinja2 template inside Airflow's own source — moving the `<script src="moment-timezone.js">` tag to load before the FAB date-rendering script — but this lives in the Airflow project, not here.
+
+### What Flask-AppBuilder is (and isn't)
+FAB is a dependency **inside Airflow** — it's the old framework Airflow used to build its own web UI pages. It has nothing to do with our DAG code. Our DAGs use `from airflow.sdk import dag, task, XComArg`, which is the modern Airflow 3.x API. FAB is being phased out by the Airflow project itself: with each new Airflow release, more UI pages are rewritten in React, and as each page is converted the `moment.tz` error disappears from that page. This happens automatically on a version upgrade — no changes to our code are required.
+
+### Options if you want to fix it
+| Option | What it involves | Verdict |
+|--------|-----------------|---------|
+| **Wait for upstream fix** | Apache Airflow merges a template patch; we pick it up via a normal `helm upgrade` | Best option — zero effort, happens automatically |
+| **Custom Docker image** | Build `FROM apache/airflow:3.1.8`, overwrite the offending FAB template file, push to ECR, point Helm at it | Fragile — breaks on every Airflow version bump; not worth it for a cosmetic error |
+| **Do nothing** | Error only appears in the browser developer console (F12 → Console), never visible to users | Correct choice for this project |
+
+### Status
+Non-blocking. Only visible in browser developer console — not shown to users. Cannot be fixed via Helm config. Resolves automatically when Airflow upgrades the affected UI page from FAB to React.
+
+---
+
+## Issue: `404 Not Found` for Task Instance URL — "Mapped Task Instance ... was not found"
+
+### Symptoms
+Navigating to a bookmarked Airflow URL (saved before the 3.x upgrade) shows:
+```
+404 Not Found
+The Mapped Task Instance with dag_id: `...`, run_id: `...`, task_id: `...`, and map_index: `-1` was not found
+```
+
+### Root Cause
+Airflow 2.x API URLs represented **every** task instance — including non-mapped (regular) tasks — with `map_index: -1` as a sentinel value. Airflow 3.x changed the task instance API: non-mapped tasks no longer use `map_index` in the endpoint path, so any 2.x deep-link URL that includes `map_index=-1` returns 404 in 3.x.
+
+This does **not** mean the task failed or that data is missing. It means the URL format is outdated.
+
+### Fix
+Discard the old bookmark. Navigate to the task instance via the Airflow 3.x UI:
+1. Open the Airflow UI → click the DAG name
+2. Click a run in the **Runs** grid
+3. Click the task name in the task grid
+
+### Notes
+- Only affects saved/bookmarked URLs from before the upgrade; all new links generated by the 3.x UI are correct
+- Confirmed non-issue: all DAG runs and task states remain accessible and correct via the new navigation path
 
 ---
 
@@ -866,4 +1046,97 @@ When making infrastructure changes:
 - [ ] Verify files in pod after pod restart
 - [ ] Check Airflow logs for DAG parsing errors
 - [ ] Monitor first DAG run for execution errors
+
+---
+
+## Issue: `BuildKit is enabled but the buildx component is missing or broken`
+
+### Symptoms
+`deploy.sh` Step 4 fails during the Docker build on EC2 with:
+```
+ERROR: BuildKit is enabled but the buildx component is missing or broken.
+       Install the buildx component to build images with BuildKit:
+       https://docs.docker.com/go/buildx/
+```
+
+### What is BuildKit?
+BuildKit is Docker's modern build engine, introduced as opt-in in Docker 18.09 and made
+the **default in Docker 23+**. It replaces the legacy "classic" builder with a faster,
+more parallel build graph, better layer caching, and new Dockerfile syntax features
+(e.g. `--mount=type=cache` to cache pip/apt downloads between builds).
+
+### What is `docker-buildx-plugin`?
+`docker-buildx-plugin` is the apt package that installs the `buildx` binary — the CLI
+frontend that BuildKit requires. When Docker runs a build with BuildKit enabled, it calls
+`buildx` internally even if you use the classic `docker build` syntax. Without the
+plugin, Docker has no way to invoke its own build engine and aborts with the above error.
+
+### Root Cause
+`deploy.sh` sets `DOCKER_BUILDKIT=1` explicitly, and Docker 23+ also enables BuildKit in
+`daemon.json` by default. Either trigger requires `buildx`. On a fresh or recently
+upgraded Ubuntu instance, `docker-buildx-plugin` is a separate apt package that isn't
+always installed automatically alongside `docker.io` or `docker-ce`.
+
+### Why not just remove `DOCKER_BUILDKIT=1`?
+That would suppress our explicit opt-in, but if the Docker daemon has BuildKit on by
+default (the case on Docker 23+), the build would still fail. Removing the env var is a
+workaround that masks the real missing dependency rather than satisfying it.
+
+### Why BuildKit matters for this project's future
+As the pipeline grows to include Snowflake loaders, dbt runners, and Kafka consumers, each
+will likely have its own container image. BuildKit features that become valuable then:
+- **`--mount=type=cache`** — caches `pip install` and `apt-get` layers across rebuilds,
+  cutting build times from ~2 min to ~10 s for unchanged dependencies
+- **`--platform`** — builds multi-architecture images if you ever switch instance types
+- **Parallel build graph** — independent `RUN` steps execute concurrently
+
+### Fix
+`docker-buildx-plugin` only exists in Docker's **official apt repo** (`download.docker.com`).
+Ubuntu's default `docker.io` package (what this EC2 uses) does not include it, so
+`apt-get install docker-buildx-plugin` fails with "Unable to locate package".
+
+`deploy.sh` Step 4a instead downloads the buildx binary directly from GitHub releases —
+the same source Docker's own install docs recommend when the plugin package isn't available:
+```bash
+if ! docker buildx version &>/dev/null; then
+    BUILDX_VER=$(curl -fsSL https://api.github.com/repos/docker/buildx/releases/latest \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+    mkdir -p ~/.docker/cli-plugins
+    curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VER}/buildx-${BUILDX_VER}.linux-amd64" \
+        -o ~/.docker/cli-plugins/docker-buildx
+    chmod +x ~/.docker/cli-plugins/docker-buildx
+fi
+```
+Docker discovers CLI plugins in `~/.docker/cli-plugins/` automatically — no apt or root
+access needed after the download. The GitHub API call always fetches the latest stable
+release so the script stays current without manual version bumps.
+
+### Verification
+Run `./scripts/deploy.sh`. Step 4 should complete with a successful push to ECR. On
+subsequent deploys the `if` check short-circuits (buildx is already installed) so no
+extra network traffic occurs.
+
+## Issue: `kubectl` — `permission denied` reading `/etc/rancher/k3s/k3s.yaml`
+
+### Symptoms
+`deploy.sh` Step 2e (or any subsequent `kubectl` command) fails via SSH with:
+```
+error: error loading config file "/etc/rancher/k3s/k3s.yaml": open /etc/rancher/k3s/k3s.yaml: permission denied
+```
+
+### Root Cause
+K3s writes its kubeconfig to `/etc/rancher/k3s/k3s.yaml` owned by `root` (mode 600). The
+`ubuntu` SSH user has no read permission. Unlike standalone `kubectl`, the K3s kubectl binary
+(symlinked to `k3s`) reads this path **directly** and ignores `~/.kube/config`, so copying the
+file doesn't help — the permissions on the source file must be fixed.
+
+### Fix
+`deploy.sh` Step 1c runs on every deploy and makes the file world-readable:
+```bash
+sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+```
+Runs on every deploy so permissions are restored even if K3s restarts and rewrites the file.
+
+### Verification
+Run `./scripts/deploy.sh` — Step 2e and all subsequent `kubectl` steps should succeed.
 

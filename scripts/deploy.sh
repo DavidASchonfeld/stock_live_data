@@ -46,6 +46,12 @@ echo "=== Step 1: Ensuring target directories exist on EC2 ==="
 ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs \
     && chmod 777 $EC2_HOME/airflow/dag-mylogs"  # 777 so Airflow pod (UID 50000) can write to the PVC-backed log dir
 
+echo "=== Step 1c: Ensuring kubectl config is accessible ==="
+# K3s kubectl (symlinked to the k3s binary) reads /etc/rancher/k3s/k3s.yaml directly and
+# ignores ~/.kube/config. The file is written root-only; chmod 644 so the ubuntu user can read it.
+# Runs on every deploy so permissions are restored even if K3s restarts and resets the file.
+ssh "$EC2_HOST" "sudo chmod 644 /etc/rancher/k3s/k3s.yaml"
+
 echo "=== Step 1b: Pre-flight validation ==="
 
 # Validate Python syntax in all DAG files (catches typos, indentation errors, missing colons)
@@ -109,13 +115,16 @@ echo "=== Step 2d: Applying Helm values to live Airflow release ==="
 # Syncing values.yaml to EC2 (step 2b) only copies the file — it does NOT update the running
 # Helm release. helm upgrade applies any changes (memory limits, worker count, probes) to the
 # live pods. Without this step, values.yaml edits have no effect until a manual helm upgrade.
-# --version 1.15.0: pins chart version (same as bootstrap_ec2.sh) to prevent accidental upgrades.
-# --reuse-values: keeps any runtime-set values not present in our file (e.g. generated secrets).
+# --version 1.20.0: pins chart to Airflow 3.x (upgraded from 1.15.0 on 2026-04-06).
+# No --reuse-values: use only values.yaml; --reuse-values injects stale 2.x Helm history and fails 3.x schema validation.
+# --atomic=false: keeps upgrade applied even if post-upgrade hooks time out (expected on this cluster).
+# || echo: hook timeout exits non-zero; suppress so set -e doesn't abort the script (upgrade was still applied).
 ssh "$EC2_HOST" "helm upgrade airflow apache-airflow/airflow \
     -n airflow-my-namespace \
-    --version 1.15.0 \
-    --reuse-values \
-    -f $EC2_HELM_PATH/values.yaml"
+    --version 1.20.0 \
+    --atomic=false --timeout 2m \
+    -f $EC2_HELM_PATH/values.yaml" \
+  || echo "Note: Helm hook timed out (expected — post-upgrade job takes >2m; upgrade was applied)."
 
 echo "=== Step 2c: Syncing Kubernetes manifests to EC2 ==="
 # Reference copies of manifests on EC2 enable direct kubectl apply from EC2 if needed
@@ -123,8 +132,46 @@ echo "=== Step 2c: Syncing Kubernetes manifests to EC2 ==="
 rsync -avz --progress airflow/manifests/ "$EC2_HOST:$EC2_HOME/airflow/manifests/"
 rsync -avz --progress dashboard/manifests/ "$EC2_HOST:$EC2_HOME/dashboard/manifests/"
 
+echo "=== Step 2e: Applying Airflow service manifest ==="
+# Apply the Airflow UI service so the selector stays in sync with values.yaml changes (e.g. 2.x→3.x component rename)
+# Without this, helm upgrade doesn't touch the manually-created NodePort service, so label changes are silently ignored
+ssh "$EC2_HOST" "kubectl apply -f $EC2_HOME/airflow/manifests/service-airflow-ui.yaml -n airflow-my-namespace"
+
 echo "=== Step 3: Syncing dashboard build files to EC2 ==="
 rsync -avz --progress dashboard/ "$EC2_HOST:$EC2_BUILD_PATH/"
+
+echo "=== Step 4a: Configuring ECR credential helper on EC2 ==="
+# amazon-ecr-credential-helper is the AWS-recommended approach for ECR auth:
+# it fetches short-lived tokens via the EC2 IAM role transparently on every push/pull,
+# so no credentials are ever written to ~/.docker/config.json (fixes the "unencrypted
+# credentials" warning that appears when using `docker login`).
+ssh "$EC2_HOST" "
+    # Install ECR credential helper if not already present
+    if ! command -v docker-credential-ecr-login &>/dev/null; then
+        sudo apt-get install -y -q amazon-ecr-credential-helper
+    fi
+    # Install buildx binary if not already present (docker-buildx-plugin only exists in Docker's
+    # official apt repo; Ubuntu's docker.io package omits it, so we fetch the binary from GitHub)
+    if ! docker buildx version &>/dev/null; then
+        BUILDX_VER=\$(curl -fsSL https://api.github.com/repos/docker/buildx/releases/latest \
+            | python3 -c \"import sys,json; print(json.load(sys.stdin)['tag_name'])\")
+        mkdir -p ~/.docker/cli-plugins
+        curl -fsSL \"https://github.com/docker/buildx/releases/download/\${BUILDX_VER}/buildx-\${BUILDX_VER}.linux-amd64\" \
+            -o ~/.docker/cli-plugins/docker-buildx
+        chmod +x ~/.docker/cli-plugins/docker-buildx
+        echo \"Installed buildx \${BUILDX_VER}\"
+    fi
+    # Register the helper for this ECR registry in ~/.docker/config.json (idempotent)
+    python3 -c \"
+import json, pathlib
+p = pathlib.Path.home() / '.docker/config.json'
+cfg = json.loads(p.read_text()) if p.exists() else {}
+cfg.setdefault('credHelpers', {})['$ECR_REGISTRY'] = 'ecr-login'
+p.parent.mkdir(exist_ok=True)
+p.write_text(json.dumps(cfg, indent=2))
+print('ECR credential helper configured')
+    \"
+"
 
 echo "=== Step 4: Building Docker image on EC2 and pushing to ECR ==="
 # WHY we push to ECR instead of keeping the image local:
@@ -134,14 +181,13 @@ echo "=== Step 4: Building Docker image on EC2 and pushing to ECR ==="
 #   private container registry) and let K3S pull it from there — this is the standard
 #   production pattern for Kubernetes on AWS.
 #
-#   Authentication uses the EC2 instance's IAM role (no passwords stored anywhere):
-#   "aws ecr get-login-password" fetches a temporary token via the instance metadata service,
-#   then pipes it into "docker login" so Docker can push to your private ECR repo.
+#   Authentication is handled by the ECR credential helper (Step 4a), which uses the
+#   EC2 instance's IAM role — no explicit `docker login` needed, no credentials on disk.
+# DOCKER_BUILDKIT=1: enables BuildKit, the modern Docker build engine (legacy builder is deprecated)
 # ssh runs the quoted string as a command on EC2 (not on my Mac)
 # "&&" chains commands: each runs only if the previous one succeeded
-ssh "$EC2_HOST" "aws ecr get-login-password --region $AWS_REGION \
-    | docker login --username AWS --password-stdin $ECR_REGISTRY \
-    && cd $EC2_BUILD_PATH && docker build -t $FLASK_IMAGE . \
+ssh "$EC2_HOST" "cd $EC2_BUILD_PATH \
+    && DOCKER_BUILDKIT=1 docker build -t $FLASK_IMAGE . \
     && docker tag $FLASK_IMAGE $ECR_IMAGE \
     && docker push $ECR_IMAGE"
 

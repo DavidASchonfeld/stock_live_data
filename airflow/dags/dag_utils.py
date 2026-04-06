@@ -2,7 +2,7 @@
 
 import logging  # used to write VACATION_MODE state to task logs for auditability
 
-from airflow.models import Variable  # Airflow Variable: key-value store editable in UI → Admin → Variables
+from airflow.sdk import Variable  # Airflow Variable: key-value store editable in UI → Admin → Variables
 from airflow.exceptions import AirflowSkipException  # signals Airflow to mark the task as Skipped (not failed)
 
 
@@ -30,7 +30,7 @@ def check_vacation_mode() -> None:
     - Every run logs the current VACATION_MODE value — search task logs for "VACATION_MODE ="
     """
     # Fetch value once; log it so every task log records the state for future audits
-    vacation = Variable.get("VACATION_MODE", default_var="false").lower()
+    vacation = Variable.get("VACATION_MODE", default="false").lower()  # Airflow 3.x: default_var renamed to default
     logging.info("VACATION_MODE = %s", vacation)
     if vacation == "true":
         raise AirflowSkipException("VACATION_MODE is enabled — skipping all API calls for this run.")

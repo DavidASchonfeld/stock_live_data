@@ -2,6 +2,49 @@
 
 ---
 
+## 2026-04-06: Fix `kubectl` Permission Denied on K3s Kubeconfig ✅
+
+**Problem:** `deploy.sh` Step 2e (and all subsequent `kubectl` steps) failed with:
+```
+error: error loading config file "/etc/rancher/k3s/k3s.yaml": permission denied
+```
+K3s writes its kubeconfig owned by `root` (mode 600). The `kubectl` binary on this EC2 is symlinked to the `k3s` binary, which reads `/etc/rancher/k3s/k3s.yaml` directly and ignores `~/.kube/config`. Copying the file to `~/.kube/config` (attempted first) had no effect.
+
+**Fix:** Added Step 1c to `deploy.sh` that runs `sudo chmod 644 /etc/rancher/k3s/k3s.yaml` before any `kubectl` calls. Runs on every deploy so permissions are restored even if K3s restarts and resets the file.
+
+**Files changed:** `scripts/deploy.sh`, `docs/operations/TROUBLESHOOTING.md`
+
+---
+
+## 2026-04-06: Fix transform OOM — Stage Raw EDGAR Data to PVC ✅
+
+**Problem:** The `transform` task in `Stock_Market_Pipeline` was silently OOM-killed ("Up for Retry") with no Python traceback — only 3 DAG-parsing lines appeared in the log. Root cause: `extract()` was returning the full raw SEC EDGAR `companyfacts` response for 3 tickers (~10–15 MB each, ~45 MB total) directly through Airflow XCom. MariaDB's XCom table stores values as `MEDIUMBLOB` (16 MB max), and the worker pod was OOM-killed during deserialization before any task code could run.
+
+**Fix:** Changed `extract()` to write the raw payload to the PVC (`/opt/airflow/out/raw_{run_id}.json`) and return only the file path string through XCom. `transform()` now reads the file at task startup, then deletes it on completion. This is the canonical Airflow pattern for large inter-task data — XCom carries metadata (the path), not the blob.
+
+**Files changed:** `airflow/dags/dag_stocks.py`
+
+---
+
+## 2026-04-06: Ubuntu 24.04 Package Updates Applied ✅
+
+Applied 8 pending Ubuntu package updates and rebooted the EC2 instance to clear the login banner warnings.
+
+**What was done:**
+```bash
+sudo apt update && sudo apt upgrade -y && sudo apt clean && sudo reboot
+```
+
+**Incident during upgrade:** `apt upgrade -y` silently paused mid-run waiting for a config file prompt (a `.conf` with local modifications that `-y` doesn't auto-answer). The command appeared frozen for ~6 hours overnight. Pressing **Enter** resumed it immediately and the rest of the chain completed normally.
+
+**ESM decision:** The login banner also warned about 1 additional update available via Ubuntu ESM (Extended Security Maintenance / Ubuntu Pro). After evaluating the pros and cons, decided to skip ESM for this project — the patch is non-critical and Ubuntu Pro adds a background daemon that phones home to Canonical. The persistent banner message is harmless.
+
+**Disk impact:** Negligible. `apt upgrade` adds ~50 MB; `apt clean` removes the download cache, netting ~0 net change on the 18 GB root volume.
+
+**Reference:** [Runbook #18](../operations/RUNBOOKS.md#18-apply-ubuntu-os-security-updates) — standard procedure for future updates.
+
+---
+
 ## 2026-04-06: Airflow 3.1.8 Upgrade Recovery — All Pods Running ✅
 
 This incident began when a `helm upgrade` without a `--version` pin accidentally upgraded the cluster from Airflow 2.9.3 (chart 1.15.0) to Airflow 3.1.8 (chart 1.20.0). The DB schema was migrated to the 3.x format before the upgrade timed out, leaving the cluster in a broken state: DB at the 3.x migration head, pods running 2.9.3. Four subsequent `helm upgrade` attempts over the next several hours all timed out. Three separate root causes were found and fixed.

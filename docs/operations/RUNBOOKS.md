@@ -28,6 +28,7 @@ Step-by-step playbooks for common operations. Each runbook is a complete procedu
 15. [Migrate EC2 from AL2023 to Ubuntu 24.04 LTS](#15-migrate-ec2-from-al2023-to-ubuntu-2404-lts)
 16. [Fix DAG Parse Errors / ERR_NETWORK on Grid View](#16-fix-dag-parse-errors--err_network-on-grid-view)
 17. [Fix Static Assets Failing (OOMKill → Network Connection Lost)](#17-fix-static-assets-failing-oomkill--network-connection-lost)
+18. [Apply Ubuntu OS Security Updates](#18-apply-ubuntu-os-security-updates)
 
 ---
 
@@ -1592,4 +1593,52 @@ Then reload `http://localhost:30080/home` — all CSS/JS should load cleanly.
 
 ---
 
-**Last updated:** 2026-04-05 — Added Runbook 17 (static assets OOMKill); updated Runbook 16 reference; added helm upgrade to TOC.
+**Last updated:** 2026-04-06 — Added Runbook 17 (static assets OOMKill); updated Runbook 16 reference; added helm upgrade to TOC. Added Runbook 18 (Ubuntu OS security updates).
+
+---
+
+## 18. Apply Ubuntu OS Security Updates
+
+**When:** SSH login banner shows "N updates can be applied immediately" or "*** System restart required ***".
+
+**Prerequisites:**
+- SSH access to EC2 (`ssh ec2-stock` works)
+
+**Steps:**
+
+```bash
+# 1. Check what's pending (optional — for visibility before upgrading)
+apt list --upgradable
+
+# 2. Update package lists, upgrade all packages, clear download cache, and reboot
+sudo apt update && sudo apt upgrade -y && sudo apt clean && sudo reboot
+# Connection will drop when reboot runs — this is expected (~30 sec)
+```
+
+> **Important:** `apt upgrade -y` occasionally pauses silently on config file prompts that `-y` doesn't auto-answer. If the command appears frozen for several minutes with no output, press **Enter** to accept the default and it will resume. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for details.
+
+```bash
+# 3. Reconnect after reboot
+ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
+
+# 4. Verify the warnings are gone from the login banner
+```
+
+**ESM / Ubuntu Pro note:**
+
+The login banner may still show:
+```
+1 additional security update can be applied with ESM Apps.
+```
+This is Ubuntu's Extended Security Maintenance (Ubuntu Pro). For this project, **skip it** — the 1 pending ESM update is a non-critical app-layer patch and the message is partly marketing. If you ever want it, `sudo pro attach` enrolls the machine for free (up to 5 personal machines).
+
+**Disk impact:**
+
+Negligible — `apt upgrade` adds ~50 MB of new binaries; `apt clean` removes the download cache, netting roughly zero change. If disk usage is above 80%, investigate with:
+```bash
+du -sh /* 2>/dev/null | sort -rh | head -15
+```
+
+**Success criteria:** Login banner no longer shows update count or restart required message.
+
+---

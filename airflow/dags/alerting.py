@@ -65,9 +65,9 @@ def _alert_variable_key(dag_id: str, task_id: str) -> str:
 
 def _should_send_alert(key: str, cooldown_minutes: int) -> bool:
     """Return True if no alert was sent for this key within the cooldown window."""
-    from airflow.models import Variable  # local import — avoids top-level Airflow dependency at parse time
+    from airflow.sdk import Variable  # local import — avoids top-level Airflow dependency at parse time
     try:
-        raw = Variable.get(key, default_var=None)
+        raw = Variable.get(key, default=None)  # Airflow 3.x: default_var renamed to default
     except Exception:
         return True  # if Variable store is unavailable, allow the alert rather than suppress it
     if raw is None:
@@ -81,7 +81,7 @@ def _should_send_alert(key: str, cooldown_minutes: int) -> bool:
 
 def _record_alert_sent(key: str) -> None:
     """Persist current timestamp as last-alert time for this key."""
-    from airflow.models import Variable  # local import
+    from airflow.sdk import Variable  # local import
     try:
         Variable.set(key, datetime.now().isoformat())
     except Exception as e:
@@ -91,7 +91,7 @@ def _record_alert_sent(key: str) -> None:
 
 def _clear_alert_state(key: str) -> None:
     """Delete the Airflow Variable tracking last-alert time, resetting cooldown."""
-    from airflow.models import Variable  # local import
+    from airflow.sdk import Variable  # local import
     try:
         Variable.delete(key)
     except Exception:
@@ -100,9 +100,9 @@ def _clear_alert_state(key: str) -> None:
 
 def _should_send_staleness_recovery(key: str) -> bool:
     """Return True if there was a prior staleness alert that has now resolved."""
-    from airflow.models import Variable  # local import
+    from airflow.sdk import Variable  # local import
     try:
-        return Variable.get(key, default_var=None) is not None
+        return Variable.get(key, default=None) is not None  # Airflow 3.x: default_var renamed to default
     except Exception:
         return False  # if Variable store is unavailable, skip recovery message
 
@@ -165,7 +165,7 @@ def on_retry_alert(context: dict) -> None:
 
 def on_success_alert(context: dict) -> None:
     """Airflow on_success_callback: sends recovery message and clears alert state if task previously failed."""
-    from airflow.models import Variable  # local import
+    from airflow.sdk import Variable  # local import
     writer = _get_writer()
 
     dag_id = context.get("dag", {}).dag_id if context.get("dag") else "unknown"
@@ -174,7 +174,7 @@ def on_success_alert(context: dict) -> None:
     # Only notify on recovery if a prior failure alert was recorded for this task
     key = _alert_variable_key(dag_id, task_id)
     try:
-        if Variable.get(key, default_var=None) is None:
+        if Variable.get(key, default=None) is None:  # Airflow 3.x: default_var renamed to default
             return  # task never failed (or already recovered) — no recovery message needed
     except Exception:
         return  # if Variable store is unavailable, skip silently

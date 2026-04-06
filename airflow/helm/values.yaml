@@ -1,9 +1,15 @@
 executor: LocalExecutor
 
-# Install pymysql so SQLAlchemy can connect to MariaDB via mysql+pymysql:// — must be declared here so all pods get it at startup
+# Install extra pip packages at pod startup so all pods get them
+# pymysql: SQLAlchemy needs it to connect to MariaDB via mysql+pymysql://
+# requests>=2.32.3: pins requests to a version that supports urllib3 2.x (fixes RequestsDependencyWarning)
+# apache-airflow-providers-common-compat>=1.5.0: upgrades the compat shim that was importing the
+#   deprecated airflow.security.permissions module (fixes RemovedInAirflow4Warning on dags list)
 env:
   - name: _PIP_ADDITIONAL_REQUIREMENTS
-    value: "pymysql"
+    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0"
+  - name: AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE  # prevents moment.tz.guess() on login; moment.tz() error on Home Page is a known Airflow 3.x cosmetic bug (non-blocking, unfixable via Helm)
+    value: "America/New_York"
 
 # Override postgresql image: chart default tag (16.1.0-debian-11-r15) removed from Docker Hub; ECR Public has no rate limits from EC2
 postgresql:
@@ -123,18 +129,28 @@ webserver:
     timeoutSeconds: 20
 
 apiServer:
-  # Airflow 3.x: REST API is now a separate process (split from webserver). Handles all API calls.
+  # Airflow 3.x: REST API + UI server (split from webserver). Handles all API calls and serves the web UI.
   # Give 3 min to start — pymysql installs at startup before the HTTP endpoint comes up.
+  env:
+    - name: AIRFLOW__API_SERVER__WORKERS  # reduce from 4→2 workers; each loads all providers (~300MB each)
+      value: "2"
   startupProbe:
     failureThreshold: 18  # 180s — matches webserver/scheduler
     periodSeconds: 10
-    timeoutSeconds: 20
+    timeoutSeconds: 45  # was 20 — Airflow 3.x provider loading takes 30-45s (same fix as scheduler)
+  # Auto-restarts api-server if it freezes; timeout raised for same provider-loading reason as scheduler
+  livenessProbe:
+    initialDelaySeconds: 10
+    timeoutSeconds: 45  # Airflow 3.x provider loading takes 30-45s
+    failureThreshold: 5
+    periodSeconds: 60
+  # 2Gi limit: same fix as webserver in 2.x — OOMKilled at 1Gi with 4 gunicorn workers × ~300MB provider load each
   resources:
     requests:
       memory: "256Mi"
       cpu: "100m"
     limits:
-      memory: "1Gi"
+      memory: "2Gi"
       cpu: "500m"
 
 triggerer:

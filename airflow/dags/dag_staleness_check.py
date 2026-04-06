@@ -4,7 +4,7 @@ from datetime import timedelta
 
 import pendulum
 
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task  # Airflow 3.x SDK — replaces airflow.decorators
 
 
 # My Files

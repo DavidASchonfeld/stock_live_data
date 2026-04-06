@@ -6,8 +6,7 @@ from datetime import datetime, timedelta
 
 import pendulum
 
-from airflow.decorators import dag, task
-from airflow.models.xcom_arg import XComArg
+from airflow.sdk import dag, task, XComArg  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 
 
 import pandas as pd
