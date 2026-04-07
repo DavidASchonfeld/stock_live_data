@@ -16,11 +16,12 @@ from datetime import datetime
 from pprint import pformat
 
 import pandas as pd
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import text, inspect
 from sqlalchemy.exc import SQLAlchemyError
 
 from file_logger import OutputTextWriter
-from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST
+from shared.config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST
+from shared.db import make_mariadb_engine
 
 
 # Expected schema for company_financials table (SEC EDGAR XBRL data)
@@ -66,8 +67,7 @@ def validate_database():
     writer.log("=" * 80)
 
     try:
-        # Create database engine using existing db_config credentials
-        engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
+        engine = make_mariadb_engine()
 
         # Test basic connection
         with engine.connect() as connection:

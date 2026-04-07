@@ -11,6 +11,8 @@ airflow_env/
 *.txt
 # local infra secrets (IPs, key file, credentials) — never commit
 infra_local.md
+# K8s secrets with passwords — never commit
+*-secret.yaml
 # compiled Python bytecode
 __pycache__/
 # local development notes

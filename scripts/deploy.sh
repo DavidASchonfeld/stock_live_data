@@ -75,11 +75,11 @@ echo "=== Step 1b: Pre-flight validation ==="
 # Validate Python syntax in all DAG files (catches typos, indentation errors, missing colons)
 # Check exit code directly — py_compile exits non-zero on syntax error (grep on output is unreliable)
 echo "Checking Python syntax in DAG files..."
-if python3 -m py_compile airflow/dags/*.py 2>/dev/null; then
+if find airflow/dags -name "*.py" | xargs python3 -m py_compile 2>/dev/null; then
     echo "✓ All DAG files have valid Python syntax"
 else
     echo "✗ Syntax error in DAG files. Fix before deploying."
-    python3 -m py_compile airflow/dags/*.py  # re-run to display the error
+    find airflow/dags -name "*.py" | xargs python3 -m py_compile  # re-run to display the error
     exit 1
 fi
 
@@ -142,6 +142,7 @@ ssh "$EC2_HOST" "helm upgrade airflow apache-airflow/airflow \
     -n airflow-my-namespace \
     --version 1.20.0 \
     --atomic=false --timeout 2m \
+    --force \
     -f $EC2_HELM_PATH/values.yaml" \
   || echo "Note: Helm hook timed out (expected — post-upgrade job takes >2m; upgrade was applied)."
 
@@ -150,6 +151,21 @@ echo "=== Step 2c: Syncing Kubernetes manifests to EC2 ==="
 # (Git remains the source of truth; these are convenience copies for EC2-side operations)
 rsync -avz --progress airflow/manifests/ "$EC2_HOST:$EC2_HOME/airflow/manifests/"
 rsync -avz --progress dashboard/manifests/ "$EC2_HOST:$EC2_HOME/dashboard/manifests/"
+
+echo "=== Step 2c1: Applying K8s secrets (credentials) ==="
+# Apply Snowflake and database credential secrets to both airflow-my-namespace and default namespaces.
+# These secrets must exist before Helm upgrade (Step 2d) so pods can reference them in envFrom.
+# Secrets are .gitignored (never committed) and stored only locally on EC2.
+ssh "$EC2_HOST" "
+    if [ -f $EC2_HOME/airflow/manifests/snowflake-secret.yaml ]; then
+        echo 'Applying Snowflake credentials to airflow-my-namespace...' &&
+        kubectl apply -f $EC2_HOME/airflow/manifests/snowflake-secret.yaml -n airflow-my-namespace &&
+        echo 'Applying Snowflake credentials to default namespace (for Flask pod)...' &&
+        kubectl apply -f $EC2_HOME/airflow/manifests/snowflake-secret.yaml -n default
+    else
+        echo 'Note: snowflake-secret.yaml not found — skipping (first deploy before secret created).'
+    fi
+"
 
 echo "=== Step 2e: Applying Airflow service manifest ==="
 # Apply the Airflow UI service so the selector stays in sync with values.yaml changes (e.g. 2.x→3.x component rename)
@@ -216,25 +232,35 @@ echo "=== Step 5: Refreshing ECR pull secret in Kubernetes ==="
 # WHY this step is needed:
 #   K3S containerd needs credentials to pull from ECR (a private registry).
 #   We store those credentials as a Kubernetes "docker-registry" secret named "ecr-credentials".
-#   The pod manifest (pod-flask.yaml) references this secret via "imagePullSecrets".
+#   Both Flask pod (in default namespace) and Airflow pods (in airflow-my-namespace) reference
+#   this secret via "imagePullSecrets".
 #
 #   ECR tokens are valid for 12 hours. We refresh the secret on every deploy so it's always
 #   current. "--dry-run=client -o yaml | kubectl apply" handles both first-time create and
 #   subsequent updates without erroring if the secret already exists.
 #
-# WHY -n default on both sides:
-#   The kubectl context on this EC2 instance defaults to airflow-my-namespace (where Airflow
-#   lives). Without an explicit namespace, the secret would be created there instead of in the
-#   default namespace where the Flask pod runs. Kubernetes resolves imagePullSecrets in the
-#   SAME namespace as the pod, so a secret in the wrong namespace is silently ignored —
-#   containerd falls back to a direct (unauthenticated) pull, which fails with ImagePullBackOff
-#   unless the image happens to already be cached on the node.
+# WHY apply to both namespaces:
+#   Kubernetes resolves imagePullSecrets in the SAME namespace as the pod.
+#   A secret in the wrong namespace is silently ignored — containerd falls back to a direct
+#   (unauthenticated) pull, which fails with ImagePullBackOff. We apply to both:
+#   - default namespace (Flask pod)
+#   - airflow-my-namespace (Airflow pods: scheduler, webserver, dag-processor, triggerer)
+
+# Create the secret in default namespace (Flask)
 ssh "$EC2_HOST" "kubectl create secret docker-registry ecr-credentials \
     -n default \
     --docker-server=$ECR_REGISTRY \
     --docker-username=AWS \
     --docker-password=\$(aws ecr get-login-password --region $AWS_REGION) \
     --dry-run=client -o yaml | kubectl apply -n default -f -"
+
+# Create the secret in airflow-my-namespace (Airflow pods)
+ssh "$EC2_HOST" "kubectl create secret docker-registry ecr-credentials \
+    -n airflow-my-namespace \
+    --docker-server=$ECR_REGISTRY \
+    --docker-username=AWS \
+    --docker-password=\$(aws ecr get-login-password --region $AWS_REGION) \
+    --dry-run=client -o yaml | kubectl apply -n airflow-my-namespace -f -"
 
 echo "=== Step 6: Restarting Flask pod to pick up the new image ==="
 # WHY delete+recreate instead of just "restart":

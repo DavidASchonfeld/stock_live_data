@@ -3,7 +3,7 @@ from datetime import datetime
 from pprint import pprint
 from pprint import pformat
 
-from constants import outputTextsFolder_folderPath  # My constants Python file is in .gitignore
+from shared.config import LOCAL_LOG_PATH as outputTextsFolder_folderPath
 
 
 # ── Why a custom logger instead of Python's built-in logging module? ──────────

@@ -11,14 +11,15 @@ import pendulum
 from airflow.sdk import dag, task, XComArg, get_current_context  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 
 import pandas as pd
-from sqlalchemy import create_engine, text  # text() required for raw SQL in SQLAlchemy 2.x
+from sqlalchemy import text  # text() required for raw SQL in SQLAlchemy 2.x
 from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
 from edgar_client import resolve_cik, fetch_company_facts, flatten_company_financials  # SEC EDGAR XBRL API calls and data flattening
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
-from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
+from shared.config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST
+from shared.db import make_mariadb_engine
 from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
 from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
@@ -231,11 +232,7 @@ def stock_market_pipeline():
         df: pd.DataFrame = pd.DataFrame(records)
 
         try:
-            # Why mysql+pymysql://? SQLAlchemy needs a driver prefix; pymysql is a
-            # pure-Python MySQL/MariaDB driver that requires no C extensions to install.
-            # DB_HOST points to MariaDB's private EC2 IP — reachable from inside the K8s
-            # cluster because MariaDB runs on the same EC2 host (outside the pods).
-            engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
+            engine = make_mariadb_engine()
 
             with engine.connect() as connection:
                 result_one = connection.execute(text("SELECT 1"))  # text() wrapper required by SQLAlchemy 2.x

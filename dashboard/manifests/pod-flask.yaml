@@ -17,6 +17,8 @@ spec:
     envFrom:
     - secretRef:
         name: db-credentials  # injects DB_USER, DB_PASSWORD, DB_HOST, DB_NAME
+    - secretRef:
+        name: snowflake-credentials  # injects SNOWFLAKE_ACCOUNT, USER, PASSWORD, DATABASE, SCHEMA, WAREHOUSE (+ DB_BACKEND when cutting over)
     # Resource limits required on t3.large (8 GB RAM) to prevent one runaway pod from OOMKilling (Out Of Memory Killing) others.
     # requests = memory/CPU K8s guarantees and uses for scheduling; limits = hard ceiling before OOMKill (pod killed by OS for exceeding RAM).
     # 256Mi request: Flask/Dash idle baseline is ~200 MB (see EC2_SIZING.md); 512Mi limit covers peak load.

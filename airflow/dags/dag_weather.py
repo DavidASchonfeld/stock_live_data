@@ -11,14 +11,15 @@ from airflow.sdk import dag, task, XComArg  # Airflow 3.x SDK — replaces airfl
 
 
 import pandas as pd
-from sqlalchemy import create_engine, text  # text() required for raw SQL in SQLAlchemy 2.x
+from sqlalchemy import text  # text() required for raw SQL in SQLAlchemy 2.x
 from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
 from weather_client import fetch_weather_forecast  # renamed from sendRequest_openMeteo
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
-from db_config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST  # db_config.py is in .gitignore — never commit secrets
+from shared.config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST
+from shared.db import make_mariadb_engine
 from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
 from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
@@ -174,7 +175,7 @@ def weather_pipeline():
             # engine = create_engine("mysql+pymysql://USERNAME:PASSWORD@localhost:3306/mydatabase")
             # If Apache Airflow was not inside Kubernetes pod, since MariaDB is already outside a pod: "localhost:3306"  # Default MariaDB Value (This Command in "Command Line" confirms this: "sudo netstat -tulnp | grep 3306")
 
-            engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
+            engine = make_mariadb_engine()
 
             with engine.connect() as connection:
                 result_one = connection.execute(text("SELECT 1"))  # text() wrapper required by SQLAlchemy 2.x
@@ -204,14 +205,46 @@ def weather_pipeline():
                 # index = False means: don't write the Pandas Dataframe's index into the SQL table
                 writer.log(f"Loaded {len(new_rows)} new rows into weather_hourly table")
 
-            # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
+            # Dual-write to Snowflake — dedup against Snowflake independently from MariaDB
             try:
                 from snowflake_client import write_df_to_snowflake
-                # Mirror the same dedup-filtered rows to Snowflake (overwrite=False = append)
-                write_df_to_snowflake(new_rows.copy(), "WEATHER_HOURLY", overwrite=False)
-                writer.log(f"Loaded {len(new_rows)} rows into Snowflake WEATHER_HOURLY")
+                from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+                # Check which timestamps already exist in Snowflake (separate from MariaDB dedup)
+                sf_hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
+                sf_conn = sf_hook.get_conn()
+                sf_cur = sf_conn.cursor()
+                try:
+                    sf_cur.execute("SELECT TIME FROM PIPELINE_DB.RAW.WEATHER_HOURLY")
+                    # TIME column is NUMBER(38,0) storing epoch seconds; convert to int for comparison
+                    sf_existing = {int(row[0]) for row in sf_cur.fetchall()}
+                    writer.log(f"Snowflake has {len(sf_existing)} existing timestamps")
+                except Exception as query_err:
+                    writer.log(f"Snowflake table doesn't exist yet or query failed: {query_err}")
+                    sf_existing = set()  # table doesn't exist yet
+                sf_cur.close()
+                sf_conn.close()
+                # Convert df["time"] ISO strings to epoch seconds for comparison with Snowflake NUMBER column
+                df_times_epoch = pd.to_datetime(df["time"]).astype(int) // 10**9  # ns to seconds
+                sf_new_rows = df[~df_times_epoch.isin(sf_existing)].copy()
+                writer.log(f"Snowflake dedup: {len(sf_existing)} existing, {len(sf_new_rows)} new rows")
+                if len(sf_new_rows) > 0:
+                    # Cast ALL columns to match Snowflake table schema exactly
+                    sf_new_rows = sf_new_rows.copy()
+                    sf_new_rows["time"] = pd.to_datetime(sf_new_rows["time"])
+                    sf_new_rows["imported_at"] = pd.to_datetime(sf_new_rows["imported_at"])
+                    sf_new_rows["temperature_2m"] = sf_new_rows["temperature_2m"].astype(float)
+                    sf_new_rows["latitude"] = sf_new_rows["latitude"].astype(float)
+                    sf_new_rows["longitude"] = sf_new_rows["longitude"].astype(float)
+                    sf_new_rows["elevation"] = sf_new_rows["elevation"].astype(float)
+                    sf_new_rows["timezone"] = sf_new_rows["timezone"].astype(str)  # explicitly cast to str
+                    sf_new_rows["utc_offset_seconds"] = sf_new_rows["utc_offset_seconds"].astype("int64")
+                    write_df_to_snowflake(sf_new_rows, "WEATHER_HOURLY", overwrite=False)
+                    writer.log(f"Loaded {len(sf_new_rows)} rows into Snowflake WEATHER_HOURLY")
+                else:
+                    writer.log("No new rows to insert into Snowflake — all timestamps already present")
             except Exception as sf_err:
-                writer.log(f"Snowflake write skipped (not yet configured): {sf_err}")
+                writer.log(f"[ERROR] Snowflake write failed: {sf_err}")
+                raise  # Re-raise so the DAG task fails and you see the error
 
         except SQLAlchemyError as e:
             writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")  # write to PVC so error is readable without the Airflow UI (UI has 404 encoding bug on run IDs with '+')

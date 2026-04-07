@@ -1,5 +1,19 @@
 executor: LocalExecutor
 
+# Override base Airflow image to use official Apache image (bitnami/airflow:3.0.5 was removed from Docker Hub)
+# Also override Redis image — bitnami/redis:8.2.1 doesn't exist on Docker Hub; use official Redis
+images:
+  airflow:
+    repository: apache/airflow
+    tag: "3.1.8"
+  redis:
+    repository: redis
+    tag: "7.2-bookworm"
+
+# ECR credentials: all Airflow pods pull images from ECR (private AWS registry)
+imagePullSecrets:
+  - name: ecr-credentials
+
 # Install extra pip packages at pod startup so all pods get them
 # pymysql: SQLAlchemy needs it to connect to MariaDB via mysql+pymysql://
 # requests>=2.32.3: pins requests to a version that supports urllib3 2.x (fixes RequestsDependencyWarning)
@@ -7,7 +21,7 @@ executor: LocalExecutor
 #   deprecated airflow.security.permissions module (fixes RemovedInAirflow4Warning on dags list)
 env:
   - name: _PIP_ADDITIONAL_REQUIREMENTS
-    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0"
+    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0 apache-airflow-providers-snowflake==5.6.1 snowflake-connector-python==3.10.1"
   - name: AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE  # prevents moment.tz.guess() on login; moment.tz() error on Home Page is a known Airflow 3.x cosmetic bug (non-blocking, unfixable via Helm)
     value: "America/New_York"
 
@@ -22,6 +36,8 @@ postgresql:
 extraEnvFrom: |
   - secretRef:
       name: db-credentials
+  - secretRef:
+      name: snowflake-credentials  # injects SNOWFLAKE_ACCOUNT, USER, PASSWORD, DATABASE, SCHEMA, WAREHOUSE
 
 dags:
   persistence:
@@ -82,11 +98,6 @@ scheduler:
     timeoutSeconds: 45        # Airflow 3.x loads full provider stack per jobs-check call; needs up to 45s
     failureThreshold: 5       # 5 consecutive failures (5 min) before K8s kills and restarts the pod
     periodSeconds: 60         # check every 60s — scheduler heartbeats every 5s so this avoids false positives
-    command:
-      - sh
-      - -c
-      - |
-        airflow jobs check --job-type SchedulerJob --hostname "$(hostname)"  # hostname evaluated inside pod at runtime
   # Heart of Airflow — parses DAGs and triggers tasks. Guaranteed 512Mi prevents slow scheduling under load.
   # 2Gi limit: Airflow 3.x supervisor model spawns ~15 worker subprocesses (each loads providers); OOMKilled at 1Gi.
   resources:
