@@ -61,7 +61,7 @@ ECR_IMAGE="$ECR_REGISTRY/my-flask-app:latest"
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "=== Step 1: Ensuring target directories exist on EC2 ==="
-ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs \
+ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs $EC2_HOME/airflow/docker \
     && chmod 777 $EC2_HOME/airflow/dag-mylogs"  # 777 so Airflow pod (UID 50000) can write to the PVC-backed log dir
 
 echo "=== Step 1c: Ensuring kubectl config is accessible ==="
@@ -129,6 +129,45 @@ rsync -avz --progress airflow/dags/ "$EC2_HOST:$EC2_DAG_PATH/"
 
 echo "=== Step 2b: Syncing Helm values to EC2 ==="
 rsync -avz --progress airflow/helm/values.yaml "$EC2_HOST:$EC2_HELM_PATH/"
+
+echo "=== Step 2b1: Syncing Airflow Dockerfile to EC2 ==="
+# Sync the Dockerfile so the image can be built on EC2 (image is never pushed to ECR — imported directly into K3S containerd)
+rsync -avz --progress airflow/docker/ "$EC2_HOST:$EC2_HOME/airflow/docker/"
+
+echo "=== Step 2b2: Building Airflow+dbt image and importing into K3S ==="
+# WHY build on EC2 instead of pushing to ECR:
+#   The custom airflow-dbt image only ever needs to exist on this one EC2 instance.
+#   ECR would add ~$0.15/month storage cost for no benefit. Instead we build locally
+#   and import directly into K3S's containerd image store (separate from Docker's store).
+#   pullPolicy: Never in values.yaml tells K3S to use the local image without pulling.
+#
+# WHY Docker layer cache makes this fast on repeat deploys:
+#   docker build reuses cached layers when the Dockerfile and its inputs are unchanged.
+#   Only the changed layers are rebuilt — if only DAG files changed, the dbt venv layer
+#   (the slow pip install step) is served from cache in seconds.
+ssh "$EC2_HOST" "
+    echo 'Building airflow-dbt:3.1.8-dbt image...' &&
+    docker build -t airflow-dbt:3.1.8-dbt $EC2_HOME/airflow/docker/ &&
+    echo 'Importing image into K3S containerd (bypasses Docker image store, which K3S cannot see)...' &&
+    docker save airflow-dbt:3.1.8-dbt | sudo k3s ctr images import - &&
+    echo 'Verifying image is visible to K3S...' &&
+    sudo k3s ctr images list | grep airflow-dbt
+"
+
+echo "=== Step 2c2: Syncing dbt profiles secret to EC2 ==="
+# profiles.yml is gitignored (contains dbt connection config referencing Snowflake env vars).
+# scp copies it from Mac to EC2; kubectl apply creates or updates the dbt-profiles secret idempotently.
+# The secret is mounted at /dbt/ in Airflow workers + scheduler (values.yaml extraVolumeMounts).
+# BashOperator tasks set DBT_PROFILES_DIR=/dbt so dbt finds profiles.yml at runtime.
+if [ -f "$PROJECT_ROOT/profiles.yml" ]; then
+    scp "$PROJECT_ROOT/profiles.yml" "$EC2_HOST:$EC2_HOME/profiles.yml"
+    ssh "$EC2_HOST" "kubectl create secret generic dbt-profiles \
+        --from-file=profiles.yml=$EC2_HOME/profiles.yml \
+        -n airflow-my-namespace \
+        --dry-run=client -o yaml | kubectl apply -f -"
+else
+    echo "Note: profiles.yml not found locally — skipping (create it first if dbt is not yet set up)."
+fi
 
 echo "=== Step 2d: Applying Helm values to live Airflow release ==="
 # Syncing values.yaml to EC2 (step 2b) only copies the file — it does NOT update the running

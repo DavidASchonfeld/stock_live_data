@@ -4,8 +4,9 @@ executor: LocalExecutor
 # Also override Redis image — bitnami/redis:8.2.1 doesn't exist on Docker Hub; use official Redis
 images:
   airflow:
-    repository: apache/airflow
-    tag: "3.1.8"
+    repository: airflow-dbt    # custom image built on EC2 and imported into K3S containerd — see airflow/docker/Dockerfile
+    tag: "3.1.8-dbt"           # built from apache/airflow:3.1.8 + /opt/dbt-venv (dbt-core + dbt-snowflake)
+    pullPolicy: Never          # use the locally imported image — no ECR needed, avoids registry storage cost
   redis:
     repository: redis
     tag: "7.2-bookworm"
@@ -71,9 +72,15 @@ workers:
    - name: out-volume
      persistentVolumeClaim:
        claimName:  pvc-outputtextwriter
+   - name: dbt-profiles           # mounts profiles.yml from K8s secret so BashOperator can find it at /dbt/profiles.yml
+     secret:
+       secretName: dbt-profiles   # create with: kubectl create secret generic dbt-profiles --from-file=profiles.yml=./profiles.yml -n airflow
   extraVolumeMounts:
    - name: out-volume
      mountPath: /opt/airflow/out
+   - name: dbt-profiles
+     mountPath: /dbt              # DBT_PROFILES_DIR=/dbt in BashOperator commands points dbt here
+     readOnly: true
      
 scheduler:
   # Same as in workers section
@@ -84,9 +91,15 @@ scheduler:
    - name: out-volume
      persistentVolumeClaim:
        claimName: pvc-outputtextwriter
+   - name: dbt-profiles           # LocalExecutor runs tasks in the scheduler pod — must mount here too
+     secret:
+       secretName: dbt-profiles
   extraVolumeMounts:
    - name: out-volume
      mountPath: /opt/airflow/out
+   - name: dbt-profiles
+     mountPath: /dbt              # matches DBT_PROFILES_DIR=/dbt in BashOperator bash_command
+     readOnly: true
   # Airflow 3.x loads full provider stack per jobs-check call; needs 45s. 10 chances × 30s = 5 min startup window.
   startupProbe:
     failureThreshold: 10

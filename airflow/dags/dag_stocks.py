@@ -8,6 +8,7 @@ from datetime import timedelta, date
 
 import pendulum
 from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
+from airflow.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv at /opt/dbt-venv/
 
 import pandas as pd
 from sqlalchemy import text  # text() required for raw SQL in SQLAlchemy 2.x
@@ -295,7 +296,34 @@ def stock_market_pipeline():
     # actual Python code inside each function runs later at execution time.
     staging_path: XComArg = extract()
     transformed:  XComArg = transform(staging_path)  # type: ignore[arg-type]
-    load(transformed)                             # type: ignore[arg-type]
+    load_task             = load(transformed)         # type: ignore[arg-type]
+
+    # dbt runs after RAW is loaded — builds STAGING views and MARTS tables in Snowflake
+    # DBT_PROFILES_DIR points to the K8s secret mounted at /dbt; --project-dir points to the dbt project in the DAGs PVC
+    dbt_run = BashOperator(
+        task_id="dbt_run",
+        bash_command=(
+            "DBT_PROFILES_DIR=/dbt "
+            "/opt/dbt-venv/bin/dbt run "
+            "--select tag:stocks "               # only run models tagged 'stocks' — skips weather models
+            "--project-dir /opt/airflow/dags/dbt "
+            "--no-use-colors"                    # cleaner logs in Airflow UI
+        ),
+    )
+
+    # dbt test runs after dbt run — checks not_null, unique, accepted_values, and singular tests
+    dbt_test = BashOperator(
+        task_id="dbt_test",
+        bash_command=(
+            "DBT_PROFILES_DIR=/dbt "
+            "/opt/dbt-venv/bin/dbt test "
+            "--select tag:stocks "
+            "--project-dir /opt/airflow/dags/dbt "
+            "--no-use-colors"
+        ),
+    )
+
+    load_task >> dbt_run >> dbt_test  # dbt only runs if Snowflake load succeeds
 
 
 dag = stock_market_pipeline()

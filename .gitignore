@@ -13,6 +13,8 @@ airflow_env/
 infra_local.md
 # K8s secrets with passwords — never commit
 *-secret.yaml
+# dbt credentials — never commit
+profiles.yml
 # compiled Python bytecode
 __pycache__/
 # local development notes

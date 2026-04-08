@@ -1,0 +1,57 @@
+version: 2
+
+# Built-in dbt tests — run via `dbt test --select tag:stocks` or `tag:weather` from the DAG BashOperator
+models:
+  - name: stg_company_financials
+    description: "Staged SEC EDGAR financials — types cast, nulls filtered"
+    columns:
+      - name: ticker
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['AAPL', 'MSFT', 'GOOGL']  # must match TICKERS list in dag_stocks.py
+      - name: metric
+        tests: [not_null]
+      - name: period_end
+        tests: [not_null]
+      - name: value
+        tests: [not_null]
+
+  - name: stg_weather_hourly
+    description: "Staged Open-Meteo weather — epoch seconds converted to TIMESTAMP_NTZ"
+    columns:
+      - name: observation_time
+        tests: [not_null]
+      - name: temperature_f
+        tests: [not_null]
+
+  - name: fct_company_financials
+    description: "Dashboard-ready annual financials — deduplicated, FY rows only"
+    columns:
+      - name: ticker
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['AAPL', 'MSFT', 'GOOGL']
+      - name: metric
+        tests: [not_null]
+      - name: period_end
+        tests: [not_null]
+
+  - name: dim_company
+    description: "Company dimension table — one row per ticker for dashboard dropdowns and joins"
+    columns:
+      - name: ticker
+        tests: [not_null, unique]
+      - name: cik
+        tests: [not_null]
+      - name: entity_name
+        tests: [not_null]
+
+  - name: fct_weather_hourly
+    description: "Dashboard-ready weather facts — deduplicated on observation_time + location"
+    columns:
+      - name: observation_time
+        tests: [not_null, unique]
+      - name: temperature_f
+        tests: [not_null]

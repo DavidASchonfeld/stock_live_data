@@ -1,0 +1,12 @@
+version: 2
+
+# Points dbt at the raw Snowflake tables Airflow writes to — these are the pipeline's entry point for transforms
+sources:
+  - name: raw
+    database: PIPELINE_DB
+    schema: RAW
+    tables:
+      - name: COMPANY_FINANCIALS
+        description: "Raw SEC EDGAR XBRL financials — full table replace on each dag_stocks.py run"
+      - name: WEATHER_HOURLY
+        description: "Raw Open-Meteo hourly forecasts — append-only with dedup in dag_weather.py"

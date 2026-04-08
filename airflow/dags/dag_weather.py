@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 
 import pendulum
 from airflow.sdk import dag, task, XComArg, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
+from airflow.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv at /opt/dbt-venv/
 
 
 import pandas as pd
@@ -282,8 +283,35 @@ def weather_pipeline():
     # Calling the @task functions here defines the execution order for Airflow.
     # Airflow reads these at parse time to build the DAG graph; the functions
     # themselves run later at scheduled execution time.
-    raw_data : XComArg = extract()
-    records : XComArg = transform(raw_data)
-    load(records)
+    raw_data  : XComArg = extract()
+    records   : XComArg = transform(raw_data)
+    load_task           = load(records)
+
+    # dbt runs after each load attempt — idempotent if no new rows were written (daily batch gate skipped the write)
+    # DBT_PROFILES_DIR points to the K8s secret mounted at /dbt; --project-dir points to the dbt project in the DAGs PVC
+    dbt_run = BashOperator(
+        task_id="dbt_run",
+        bash_command=(
+            "DBT_PROFILES_DIR=/dbt "
+            "/opt/dbt-venv/bin/dbt run "
+            "--select tag:weather "              # only run models tagged 'weather' — skips stocks models
+            "--project-dir /opt/airflow/dags/dbt "
+            "--no-use-colors"                   # cleaner logs in Airflow UI
+        ),
+    )
+
+    # dbt test runs after dbt run — checks not_null, unique, and accepted_values on weather models
+    dbt_test = BashOperator(
+        task_id="dbt_test",
+        bash_command=(
+            "DBT_PROFILES_DIR=/dbt "
+            "/opt/dbt-venv/bin/dbt test "
+            "--select tag:weather "
+            "--project-dir /opt/airflow/dags/dbt "
+            "--no-use-colors"
+        ),
+    )
+
+    load_task >> dbt_run >> dbt_test  # dbt only runs if load succeeds
 
 dag = weather_pipeline()  # assign to module-level variable — Airflow best practice for DAG discovery

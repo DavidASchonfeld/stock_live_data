@@ -1,0 +1,20 @@
+name: 'pipeline_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'pipeline_dbt'  # must match the top-level key in profiles.yml (mounted at /dbt/profiles.yml)
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "/tmp/dbt_target"    # write compiled SQL to /tmp — the dags PVC is read-only from the image perspective
+clean-targets: ["/tmp/dbt_target"]
+
+models:
+  pipeline_dbt:
+    staging:
+      +schema: staging        # resolved to PIPELINE_DB.STAGING by generate_schema_name macro
+      +materialized: view     # views cost zero Snowflake storage credits
+    marts:
+      +schema: marts          # resolved to PIPELINE_DB.MARTS by generate_schema_name macro
+      +materialized: table    # tables are what the dashboard queries
