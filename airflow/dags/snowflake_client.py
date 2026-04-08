@@ -57,14 +57,8 @@ def write_df_to_snowflake(
                 epoch_seconds = int(val.timestamp())
                 values.append(str(epoch_seconds))
             elif isinstance(val, str):
-                # For numeric columns that should be strings, try to convert or NULL
-                try:
-                    # Try to parse as float if it's supposed to be numeric
-                    float(val)
-                    values.append(val)
-                except ValueError:
-                    # If it's not numeric, insert NULL (handles broken schema)
-                    values.append("NULL")
+                # Escape single quotes and wrap in quotes for SQL
+                values.append(f"'{val.replace(chr(39), chr(39)*2)}'")
             else:
                 values.append(str(val))
         rows_to_insert.append(f"({','.join(values)})")
