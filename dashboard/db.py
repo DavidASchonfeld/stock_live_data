@@ -1,4 +1,5 @@
 import os
+import time
 
 import pandas as pd
 from dotenv import load_dotenv  # reads .env for local dev; no-op in production
@@ -35,6 +36,23 @@ else:
     )
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Query cache (cost optimization #2) ───────────────────────────────────────
+CACHE_TTL_FINANCIALS = 3600   # 1 hour — SEC filings change at most daily
+CACHE_TTL_WEATHER    = 900    # 15 min — reserved for future weather queries
+_QUERY_CACHE: dict = {}       # {key: (dataframe, expires_at)}
+
+def _cache_get(key: str):
+    """Return cached value if present and not expired, else None."""
+    entry = _QUERY_CACHE.get(key)
+    if entry and time.monotonic() < entry[1]:
+        return entry[0]
+    return None
+
+def _cache_set(key: str, value, ttl: int) -> None:
+    """Store value with a monotonic expiry timestamp."""
+    _QUERY_CACHE[key] = (value, time.monotonic() + ttl)
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def _load_ticker_data(ticker: str) -> pd.DataFrame:
     """Query MariaDB for annual Revenue and Net Income rows from company_financials.
@@ -45,6 +63,12 @@ def _load_ticker_data(ticker: str) -> pd.DataFrame:
     handles reuse and cleanup automatically.
     Filters to fiscal_period='FY' to return one row per metric per annual filing.
     """
+    # Return cached result if still fresh
+    cache_key = f"financials:{ticker}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     # :ticker is a SQLAlchemy named bind parameter; its value is supplied by params={"ticker": ticker} below
     query = text("""
         SELECT metric, label, period_end, value, fiscal_year, fiscal_period
@@ -58,6 +82,7 @@ def _load_ticker_data(ticker: str) -> pd.DataFrame:
         df = pd.read_sql(query, conn, params={"ticker": ticker})
     # Cast period_end to datetime so Plotly renders the x-axis correctly
     df["period_end"] = pd.to_datetime(df["period_end"])
+    _cache_set(cache_key, df, CACHE_TTL_FINANCIALS)
     return df
 
 

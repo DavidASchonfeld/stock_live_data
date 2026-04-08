@@ -3,11 +3,10 @@
 import os
 import json
 from typing import Annotated, Any, cast
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 import pendulum
-
-from airflow.sdk import dag, task, XComArg  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
+from airflow.sdk import dag, task, XComArg, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 
 
 import pandas as pd
@@ -141,7 +140,8 @@ def weather_pipeline():
     def load(inData):
         """
         ### Load Task
-        Push transformed rows into MariaDB (table: weather_hourly) via SQLAlchemy.
+        Push transformed rows into MariaDB (table: weather_hourly) via SQLAlchemy hourly.
+        Writes to Snowflake only once per day (daily batch gate cost optimization).
         Deduplicates on (time, latitude, longitude) before inserting to prevent
         unbounded table growth when the DAG reruns within the same forecast window.
         """
@@ -205,46 +205,68 @@ def weather_pipeline():
                 # index = False means: don't write the Pandas Dataframe's index into the SQL table
                 writer.log(f"Loaded {len(new_rows)} new rows into weather_hourly table")
 
-            # Dual-write to Snowflake — dedup against Snowflake independently from MariaDB
+            # ─── Daily Batch Gate: Snowflake write only once per day (cost optimization) ───
+            today_iso = date.today().isoformat()
             try:
-                from snowflake_client import write_df_to_snowflake
-                from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-                # Check which timestamps already exist in Snowflake (separate from MariaDB dedup)
-                sf_hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
-                sf_conn = sf_hook.get_conn()
-                sf_cur = sf_conn.cursor()
+                last_write = Variable.get("SF_WEATHER_LAST_WRITE_DATE")
+            except KeyError:
+                last_write = ""  # Variable doesn't exist yet (first run)
+            should_write_snowflake = (last_write != today_iso)
+
+            if should_write_snowflake:
+                writer.log(f"Daily batch gate: last write was {last_write}, today is {today_iso} — proceeding with Snowflake write")
+            else:
+                writer.log(f"Daily batch gate: already wrote to Snowflake today ({today_iso}) — skipping Snowflake write")
+
+            # Dual-write to Snowflake — dedup against Snowflake independently from MariaDB
+            if should_write_snowflake:
                 try:
-                    sf_cur.execute("SELECT TIME FROM PIPELINE_DB.RAW.WEATHER_HOURLY")
-                    # TIME column is NUMBER(38,0) storing epoch seconds; convert to int for comparison
-                    sf_existing = {int(row[0]) for row in sf_cur.fetchall()}
-                    writer.log(f"Snowflake has {len(sf_existing)} existing timestamps")
-                except Exception as query_err:
-                    writer.log(f"Snowflake table doesn't exist yet or query failed: {query_err}")
-                    sf_existing = set()  # table doesn't exist yet
-                sf_cur.close()
-                sf_conn.close()
-                # Convert df["time"] ISO strings to epoch seconds for comparison with Snowflake NUMBER column
-                df_times_epoch = pd.to_datetime(df["time"]).astype(int) // 10**9  # ns to seconds
-                sf_new_rows = df[~df_times_epoch.isin(sf_existing)].copy()
-                writer.log(f"Snowflake dedup: {len(sf_existing)} existing, {len(sf_new_rows)} new rows")
-                if len(sf_new_rows) > 0:
-                    # Cast ALL columns to match Snowflake table schema exactly
-                    sf_new_rows = sf_new_rows.copy()
-                    sf_new_rows["time"] = pd.to_datetime(sf_new_rows["time"])
-                    sf_new_rows["imported_at"] = pd.to_datetime(sf_new_rows["imported_at"])
-                    sf_new_rows["temperature_2m"] = sf_new_rows["temperature_2m"].astype(float)
-                    sf_new_rows["latitude"] = sf_new_rows["latitude"].astype(float)
-                    sf_new_rows["longitude"] = sf_new_rows["longitude"].astype(float)
-                    sf_new_rows["elevation"] = sf_new_rows["elevation"].astype(float)
-                    sf_new_rows["timezone"] = sf_new_rows["timezone"].astype(str)  # explicitly cast to str
-                    sf_new_rows["utc_offset_seconds"] = sf_new_rows["utc_offset_seconds"].astype("int64")
-                    write_df_to_snowflake(sf_new_rows, "WEATHER_HOURLY", overwrite=False)
-                    writer.log(f"Loaded {len(sf_new_rows)} rows into Snowflake WEATHER_HOURLY")
-                else:
-                    writer.log("No new rows to insert into Snowflake — all timestamps already present")
-            except Exception as sf_err:
-                writer.log(f"[ERROR] Snowflake write failed: {sf_err}")
-                raise  # Re-raise so the DAG task fails and you see the error
+                    from snowflake_client import write_df_to_snowflake
+                    from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
+                    # Check which timestamps already exist in Snowflake (separate from MariaDB dedup)
+                    sf_hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
+                    sf_conn = sf_hook.get_conn()
+                    sf_cur = sf_conn.cursor()
+                    try:
+                        sf_cur.execute("SELECT TIME FROM PIPELINE_DB.RAW.WEATHER_HOURLY")
+                        # TIME column is NUMBER(38,0) storing epoch seconds; convert to int for comparison
+                        sf_existing = {int(row[0]) for row in sf_cur.fetchall()}
+                        writer.log(f"Snowflake has {len(sf_existing)} existing timestamps")
+                    except Exception as query_err:
+                        writer.log(f"Snowflake table doesn't exist yet or query failed: {query_err}")
+                        sf_existing = set()  # table doesn't exist yet
+                    sf_cur.close()
+                    sf_conn.close()
+                    # Convert df["time"] ISO strings to epoch seconds for comparison with Snowflake NUMBER column
+                    df_times_epoch = pd.to_datetime(df["time"]).astype(int) // 10**9  # ns to seconds
+                    sf_new_rows = df[~df_times_epoch.isin(sf_existing)].copy()
+                    writer.log(f"Snowflake dedup: {len(sf_existing)} existing, {len(sf_new_rows)} new rows")
+                    if len(sf_new_rows) > 0:
+                        # Cast ALL columns to match Snowflake table schema exactly
+                        sf_new_rows = sf_new_rows.copy()
+                        sf_new_rows["time"] = pd.to_datetime(sf_new_rows["time"])
+                        sf_new_rows["imported_at"] = pd.to_datetime(sf_new_rows["imported_at"])
+                        sf_new_rows["temperature_2m"] = sf_new_rows["temperature_2m"].astype(float)
+                        sf_new_rows["latitude"] = sf_new_rows["latitude"].astype(float)
+                        sf_new_rows["longitude"] = sf_new_rows["longitude"].astype(float)
+                        sf_new_rows["elevation"] = sf_new_rows["elevation"].astype(float)
+                        sf_new_rows["timezone"] = sf_new_rows["timezone"].astype(str)  # explicitly cast to str
+                        sf_new_rows["utc_offset_seconds"] = sf_new_rows["utc_offset_seconds"].astype("int64")
+                        write_df_to_snowflake(sf_new_rows, "WEATHER_HOURLY", overwrite=False)
+                        writer.log(f"Loaded {len(sf_new_rows)} rows into Snowflake WEATHER_HOURLY")
+                        # Update gate variable after successful write
+                        Variable.set("SF_WEATHER_LAST_WRITE_DATE", today_iso)
+                        writer.log(f"Updated SF_WEATHER_LAST_WRITE_DATE to {today_iso}")
+                    else:
+                        writer.log("No new rows to insert into Snowflake — all timestamps already present")
+                        # Still update gate variable even if no new rows (prevents retry writes)
+                        Variable.set("SF_WEATHER_LAST_WRITE_DATE", today_iso)
+                        writer.log(f"Updated SF_WEATHER_LAST_WRITE_DATE to {today_iso} (no new rows)")
+                except Exception as sf_err:
+                    writer.log(f"[ERROR] Snowflake write failed: {sf_err}")
+                    raise  # Re-raise so the DAG task fails and you see the error
+            else:
+                writer.log("Snowflake write skipped by daily batch gate — MariaDB write already completed")
 
         except SQLAlchemyError as e:
             writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")  # write to PVC so error is readable without the Airflow UI (UI has 404 encoding bug on run IDs with '+')

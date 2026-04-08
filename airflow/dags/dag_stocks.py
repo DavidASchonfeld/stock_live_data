@@ -4,11 +4,10 @@ import os
 import json
 import time
 from typing import Any
-from datetime import timedelta
+from datetime import timedelta, date
 
 import pendulum
-
-from airflow.sdk import dag, task, XComArg, get_current_context  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
+from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 
 import pandas as pd
 from sqlalchemy import text  # text() required for raw SQL in SQLAlchemy 2.x
@@ -199,7 +198,8 @@ def stock_market_pipeline():
     def load(records: list[dict[str, Any]]) -> None:
         """
         ### Load
-        Push transformed rows into MariaDB (table: company_financials).
+        Push transformed rows into MariaDB (table: company_financials) daily.
+        Writes to Snowflake only once per day (daily batch gate cost optimization).
 
         Uses REPLACE strategy: drops and recreates the table on each run because
         SEC EDGAR companyfacts returns ALL historical data in every response.
@@ -252,13 +252,32 @@ def stock_market_pipeline():
             # index = False means: don't write the Pandas Dataframe's index into the SQL table
             writer.log(f"Loaded {len(df)} rows into company_financials table")  # confirm row count written
 
-            # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
+            # ─── Daily Batch Gate: Snowflake write only once per day (cost optimization) ───
+            today_iso = date.today().isoformat()
             try:
-                from snowflake_client import write_df_to_snowflake
-                write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
-                writer.log(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
-            except Exception as sf_err:
-                writer.log(f"Snowflake write skipped (not yet configured): {sf_err}")
+                last_write = Variable.get("SF_STOCKS_LAST_WRITE_DATE")
+            except KeyError:
+                last_write = ""  # Variable doesn't exist yet (first run)
+            should_write_snowflake = (last_write != today_iso)
+
+            if should_write_snowflake:
+                writer.log(f"Daily batch gate: last write was {last_write}, today is {today_iso} — proceeding with Snowflake write")
+            else:
+                writer.log(f"Daily batch gate: already wrote to Snowflake today ({today_iso}) — skipping Snowflake write")
+
+            # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
+            if should_write_snowflake:
+                try:
+                    from snowflake_client import write_df_to_snowflake
+                    write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
+                    writer.log(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
+                    # Update gate variable after successful write
+                    Variable.set("SF_STOCKS_LAST_WRITE_DATE", today_iso)
+                    writer.log(f"Updated SF_STOCKS_LAST_WRITE_DATE to {today_iso}")
+                except Exception as sf_err:
+                    writer.log(f"Snowflake write skipped (not yet configured): {sf_err}")
+            else:
+                writer.log("Snowflake write skipped by daily batch gate — MariaDB write already completed")
 
         except SQLAlchemyError as e:
             # Re-raise so task fails and Airflow can retry (instead of silent failure)

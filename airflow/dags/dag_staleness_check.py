@@ -22,7 +22,7 @@ from alerting import on_failure_alert, on_retry_alert, check_data_staleness  # S
         'on_retry_callback': on_retry_alert,
     },
     description="Monitors data freshness in company_financials and weather_hourly tables",
-    schedule=timedelta(minutes=30),  # less frequent than data DAGs — just a health check
+    schedule=None,  # Manual trigger only to minimize Snowflake query costs (cost optimization)
     start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York"),
     catchup=False,
     tags=["monitoring", "alerting", "staleness"]
@@ -33,6 +33,8 @@ def data_staleness_monitor():
 
     Checks how old the latest data is in each table and sends a Slack alert
     (or logs) if any table exceeds its freshness threshold.
+
+    **Manual trigger only** — run via Airflow UI or API to avoid repeated Snowflake queries.
 
     Respects vacation mode — stale data is expected when pipelines are paused.
     """

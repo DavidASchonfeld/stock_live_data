@@ -98,7 +98,7 @@ except ImportError:
     sys.exit(0)
 
 # Try importing all DAG files
-dag_files = ['dag_stocks', 'dag_weather']
+dag_files = ['dag_stocks', 'dag_weather', 'dag_staleness_check']
 for dag_file in dag_files:
     try:
         __import__(dag_file)
