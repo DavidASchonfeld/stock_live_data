@@ -11,9 +11,10 @@
 with deduplicated as (
     select
         *,
-        -- keep most recently imported row if same observation_time + location appears more than once
+        -- single-location pipeline: observation_time is the primary key; partition by it alone
+        -- so the unique test in schema.yml holds even if Open-Meteo snaps coordinates differently across calls
         row_number() over (
-            partition by observation_time, latitude, longitude
+            partition by observation_time
             order by imported_at desc nulls last
         ) as rn
     from {{ ref('stg_weather_hourly') }}  -- reads from PIPELINE_DB.STAGING.STG_WEATHER_HOURLY view

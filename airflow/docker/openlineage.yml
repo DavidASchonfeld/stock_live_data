@@ -1,0 +1,5 @@
+# OpenLineage transport config — used by dbt via OPENLINEAGE_CONFIG=/opt/openlineage.yml
+# console transport: emits events to stdout, visible in Airflow task logs (no external service needed)
+# To switch to Marquez: change type to "http" and add config.url: http://marquez:5000
+transport:
+  type: console

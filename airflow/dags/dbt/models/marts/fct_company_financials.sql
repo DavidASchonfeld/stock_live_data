@@ -11,10 +11,10 @@
 with deduplicated as (
     select
         *,
-        -- keep the most recently filed row when duplicates exist for the same reporting period
+        -- keep the most recently filed row; frame asc breaks ties deterministically when filed_date is the same date
         row_number() over (
             partition by ticker, metric, period_end, fiscal_period
-            order by filed_date desc nulls last
+            order by filed_date desc nulls last, frame asc nulls last
         ) as rn
     from {{ ref('stg_company_financials') }}  -- reads from PIPELINE_DB.STAGING.STG_COMPANY_FINANCIALS view
     where fiscal_period = 'FY'  -- annual filings only — matches annual_only=True in dag_stocks.py

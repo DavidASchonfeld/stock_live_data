@@ -20,11 +20,27 @@ imagePullSecrets:
 # requests>=2.32.3: pins requests to a version that supports urllib3 2.x (fixes RequestsDependencyWarning)
 # apache-airflow-providers-common-compat>=1.5.0: upgrades the compat shim that was importing the
 #   deprecated airflow.security.permissions module (fixes RemovedInAirflow4Warning on dags list)
+# NOTE: do NOT pin apache-airflow-providers-snowflake or snowflake-connector-python here —
+#   apache/airflow:3.1.8 already bundles 6.10.0 / 4.0.0; pinning older ==5.6.1 / ==3.10.1
+#   causes pip to downgrade them at every pod startup (~7 min download), breaking the startup probe
 env:
   - name: _PIP_ADDITIONAL_REQUIREMENTS
-    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0 apache-airflow-providers-snowflake==5.6.1 snowflake-connector-python==3.10.1"
+    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0"
   - name: AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE  # prevents moment.tz.guess() on login; moment.tz() error on Home Page is a known Airflow 3.x cosmetic bug (non-blocking, unfixable via Helm)
     value: "America/New_York"
+  # OpenLineage — native to Airflow 3.x (apache-airflow-providers-openlineage bundled)
+  # console transport: emits events to stdout (visible per-task in Airflow logs)
+  # To switch to Marquez: change to '{"type": "http", "config": {"url": "http://marquez:5000"}}'
+  - name: AIRFLOW__OPENLINEAGE__TRANSPORT
+    value: '{"type": "console"}'
+  - name: AIRFLOW__OPENLINEAGE__NAMESPACE  # groups all jobs under one lineage namespace in Marquez/Atlan
+    value: "pipeline"
+  - name: AIRFLOW__OPENLINEAGE__EXECUTION_TIMEOUT  # seconds before the OL subprocess is killed; default 10s is too short for slow provider imports on t3.large
+    value: "60"
+  - name: AIRFLOW__CORE__MP_START_METHOD
+    value: "spawn"   # Python 3.12+: use spawn instead of fork to avoid deadlocks in multi-threaded scheduler
+  - name: PYTHONWARNINGS
+    value: "ignore:This process:DeprecationWarning"   # suppress LocalExecutor os.fork() warning — harmless, Airflow calls os.fork() directly bypassing MP_START_METHOD
 
 # Override postgresql image: chart default tag (16.1.0-debian-11-r15) removed from Docker Hub; ECR Public has no rate limits from EC2
 postgresql:

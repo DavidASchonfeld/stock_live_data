@@ -8,18 +8,15 @@ from datetime import timedelta, date
 
 import pendulum
 from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
-from airflow.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv at /opt/dbt-venv/
+from airflow.providers.standard.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv at /opt/dbt-venv/
 
 import pandas as pd
-from sqlalchemy import text  # text() required for raw SQL in SQLAlchemy 2.x
 from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
 from edgar_client import resolve_cik, fetch_company_facts, flatten_company_financials  # SEC EDGAR XBRL API calls and data flattening
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
-from shared.config import DB_USER, DB_PASSWORD, DB_NAME, DB_HOST
-from shared.db import make_mariadb_engine
 from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
 from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack + PVC log alerts on task failure/retry/recovery
 
@@ -57,7 +54,7 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]  # Must match TICKERS in dashboar
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
     },
-    description="Company financials pipeline: SEC EDGAR XBRL → MariaDB (→ Snowflake in Step 2)",
+    description="Company financials pipeline: SEC EDGAR XBRL → Snowflake → dbt",
     schedule=timedelta(days=1),  # Daily: SEC EDGAR companyfacts updates only when companies file (≈annually)
     # start_date must be in the past for Airflow to schedule the first run immediately
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
@@ -67,7 +64,7 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]  # Must match TICKERS in dashboar
     # We skip that because SEC EDGAR companyfacts already returns all historical data
     # in the very first successful run.
     catchup=False,  # don't backfill historical runs when DAG is first deployed
-    tags=["stocks", "sec_edgar", "financials", "mariadb", "portfolio"]
+    tags=["stocks", "sec_edgar", "financials", "snowflake", "portfolio"]
 )
 def stock_market_pipeline():
     """
@@ -75,18 +72,12 @@ def stock_market_pipeline():
 
     Pulls financial data (revenue, net income, EPS, assets, etc.) for a list
     of tickers from SEC EDGAR's XBRL API, flattens the nested XBRL JSON into
-    a tabular format, and loads it into MariaDB.
+    a tabular format, and loads it into Snowflake (RAW schema).
 
     Data source: SEC EDGAR (U.S. government, public domain, no API key needed)
 
     #### Pipeline stages:
-    extract()  →  transform()  →  load()
-
-    #### TODO (Step 2 of career plan):
-    Replace the MariaDB load with a Snowflake load:
-        - Install: apache-airflow-providers-snowflake, snowflake-connector-python
-        - Add a Snowflake Connection in the Airflow UI
-        - Use SnowflakeHook + write_pandas() instead of SQLAlchemy to_sql()
+    extract()  →  transform()  →  load()  →  dbt_run  →  dbt_test
     """
 
     @task()
@@ -199,20 +190,11 @@ def stock_market_pipeline():
     def load(records: list[dict[str, Any]]) -> None:
         """
         ### Load
-        Push transformed rows into MariaDB (table: company_financials) daily.
-        Writes to Snowflake only once per day (daily batch gate cost optimization).
+        Push transformed rows into Snowflake (table: COMPANY_FINANCIALS) once per day.
+        Uses a daily batch gate to avoid redundant Snowflake cold-starts (cost optimization).
 
-        Uses REPLACE strategy: drops and recreates the table on each run because
-        SEC EDGAR companyfacts returns ALL historical data in every response.
-        This avoids duplicate rows without needing a primary key or upsert logic.
-
-        #### TODO (Step 2 of career plan):
-        Swap MariaDB for Snowflake:
-            from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-            from snowflake.connector.pandas_tools import write_pandas
-            hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
-            conn = hook.get_conn()
-            write_pandas(conn, df, "RAW_COMPANY_FINANCIALS", auto_create_table=True)
+        Uses REPLACE strategy: SEC EDGAR companyfacts returns ALL historical data in every
+        response, so we replace the entire table to avoid duplicates without needing upserts.
         """
         # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
@@ -221,67 +203,41 @@ def stock_market_pipeline():
         # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
         # which would cause issues.
 
-        # Validate DB secrets at task-execution time (not parse time) — prevents DAG parse failures when secrets aren't yet mounted
-        _missing = [k for k in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_NAME"] if not os.getenv(k)]
-        if _missing:
-            raise RuntimeError(f"Missing Kubernetes secrets: {_missing}. Ensure db-credentials secret is mounted.")
-
         print(str(records[:2]))  # log first 2 rows so Airflow task log shows data arrived
         writer.log(str(records[:2]))
 
-        # list-of-dicts → flat DataFrame ready for SQL
+        # list-of-dicts → flat DataFrame ready for Snowflake write
         df: pd.DataFrame = pd.DataFrame(records)
 
+        # ─── Daily Batch Gate: write to Snowflake only once per day (cost optimization) ───
+        today_iso = date.today().isoformat()
         try:
-            engine = make_mariadb_engine()
+            last_write = Variable.get("SF_STOCKS_LAST_WRITE_DATE")
+        except KeyError:
+            last_write = ""  # Variable doesn't exist yet (first run)
+        should_write_snowflake = (last_write != today_iso)
 
-            with engine.connect() as connection:
-                result_one = connection.execute(text("SELECT 1"))  # text() wrapper required by SQLAlchemy 2.x
-                print(f"Success! {result_one.scalar()}")
+        if should_write_snowflake:
+            writer.log(f"Daily batch gate: last write was {last_write}, today is {today_iso} — proceeding with Snowflake write")
+        else:
+            writer.log(f"Daily batch gate: already wrote to Snowflake today ({today_iso}) — skipping")
+            return
 
+        try:
             writer.log("--- Pre-insert DataFrame preview ---")
             writer.log(str(df.head()))
             writer.log(str(df.dtypes))
-            writer.log("--- DataFrame dtypes ---")
 
-            ### THIS LINE PUTS THE STUFF INTO SQL DATABASE, AUTOMATICALLY CONVERTING IT INTO A SQL OBJECT
-            # if_exists="replace": SEC EDGAR returns ALL historical data each call, so we
-            # replace the entire table to avoid duplicates. Unlike Alpha Vantage (which
-            # returned only recent data and needed "append"), EDGAR gives us everything.
-            df.to_sql("company_financials", con=engine, if_exists="replace", index=False)
+            from snowflake_client import write_df_to_snowflake
+            # if_exists="replace": EDGAR returns ALL historical data each call, so replace avoids duplicates
+            write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
+            writer.log(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
 
-            # index = False means: don't write the Pandas Dataframe's index into the SQL table
-            writer.log(f"Loaded {len(df)} rows into company_financials table")  # confirm row count written
-
-            # ─── Daily Batch Gate: Snowflake write only once per day (cost optimization) ───
-            today_iso = date.today().isoformat()
-            try:
-                last_write = Variable.get("SF_STOCKS_LAST_WRITE_DATE")
-            except KeyError:
-                last_write = ""  # Variable doesn't exist yet (first run)
-            should_write_snowflake = (last_write != today_iso)
-
-            if should_write_snowflake:
-                writer.log(f"Daily batch gate: last write was {last_write}, today is {today_iso} — proceeding with Snowflake write")
-            else:
-                writer.log(f"Daily batch gate: already wrote to Snowflake today ({today_iso}) — skipping Snowflake write")
-
-            # Dual-write to Snowflake — soft fail so MariaDB load still succeeds before Snowflake is wired up
-            if should_write_snowflake:
-                try:
-                    from snowflake_client import write_df_to_snowflake
-                    write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
-                    writer.log(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
-                    # Update gate variable after successful write
-                    Variable.set("SF_STOCKS_LAST_WRITE_DATE", today_iso)
-                    writer.log(f"Updated SF_STOCKS_LAST_WRITE_DATE to {today_iso}")
-                except Exception as sf_err:
-                    writer.log(f"Snowflake write skipped (not yet configured): {sf_err}")
-            else:
-                writer.log("Snowflake write skipped by daily batch gate — MariaDB write already completed")
+            # Update gate variable after successful write
+            Variable.set("SF_STOCKS_LAST_WRITE_DATE", today_iso)
+            writer.log(f"Updated SF_STOCKS_LAST_WRITE_DATE to {today_iso}")
 
         except SQLAlchemyError as e:
-            # Re-raise so task fails and Airflow can retry (instead of silent failure)
             writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")
             raise
         except Exception as e:
@@ -303,8 +259,13 @@ def stock_market_pipeline():
     dbt_run = BashOperator(
         task_id="dbt_run",
         bash_command=(
+            "mkdir -p /tmp/dbt_target /tmp/dbt_logs && "  # ensure artifact dirs exist before dbt-ol runs
+            "PATH=/opt/dbt-venv/bin:$PATH "      # ensures dbt-ol's internal subprocess.Popen(['dbt']) resolves correctly
             "DBT_PROFILES_DIR=/dbt "
-            "/opt/dbt-venv/bin/dbt run "
+            "OPENLINEAGE_CONFIG=/opt/openlineage.yml "  # emits lineage events via console transport
+            "DBT_TARGET_PATH=/tmp/dbt_target "   # dbt-ol uses this env var for both artifact writing and post-run reading
+            "DBT_LOG_PATH=/tmp/dbt_logs "        # dbt 1.8+: replaces deprecated log-path in dbt_project.yml
+            "/opt/dbt-venv/bin/dbt-ol run "      # dbt-ol wraps dbt run and emits OpenLineage events after completion
             "--select tag:stocks "               # only run models tagged 'stocks' — skips weather models
             "--project-dir /opt/airflow/dags/dbt "
             "--no-use-colors"                    # cleaner logs in Airflow UI
@@ -315,8 +276,13 @@ def stock_market_pipeline():
     dbt_test = BashOperator(
         task_id="dbt_test",
         bash_command=(
+            "mkdir -p /tmp/dbt_target /tmp/dbt_logs && "  # ensure artifact dirs exist before dbt-ol runs
+            "PATH=/opt/dbt-venv/bin:$PATH "      # ensures dbt-ol's internal subprocess.Popen(['dbt']) resolves correctly
             "DBT_PROFILES_DIR=/dbt "
-            "/opt/dbt-venv/bin/dbt test "
+            "OPENLINEAGE_CONFIG=/opt/openlineage.yml "  # emits lineage events via console transport
+            "DBT_TARGET_PATH=/tmp/dbt_target "   # dbt-ol uses this env var for artifact reading and writing
+            "DBT_LOG_PATH=/tmp/dbt_logs "        # dbt 1.8+: write log file to /tmp, not project-dir
+            "/opt/dbt-venv/bin/dbt-ol test "     # dbt-ol wraps dbt test and emits events after completion
             "--select tag:stocks "
             "--project-dir /opt/airflow/dags/dbt "
             "--no-use-colors"

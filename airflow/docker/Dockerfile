@@ -16,6 +16,11 @@ RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install \
          dbt-core==1.8.0 \
          dbt-snowflake==1.8.0 \
+         openlineage-dbt \
     && chown -R airflow: /opt/dbt-venv
+
+# OpenLineage config — console transport writes events to stdout (visible in Airflow task logs)
+# To use Marquez instead, replace "console" with: type: http\n  config:\n    url: http://marquez:5000
+COPY --chown=airflow:root openlineage.yml /opt/openlineage.yml
 
 USER airflow

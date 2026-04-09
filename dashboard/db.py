@@ -26,7 +26,7 @@ if DB_BACKEND == "snowflake":
         user=os.environ.get("SNOWFLAKE_USER"),
         password=os.environ.get("SNOWFLAKE_PASSWORD"),
         database=os.environ.get("SNOWFLAKE_DATABASE", "PIPELINE_DB"),
-        schema=os.environ.get("SNOWFLAKE_SCHEMA", "RAW"),
+        schema=os.environ.get("SNOWFLAKE_SCHEMA", "MARTS"),  # dashboard reads MARTS, not RAW
         warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "PIPELINE_WH"),
     ))
 else:
@@ -34,6 +34,8 @@ else:
     DB_ENGINE = create_engine(
         f"mysql+pymysql://{SQL_USERNAME}:{SQL_PASSWORD}@{SQL_URL}/{SQL_DATABASE}"
     )
+# Table name differs by backend — Snowflake uses the dbt MARTS output table
+_FINANCIALS_TABLE = "FCT_COMPANY_FINANCIALS" if DB_BACKEND == "snowflake" else "company_financials"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Query cache (cost optimization #2) ───────────────────────────────────────
@@ -70,9 +72,10 @@ def _load_ticker_data(ticker: str) -> pd.DataFrame:
         return cached
 
     # :ticker is a SQLAlchemy named bind parameter; its value is supplied by params={"ticker": ticker} below
-    query = text("""
+    # _FINANCIALS_TABLE is a hardcoded constant (not user input) so f-string is safe here
+    query = text(f"""
         SELECT metric, label, period_end, value, fiscal_year, fiscal_period
-        FROM company_financials
+        FROM {_FINANCIALS_TABLE}
         WHERE ticker = :ticker
           AND metric IN ('Revenues', 'NetIncomeLoss')
           AND fiscal_period = 'FY'
