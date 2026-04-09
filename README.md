@@ -1,8 +1,8 @@
 # data_pipeline
 
-> **Status: In Progress — Step 1 of 2**
-> Step 1 (current): Airflow + MariaDB + Flask/Dash on AWS EC2/K3S — fully operational.
-> Step 2 (planned): Migrate storage to Snowflake, add Kafka streaming layer.
+> **Status: Step 2 In Progress**
+> Step 1 ✓ Airflow + MariaDB + Flask/Dash on EC2/K3S — complete.
+> Step 2 (current): Snowflake ✓ · dbt ✓ · Kafka streaming — in progress.
 
 End-to-end data pipeline that pulls daily stock financials (AAPL, MSFT, GOOGL) from SEC EDGAR and hourly weather data from Open-Meteo, stores them in MariaDB, and serves an interactive Plotly/Dash dashboard — orchestrated by Apache Airflow and hosted on AWS EC2 via K3S Kubernetes.
 
@@ -42,13 +42,17 @@ AWS EC2 t3.large (2 vCPU, 8 GB RAM, 100 GiB EBS)
     │
     ├── Pod: PostgreSQL   (Airflow metadata DB — not your data)
     │
+    ├── Pod: Apache Kafka 4.0  (StatefulSet, KRaft mode, 2Gi PVC)
+    │   ├── stocks.financials.raw   (1 partition, 48h/100MB retention)
+    │   └── weather.hourly.raw     (1 partition, 48h/100MB retention)
+    │
     └── PersistentVolumes (hostPath on EC2 disk)
         ├── DAG files     /home/ubuntu/airflow/dags
         ├── Airflow logs  /home/ubuntu/airflow_logs
         └── Task logs     /home/ubuntu/airflow/out
 ```
 
-**Data flow:** API → `extract()` → `transform()` (pandas) → `load()` (SQLAlchemy → MariaDB) → Flask/Dash → browser.
+**Data flow:** API → `extract()` → `transform()` → Kafka topic → consumer DAG → `load()` (SQLAlchemy → Snowflake) → dbt → Flask/Dash → browser.
 
 **Why K3S?** Full Kubernetes features (auto-restart, rolling updates, health probes) at ~$110/month for a single EC2 instance, vs. $100+/month just for an EKS cluster fee.
 
@@ -60,6 +64,9 @@ AWS EC2 t3.large (2 vCPU, 8 GB RAM, 100 GiB EBS)
 |---|---|
 | Language | Python 3.12 |
 | Orchestration | Apache Airflow 3.1.8 (TaskFlow API, LocalExecutor, Helm 1.20.0) |
+| Streaming | Apache Kafka 4.0 (KRaft mode, plain K8s StatefulSet) |
+| Data warehouse | Snowflake (producer → consumer → Snowflake via SQLAlchemy) |
+| Transformations | dbt (models + tests run by consumer DAGs post-load) |
 | Web / Dashboard | Flask 2.3.3 + Dash 2.17.1 + Plotly 5.22.0 |
 | Database | MariaDB (MySQL-compatible, runs on EC2 outside K8s) |
 | Container runtime | containerd (via K3S), images stored in AWS ECR |
@@ -99,12 +106,25 @@ ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
 
 ---
 
+## Design Decisions
+
+**Kafka: plain StatefulSet over Strimzi Operator**
+Kafka runs as a hand-rolled Kubernetes StatefulSet using the official `docker.io/apache/kafka:4.0.0`
+image (ASF-maintained, free, KRaft-only) rather than via the Strimzi operator. Strimzi is the
+production-grade K8s-native choice, but its operator adds ~200 MB of RAM overhead — a real concern
+on the t3.large (8 GB RAM) already running K3s, Airflow, Postgres, and Redis. Upgrading to a larger
+EC2 instance is not financially viable for a portfolio project. The StatefulSet approach keeps
+K8s primitives transparent and can be migrated to Strimzi later without any changes to the
+Kafka client code in the DAGs.
+
+---
+
 ## Roadmap
 
 | Step | Status | Description |
 |---|---|---|
-| Step 1 | **In progress** | Airflow + MariaDB + Flask/Dash on EC2/K3S |
-| Step 2 | Planned | Replace MariaDB with Snowflake; add Kafka streaming layer |
+| Step 1 | ✓ Complete | Airflow + MariaDB + Flask/Dash on EC2/K3S |
+| Step 2 | **In progress** | Snowflake ✓ · dbt ✓ · Kafka streaming layer — in progress |
 
 ---
 

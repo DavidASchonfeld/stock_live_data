@@ -61,7 +61,7 @@ ECR_IMAGE="$ECR_REGISTRY/my-flask-app:latest"
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "=== Step 1: Ensuring target directories exist on EC2 ==="
-ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs $EC2_HOME/airflow/docker \
+ssh "$EC2_HOST" "mkdir -p $EC2_DAG_PATH $EC2_HELM_PATH $EC2_BUILD_PATH $EC2_DASHBOARD_PATH/manifests $EC2_HOME/airflow/dag-mylogs $EC2_HOME/airflow/docker $EC2_HOME/kafka/k8s \
     && chmod 777 $EC2_HOME/airflow/dag-mylogs"  # 777 so Airflow pod (UID 50000) can write to the PVC-backed log dir
 
 echo "=== Step 1c: Ensuring kubectl config is accessible ==="
@@ -98,7 +98,7 @@ except ImportError:
     sys.exit(0)
 
 # Try importing all DAG files
-dag_files = ['dag_stocks', 'dag_weather', 'dag_staleness_check']
+dag_files = ['dag_stocks', 'dag_weather', 'dag_staleness_check', 'dag_stocks_consumer', 'dag_weather_consumer']
 for dag_file in dag_files:
     try:
         __import__(dag_file)
@@ -154,6 +154,86 @@ ssh "$EC2_HOST" "
     sudo k3s ctr images list | grep airflow-dbt
 "
 
+echo "=== Step 2b3: Syncing Kafka manifests to EC2 ==="
+# plain k8s manifest replaces the old bitnami Helm chart (no Helm dependency, no paywall)
+rsync -avz --progress kafka/k8s/ "$EC2_HOST:$EC2_HOME/kafka/k8s/"
+
+echo "=== Step 2b4: Deploying Kafka to K3s (idempotent) ==="
+# kubectl apply is idempotent — safe to run on every deploy whether Kafka exists or not.
+# Kafka lives in its own 'kafka' namespace, separate from airflow-my-namespace.
+ssh "$EC2_HOST" "
+    # Create kafka namespace if it doesn't exist
+    kubectl create namespace kafka --dry-run=client -o yaml | kubectl apply -f -
+
+    # Apply StatefulSet + Services from the plain manifest
+    kubectl apply -f $EC2_HOME/kafka/k8s/kafka.yaml \
+    && echo 'Kafka manifests applied.'
+
+    # Deadlock guard: StatefulSet won't replace a Not-Ready pod even after a spec update.
+    # kubectl apply updates etcd but the running pod keeps its old probe until recreated.
+    # Detect the stall (currentRevision != updateRevision + pod Not Ready) and gracefully
+    # delete so the controller can schedule a replacement with the new spec.
+    CURRENT_REV=\$(kubectl get statefulset kafka -n kafka \
+        -o jsonpath='{.status.currentRevision}' 2>/dev/null || echo '')
+    UPDATE_REV=\$(kubectl get statefulset kafka -n kafka \
+        -o jsonpath='{.status.updateRevision}' 2>/dev/null || echo '')
+    POD_READY=\$(kubectl get pod kafka-0 -n kafka \
+        -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null || echo '')
+
+    if [ -n \"\$CURRENT_REV\" ] && [ -n \"\$UPDATE_REV\" ] \
+        && [ \"\$CURRENT_REV\" != \"\$UPDATE_REV\" ] && [ \"\$POD_READY\" = False ]; then
+        echo \"DEADLOCK DETECTED: pending update (\$CURRENT_REV -> \$UPDATE_REV), kafka-0 Not Ready.\"
+        echo 'Gracefully deleting kafka-0 to let controller apply new spec...'
+        # grace-period=30: lets Kafka flush log segments; avoids dirty-log recovery on next start
+        kubectl delete pod kafka-0 -n kafka --grace-period=30
+        # Wait for pod to fully disappear before rollout status starts watching to avoid race
+        kubectl wait pod/kafka-0 -n kafka --for=delete --timeout=60s \
+            || echo 'Note: kafka-0 took > 60s to terminate — continuing anyway.'
+    else
+        echo \"No deadlock (currentRevision=\$CURRENT_REV, updateRevision=\$UPDATE_REV, podReady=\$POD_READY).\"
+    fi
+
+    # Wait for rollout to complete — tracks the new pod through rolling updates, not just the current pod snapshot.
+    # kubectl wait --for=condition=Ready can catch the OLD pod right before it's killed; rollout status waits for the NEW pod.
+    # max 480s: startupProbe budget 290s (20 + 18×15) + scheduling/first-readiness buffer
+    echo 'Waiting for Kafka rollout to complete (readiness probe gates on port 9092)...'
+    kubectl rollout status statefulset/kafka -n kafka --timeout=480s \
+    || {
+        echo 'WARNING: Kafka rollout did not complete — skipping topic creation. Run deploy again once it is running.'
+        # Diagnose actual failure mode: exit 137 = OOMKill (hypothesis 1); exit 1 = startup too slow (hypothesis 2)
+        echo '--- kafka-0 pod conditions and last state ---'
+        kubectl describe pod kafka-0 -n kafka \
+            | grep -E 'Last State|Exit Code|OOMKilled|Conditions|Ready|Started|Finished|Reason'
+        echo '--- kafka-0 current logs (last 30 lines) ---'
+        kubectl logs kafka-0 -n kafka --tail=30 2>/dev/null \
+            || kubectl logs kafka-0 -n kafka --previous --tail=30 2>/dev/null \
+            || echo '(no logs available — pod may not have started)'
+        exit 0
+    }
+
+    # Create topics — --if-not-exists makes this idempotent (safe to run every deploy)
+    # apache/kafka:4.0.0 scripts live at /opt/kafka/bin/ (not on PATH like bitnami's image)
+    kubectl exec kafka-0 -n kafka -- /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server localhost:9092 --create --if-not-exists \
+        --topic stocks-financials-raw --partitions 1 --replication-factor 1 \
+    && echo 'Topic stocks-financials-raw ready.'
+
+    kubectl exec kafka-0 -n kafka -- /opt/kafka/bin/kafka-topics.sh \
+        --bootstrap-server localhost:9092 --create --if-not-exists \
+        --topic weather-hourly-raw --partitions 1 --replication-factor 1 \
+    && echo 'Topic weather-hourly-raw ready.'
+
+    echo 'Kafka topics:'
+    kubectl exec kafka-0 -n kafka -- /opt/kafka/bin/kafka-topics.sh \
+        --list --bootstrap-server localhost:9092
+"
+
+echo ""
+echo "REMINDER: Set the Airflow Variable if you have not already:"
+echo "  KAFKA_BOOTSTRAP_SERVERS = kafka.kafka.svc.cluster.local:9092"
+echo "  (Airflow UI → Admin → Variables, or: kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- airflow variables set KAFKA_BOOTSTRAP_SERVERS kafka.kafka.svc.cluster.local:9092)"
+echo ""
+
 echo "=== Step 2c2: Syncing dbt profiles secret to EC2 ==="
 # profiles.yml is gitignored (contains dbt connection config referencing Snowflake env vars).
 # scp copies it from Mac to EC2; kubectl apply creates or updates the dbt-profiles secret idempotently.
@@ -180,7 +260,7 @@ echo "=== Step 2d: Applying Helm values to live Airflow release ==="
 ssh "$EC2_HOST" "helm upgrade airflow apache-airflow/airflow \
     -n airflow-my-namespace \
     --version 1.20.0 \
-    --atomic=false --timeout 2m \
+    --atomic=false --timeout 10m \  # 10m: post-upgrade hook runs airflow db migrate, consistently exceeds 2m on this cluster
     --force \
     -f $EC2_HELM_PATH/values.yaml" \
   || echo "Note: Helm hook timed out (expected — post-upgrade job takes >2m; upgrade was applied)."

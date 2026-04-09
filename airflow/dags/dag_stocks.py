@@ -2,16 +2,14 @@
 
 import os
 import json
-import time
 from typing import Any
-from datetime import timedelta, date
+from datetime import timedelta
 
 import pendulum
 from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
-from airflow.providers.standard.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv at /opt/dbt-venv/
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator  # fires consumer DAG after publish
 
 import pandas as pd
-from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
@@ -54,7 +52,7 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]  # Must match TICKERS in dashboar
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
     },
-    description="Company financials pipeline: SEC EDGAR XBRL → Snowflake → dbt",
+    description="Company financials pipeline: SEC EDGAR XBRL → Kafka (consumer DAG writes Snowflake → dbt)",
     schedule=timedelta(days=1),  # Daily: SEC EDGAR companyfacts updates only when companies file (≈annually)
     # start_date must be in the past for Airflow to schedule the first run immediately
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
@@ -77,7 +75,8 @@ def stock_market_pipeline():
     Data source: SEC EDGAR (U.S. government, public domain, no API key needed)
 
     #### Pipeline stages:
-    extract()  →  transform()  →  load()  →  dbt_run  →  dbt_test
+    extract()  →  transform()  →  publish_to_kafka()  →  trigger stock_consumer_pipeline
+    (Snowflake write + dbt run in dag_stocks_consumer.py)
     """
 
     @task()
@@ -187,109 +186,54 @@ def stock_market_pipeline():
 
 
     @task()
-    def load(records: list[dict[str, Any]]) -> None:
+    def publish_to_kafka(records: list[dict[str, Any]]) -> int:
         """
-        ### Load
-        Push transformed rows into Snowflake (table: COMPANY_FINANCIALS) once per day.
-        Uses a daily batch gate to avoid redundant Snowflake cold-starts (cost optimization).
+        ### Publish
+        Publish the full transformed batch to Kafka topic stocks.financials.raw.
+        Returns record count. The consumer DAG (dag_stocks_consumer.py) handles
+        the Snowflake write and dbt run.
 
-        Uses REPLACE strategy: SEC EDGAR companyfacts returns ALL historical data in every
-        response, so we replace the entire table to avoid duplicates without needing upserts.
+        One message per DAG run keyed by run_id for idempotency.
         """
-        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
+        import json
+        from kafka import KafkaProducer  # kafka-python, installed via _PIP_ADDITIONAL_REQUIREMENTS
+
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
+        context = get_current_context()
 
-        # NOTE: I must declare this inside a @task object so the task only connects to that folder when the task runs.
-        # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
-        # which would cause issues.
+        bootstrap: str = Variable.get("KAFKA_BOOTSTRAP_SERVERS")  # kafka.kafka.svc.cluster.local:9092
+        producer = KafkaProducer(
+            bootstrap_servers=bootstrap,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
 
-        print(str(records[:2]))  # log first 2 rows so Airflow task log shows data arrived
-        writer.log(str(records[:2]))
+        # Single message per run — full list-of-dicts as one JSON payload
+        producer.send(
+            "stocks-financials-raw",
+            key=context["run_id"].encode("utf-8"),  # idempotency key: prevents duplicate processing on retry
+            value=records,
+        )
+        producer.flush()   # block until broker acknowledges receipt
+        producer.close()
 
-        # list-of-dicts → flat DataFrame ready for Snowflake write
-        df: pd.DataFrame = pd.DataFrame(records)
-
-        # ─── Daily Batch Gate: write to Snowflake only once per day (cost optimization) ───
-        today_iso = date.today().isoformat()
-        try:
-            last_write = Variable.get("SF_STOCKS_LAST_WRITE_DATE")
-        except KeyError:
-            last_write = ""  # Variable doesn't exist yet (first run)
-        should_write_snowflake = (last_write != today_iso)
-
-        if should_write_snowflake:
-            writer.log(f"Daily batch gate: last write was {last_write}, today is {today_iso} — proceeding with Snowflake write")
-        else:
-            writer.log(f"Daily batch gate: already wrote to Snowflake today ({today_iso}) — skipping")
-            return
-
-        try:
-            writer.log("--- Pre-insert DataFrame preview ---")
-            writer.log(str(df.head()))
-            writer.log(str(df.dtypes))
-
-            from snowflake_client import write_df_to_snowflake
-            # if_exists="replace": EDGAR returns ALL historical data each call, so replace avoids duplicates
-            write_df_to_snowflake(df.copy(), "COMPANY_FINANCIALS")
-            writer.log(f"Loaded {len(df)} rows into Snowflake COMPANY_FINANCIALS")
-
-            # Update gate variable after successful write
-            Variable.set("SF_STOCKS_LAST_WRITE_DATE", today_iso)
-            writer.log(f"Updated SF_STOCKS_LAST_WRITE_DATE to {today_iso}")
-
-        except SQLAlchemyError as e:
-            writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")
-            raise
-        except Exception as e:
-            writer.log(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors so they appear in PVC log, not just stdout
-            raise
+        writer.log(f"Published {len(records)} records to stocks-financials-raw")
+        return len(records)
 
 
     # ── Wiring the pipeline ───────────────────────────────────────────────────
-    # Calling the @task functions here (inside the @dag function body) is what
-    # tells Airflow about the dependency order: extract → transform → load.
-    # Airflow reads these calls at DAG-parse time to build the task graph; the
-    # actual Python code inside each function runs later at execution time.
+    # extract → transform → publish_to_kafka → trigger consumer DAG
+    # Snowflake write + dbt are handled in dag_stocks_consumer.py
     staging_path: XComArg = extract()
     transformed:  XComArg = transform(staging_path)  # type: ignore[arg-type]
-    load_task             = load(transformed)         # type: ignore[arg-type]
+    publish_task          = publish_to_kafka(transformed)  # type: ignore[arg-type]
 
-    # dbt runs after RAW is loaded — builds STAGING views and MARTS tables in Snowflake
-    # DBT_PROFILES_DIR points to the K8s secret mounted at /dbt; --project-dir points to the dbt project in the DAGs PVC
-    dbt_run = BashOperator(
-        task_id="dbt_run",
-        bash_command=(
-            "mkdir -p /tmp/dbt_target /tmp/dbt_logs && "  # ensure artifact dirs exist before dbt-ol runs
-            "PATH=/opt/dbt-venv/bin:$PATH "      # ensures dbt-ol's internal subprocess.Popen(['dbt']) resolves correctly
-            "DBT_PROFILES_DIR=/dbt "
-            "OPENLINEAGE_CONFIG=/opt/openlineage.yml "  # emits lineage events via console transport
-            "DBT_TARGET_PATH=/tmp/dbt_target "   # dbt-ol uses this env var for both artifact writing and post-run reading
-            "DBT_LOG_PATH=/tmp/dbt_logs "        # dbt 1.8+: replaces deprecated log-path in dbt_project.yml
-            "/opt/dbt-venv/bin/dbt-ol run "      # dbt-ol wraps dbt run and emits OpenLineage events after completion
-            "--select tag:stocks "               # only run models tagged 'stocks' — skips weather models
-            "--project-dir /opt/airflow/dags/dbt "
-            "--no-use-colors"                    # cleaner logs in Airflow UI
-        ),
+    # Fire consumer DAG after publish; consumer owns Snowflake write + dbt
+    trigger_consumer = TriggerDagRunOperator(
+        task_id="trigger_consumer",
+        trigger_dag_id="stock_consumer_pipeline",
+        wait_for_completion=False,  # fire-and-forget — consumer DAG has its own retries
     )
-
-    # dbt test runs after dbt run — checks not_null, unique, accepted_values, and singular tests
-    dbt_test = BashOperator(
-        task_id="dbt_test",
-        bash_command=(
-            "mkdir -p /tmp/dbt_target /tmp/dbt_logs && "  # ensure artifact dirs exist before dbt-ol runs
-            "PATH=/opt/dbt-venv/bin:$PATH "      # ensures dbt-ol's internal subprocess.Popen(['dbt']) resolves correctly
-            "DBT_PROFILES_DIR=/dbt "
-            "OPENLINEAGE_CONFIG=/opt/openlineage.yml "  # emits lineage events via console transport
-            "DBT_TARGET_PATH=/tmp/dbt_target "   # dbt-ol uses this env var for artifact reading and writing
-            "DBT_LOG_PATH=/tmp/dbt_logs "        # dbt 1.8+: write log file to /tmp, not project-dir
-            "/opt/dbt-venv/bin/dbt-ol test "     # dbt-ol wraps dbt test and emits events after completion
-            "--select tag:stocks "
-            "--project-dir /opt/airflow/dags/dbt "
-            "--no-use-colors"
-        ),
-    )
-
-    load_task >> dbt_run >> dbt_test  # dbt only runs if Snowflake load succeeds
+    publish_task >> trigger_consumer
 
 
 dag = stock_market_pipeline()

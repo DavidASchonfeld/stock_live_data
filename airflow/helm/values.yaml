@@ -25,7 +25,7 @@ imagePullSecrets:
 #   causes pip to downgrade them at every pod startup (~7 min download), breaking the startup probe
 env:
   - name: _PIP_ADDITIONAL_REQUIREMENTS
-    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0"
+    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0 kafka-python"
   - name: AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE  # prevents moment.tz.guess() on login; moment.tz() error on Home Page is a known Airflow 3.x cosmetic bug (non-blocking, unfixable via Helm)
     value: "America/New_York"
   # OpenLineage — native to Airflow 3.x (apache-airflow-providers-openlineage bundled)
@@ -57,6 +57,23 @@ extraEnvFrom: |
       name: snowflake-credentials  # injects SNOWFLAKE_ACCOUNT, USER, PASSWORD, DATABASE, SCHEMA, WAREHOUSE
 
 dags:
+  gitSync:
+    # WHY THIS FIX EXISTS:
+    # The Airflow Helm chart has two modes for configuring liveness/readiness probes on git-sync
+    # containers: the old behavior (recommendedProbeSetting: false, now deprecated) and the new
+    # recommended behavior (recommendedProbeSetting: true). The chart emits a DEPRECATION WARNING
+    # during `helm upgrade` whenever this flag is false (which is the default), telling you to opt
+    # into the new probe configuration.
+    #
+    # This project does NOT use git-sync at all — DAGs are loaded via a PVC (see `persistence`
+    # below). However, the chart evaluates this flag unconditionally regardless of whether
+    # git-sync is enabled, so the warning fires on every deploy.
+    #
+    # Setting this to `true` IS the fix (not a suppression): it opts into the new probe behavior,
+    # which is what Airflow recommends going forward. Since git-sync is disabled here, the probe
+    # settings have no practical effect on the deployment either way — but this silences the
+    # warning by using the correct, non-deprecated API.
+    recommendedProbeSetting: true
   persistence:
     enabled: true
     existingClaim: dag-pvc
@@ -129,10 +146,12 @@ scheduler:
     periodSeconds: 60         # check every 60s — scheduler heartbeats every 5s so this avoids false positives
   # Heart of Airflow — parses DAGs and triggers tasks. Guaranteed 512Mi prevents slow scheduling under load.
   # 2Gi limit: Airflow 3.x supervisor model spawns ~15 worker subprocesses (each loads providers); OOMKilled at 1Gi.
+  # cpu request lowered 200m→100m (Apr 2026): Kafka added ~100m, pushing node to 97% CPU requests;
+  # scheduler stayed Pending. Requests are scheduling guarantees only — burst limit (1000m) unchanged.
   resources:
     requests:
       memory: "512Mi"
-      cpu: "200m"
+      cpu: "100m"
     limits:
       memory: "2Gi"
       cpu: "1000m"
@@ -151,14 +170,14 @@ enableBuiltInSecretEnvVars:
 webserver:
   # Airflow UI + REST API server. OOMKilled at 1Gi with azure+snowflake providers loaded across 4 workers.
   # Increased to 2Gi limit + 2 workers (AIRFLOW__WEBSERVER__WORKERS=2) to stay well under ceiling.
-  # 200m CPU: mostly idle between requests; 1000m cap handles page-render and DAG-graph bursts.
+  # cpu request lowered 200m→100m (Apr 2026): same CPU-starvation fix as scheduler (see above).
   env:
     - name: AIRFLOW__WEBSERVER__WORKERS  # reduce from 4→2 workers; each worker loads all providers (~300MB each)
       value: "2"
   resources:
     requests:
       memory: "512Mi"
-      cpu: "200m"
+      cpu: "100m"
     limits:
       memory: "2Gi"
       cpu: "1000m"
@@ -188,7 +207,7 @@ apiServer:
   resources:
     requests:
       memory: "256Mi"
-      cpu: "100m"
+      cpu: "75m"
     limits:
       memory: "2Gi"
       cpu: "500m"
@@ -205,7 +224,7 @@ triggerer:
   resources:
     requests:
       memory: "128Mi"
-      cpu: "100m"
+      cpu: "75m"
     limits:
       memory: "512Mi"
       cpu: "300m"
@@ -223,7 +242,7 @@ dagProcessor:
   resources:
     requests:
       memory: "256Mi"
-      cpu: "100m"
+      cpu: "75m"
     limits:
       memory: "512Mi"
       cpu: "500m"

@@ -1,0 +1,135 @@
+# Headless service — required by StatefulSet for stable pod DNS (kafka-0.kafka-headless.kafka.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  namespace: kafka
+spec:
+  clusterIP: None
+  selector:
+    app: kafka
+  ports:
+  - port: 9092
+    name: plaintext
+
+---
+# ClusterIP service — Airflow bootstrap endpoint: kafka.kafka.svc.cluster.local:9092 (clients redirect to headless DNS after metadata)
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: kafka
+spec:
+  type: ClusterIP
+  selector:
+    app: kafka
+  ports:
+  - port: 9092
+    targetPort: 9092
+    name: plaintext
+
+---
+# Single-broker Kafka 4.0 in KRaft mode (no ZooKeeper) using the official Apache image
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: kafka
+spec:
+  serviceName: kafka-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+      - name: kafka
+        image: docker.io/apache/kafka:4.0.0
+        ports:
+        - containerPort: 9092
+          name: plaintext
+        - containerPort: 9093
+          name: controller
+        # tcpSocket probe: kubelet connects directly to pod IP:9092 — no DNS lookup, no AdminClient, no JVM
+        # headless DNS (kafka-0.kafka-headless...) only exists once pod is Ready, so any exec+AdminClient probe
+        # creates a chicken-and-egg: DNS absent → reconnect fails → probe fails → never Ready
+        # tcpSocket bypasses that entirely; port 9092 opens only after broker is fully initialized (Kafka logs confirm)
+        # startupProbe absorbs cold-start budget; readinessProbe is paused until startupProbe passes
+        startupProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 20   # minimum time for KRaft format + JVM init; failureThreshold absorbs the rest
+          periodSeconds: 15         # poll frequently to catch broker as soon as it's ready
+          timeoutSeconds: 5         # TCP connect/refused is near-instant; 5s is ample
+          failureThreshold: 18      # 20 + (18 × 15) = 290s ≈ 5-min total startup budget
+        # readinessProbe runs only after startupProbe passes — handles steady-state transient hiccups only
+        readinessProbe:
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 0    # startupProbe already confirmed broker is ready
+          periodSeconds: 20         # steady-state check interval
+          timeoutSeconds: 5
+          failureThreshold: 3       # 3 × 20s = 60s tolerance for transient GC pauses
+        env:
+        # Broker JVM heap: symmetric Xmx=Xms eliminates GC expansion pauses; probe JVM overrides this separately
+        - name: KAFKA_HEAP_OPTS
+          value: "-Xmx320m -Xms320m"
+        # KRaft identity — combined broker + controller roles in one pod
+        - name: KAFKA_NODE_ID
+          value: "1"
+        - name: KAFKA_PROCESS_ROLES
+          value: "broker,controller"
+        # Listeners: PLAINTEXT for clients, CONTROLLER for internal KRaft consensus
+        - name: KAFKA_LISTENERS
+          value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "PLAINTEXT://kafka-0.kafka-headless.kafka.svc.cluster.local:9092"  # headless DNS → pod IP directly; avoids ClusterIP hairpin for AdminClient reconnects
+        - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+          value: "1@localhost:9093"
+        - name: KAFKA_CONTROLLER_LISTENER_NAMES
+          value: "CONTROLLER"
+        - name: KAFKA_INTER_BROKER_LISTENER_NAME
+          value: "PLAINTEXT"
+        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+          value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+        # Topic defaults — auto-create off to prevent typos in producer code
+        - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+          value: "false"
+        # Retention: 48h or 100MB per partition, whichever hits first
+        - name: KAFKA_LOG_RETENTION_HOURS
+          value: "48"
+        - name: KAFKA_LOG_RETENTION_BYTES
+          value: "104857600"
+        # Single-node cluster: replication factor must be 1 everywhere
+        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+          value: "1"
+        - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+          value: "1"
+        - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+          value: "1"
+        - name: KAFKA_LOG_DIRS
+          value: "/var/lib/kafka/data"
+        resources:
+          requests:
+            memory: "768Mi"   # broker RSS at idle: ~320m heap + ~200m off-heap + probe JVM headroom
+            cpu: "100m"
+          limits:
+            memory: "1536Mi"  # raised from 1Gi — headroom for KRaft cold-start spike + off-heap (metaspace ~150m + NIO ~100m + threads ~50m)
+            cpu: "500m"
+        volumeMounts:
+        - name: kafka-data
+          mountPath: /var/lib/kafka/data
+  # PVC template — local-path provisioner creates the volume on first pod schedule
+  volumeClaimTemplates:
+  - metadata:
+      name: kafka-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: local-path
+      resources:
+        requests:
+          storage: 2Gi

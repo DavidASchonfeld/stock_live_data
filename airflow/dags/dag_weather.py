@@ -3,15 +3,13 @@
 import os
 import json
 from typing import Annotated, Any, cast
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 
 import pendulum
-from airflow.sdk import dag, task, XComArg, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
-from airflow.providers.standard.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv at /opt/dbt-venv/
-
+from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
+from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator  # fires consumer DAG after publish
 
 import pandas as pd
-from sqlalchemy.exc import SQLAlchemyError
 
 
 # My Files
@@ -44,7 +42,7 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
     },
-    description="Pulling weather info from Meteo Weather API",
+    description="Weather pipeline: Open-Meteo → Kafka (consumer DAG writes Snowflake → dbt)",
     schedule=timedelta(hours=1),  # Hourly: Open-Meteo refreshes its forecast data once per hour
     # Use fixed past date instead of pendulum.now() to prevent DAG configuration drift on each parse
     start_date=pendulum.datetime(2025, 6, 8, 0, 0, tz="America/New_York"),
@@ -65,7 +63,8 @@ def weather_pipeline():
     In a real deployment you would parameterize these or pull from a config file.
 
     #### Pipeline stages:
-    extract()  →  transform()  →  load()  →  dbt_run  →  dbt_test
+    extract()  →  transform()  →  publish_to_kafka()  →  trigger weather_consumer_pipeline
+    (Snowflake write + dbt run in dag_weather_consumer.py)
     """
 
     @task()
@@ -135,139 +134,53 @@ def weather_pipeline():
         return df.to_dict(orient="records")
 
     @task()
-    def load(inData):
+    def publish_to_kafka(records: list[dict[str, Any]]) -> int:
         """
-        ### Load Task
-        Push transformed rows into Snowflake (table: WEATHER_HOURLY) once per day.
-        Uses a daily batch gate to avoid redundant Snowflake cold-starts (cost optimization).
-        Deduplicates against existing Snowflake timestamps before inserting to prevent
-        unbounded table growth when the DAG reruns within the same forecast window.
+        ### Publish
+        Publish the transformed hourly records to Kafka topic weather.hourly.raw.
+        Returns record count. The consumer DAG (dag_weather_consumer.py) handles
+        the Snowflake dedup write and dbt run.
+
+        One message per DAG run keyed by run_id for idempotency.
         """
-        # Location that the K3S Kubernetes pod (as specified in the PortableVolume) is pointing to inside the K3S Kubernetes pod, which will push
-        writer : OutputTextWriter = OutputTextWriter("/opt/airflow/out")
+        from kafka import KafkaProducer  # kafka-python, installed via _PIP_ADDITIONAL_REQUIREMENTS
 
-        # NOTE: I must declare this inside a @task object so the task only connects to that folder when the task runs.
-        # If I had declared this constructor in the main area (outside of a task method etc.), it would run when the DAG is initialized,
-        # which would cause issues.
+        writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
+        context = get_current_context()
 
-        print(str(inData))
-        writer.log(str(inData))  # inData is now a list of row-dicts from transform()
+        bootstrap: str = Variable.get("KAFKA_BOOTSTRAP_SERVERS")  # kafka.kafka.svc.cluster.local:9092
+        producer = KafkaProducer(
+            bootstrap_servers=bootstrap,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+        )
 
-        df = pd.DataFrame(inData)  # list-of-dicts → flat DataFrame ready for Snowflake write
+        # Single message per run — full list-of-dicts as one JSON payload
+        producer.send(
+            "weather-hourly-raw",
+            key=context["run_id"].encode("utf-8"),  # idempotency key: prevents duplicate processing on retry
+            value=records,
+        )
+        producer.flush()   # block until broker acknowledges receipt
+        producer.close()
 
-        writer.log("--- Pre-insert DataFrame preview ---")
-        writer.log(str(df.head()))
-        writer.log(str(df.dtypes))
-
-        # ─── Daily Batch Gate: write to Snowflake only once per day (cost optimization) ───
-        today_iso = date.today().isoformat()
-        try:
-            last_write = Variable.get("SF_WEATHER_LAST_WRITE_DATE")
-        except KeyError:
-            last_write = ""  # Variable doesn't exist yet (first run)
-        should_write_snowflake = (last_write != today_iso)
-
-        if should_write_snowflake:
-            writer.log(f"Daily batch gate: last write was {last_write}, today is {today_iso} — proceeding with Snowflake write")
-        else:
-            writer.log(f"Daily batch gate: already wrote to Snowflake today ({today_iso}) — skipping")
-            return
-
-        try:
-            from snowflake_client import write_df_to_snowflake
-            from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-
-            # Dedup against existing Snowflake timestamps before inserting
-            sf_hook = SnowflakeHook(snowflake_conn_id="snowflake_default")
-            sf_conn = sf_hook.get_conn()
-            sf_cur = sf_conn.cursor()
-            try:
-                sf_cur.execute("SELECT TIME FROM PIPELINE_DB.RAW.WEATHER_HOURLY")
-                # TIME column is NUMBER(38,0) storing epoch seconds; convert to int for comparison
-                sf_existing = {int(row[0]) for row in sf_cur.fetchall()}
-                writer.log(f"Snowflake has {len(sf_existing)} existing timestamps")
-            except Exception as query_err:
-                writer.log(f"Snowflake table doesn't exist yet or query failed: {query_err}")
-                sf_existing = set()  # table doesn't exist yet
-            sf_cur.close()
-            sf_conn.close()
-
-            # Convert df["time"] ISO strings to epoch seconds for comparison with Snowflake NUMBER column
-            df_times_epoch = pd.to_datetime(df["time"]).astype(int) // 10**9  # ns to seconds
-            sf_new_rows = df[~df_times_epoch.isin(sf_existing)].copy()
-            writer.log(f"Snowflake dedup: {len(sf_existing)} existing, {len(sf_new_rows)} new rows")
-
-            if len(sf_new_rows) > 0:
-                # Cast ALL columns to match Snowflake table schema exactly
-                sf_new_rows["time"] = pd.to_datetime(sf_new_rows["time"])
-                sf_new_rows["imported_at"] = pd.to_datetime(sf_new_rows["imported_at"])
-                sf_new_rows["temperature_2m"] = sf_new_rows["temperature_2m"].astype(float)
-                sf_new_rows["latitude"] = sf_new_rows["latitude"].astype(float)
-                sf_new_rows["longitude"] = sf_new_rows["longitude"].astype(float)
-                sf_new_rows["elevation"] = sf_new_rows["elevation"].astype(float)
-                sf_new_rows["timezone"] = sf_new_rows["timezone"].astype(str)  # explicitly cast to str
-                sf_new_rows["utc_offset_seconds"] = sf_new_rows["utc_offset_seconds"].astype("int64")
-                write_df_to_snowflake(sf_new_rows, "WEATHER_HOURLY", overwrite=False)
-                writer.log(f"Loaded {len(sf_new_rows)} rows into Snowflake WEATHER_HOURLY")
-            else:
-                writer.log("No new rows to insert into Snowflake — all timestamps already present")
-
-            # Update gate variable after successful write (even if no new rows, to prevent retry writes)
-            Variable.set("SF_WEATHER_LAST_WRITE_DATE", today_iso)
-            writer.log(f"Updated SF_WEATHER_LAST_WRITE_DATE to {today_iso}")
-
-        except SQLAlchemyError as e:
-            writer.log(f"[ERROR] SQLAlchemy {type(e).__name__}: {e}")  # write to PVC so error is readable without the Airflow UI
-            raise
-        except Exception as e:
-            writer.log(f"[ERROR] Unexpected {type(e).__name__}: {e}")  # catches non-SQLAlchemy errors so they appear in PVC log
-            raise
+        writer.log(f"Published {len(records)} records to weather-hourly-raw")
+        return len(records)
 
     # Airflow automatically converts all task method return values to XComArg objects for cross-task data passing.
 
     # ── Wiring the pipeline ───────────────────────────────────────────────────
-    # Calling the @task functions here defines the execution order for Airflow.
-    # Airflow reads these at parse time to build the DAG graph; the functions
-    # themselves run later at scheduled execution time.
+    # extract → transform → publish_to_kafka → trigger consumer DAG
+    # Snowflake write + dbt are handled in dag_weather_consumer.py
     raw_data  : XComArg = extract()
     records   : XComArg = transform(raw_data)
-    load_task           = load(records)
+    publish_task          = publish_to_kafka(records)  # type: ignore[arg-type]
 
-    # dbt runs after each load attempt — idempotent if no new rows were written (daily batch gate skipped the write)
-    # DBT_PROFILES_DIR points to the K8s secret mounted at /dbt; --project-dir points to the dbt project in the DAGs PVC
-    dbt_run = BashOperator(
-        task_id="dbt_run",
-        bash_command=(
-            "mkdir -p /tmp/dbt_target /tmp/dbt_logs && "  # ensure artifact dirs exist before dbt-ol runs
-            "PATH=/opt/dbt-venv/bin:$PATH "      # ensures dbt-ol's internal subprocess.Popen(['dbt']) resolves correctly
-            "DBT_PROFILES_DIR=/dbt "
-            "OPENLINEAGE_CONFIG=/opt/openlineage.yml "  # emits lineage events via console transport
-            "DBT_TARGET_PATH=/tmp/dbt_target "   # dbt-ol uses this env var for both artifact writing and post-run reading
-            "DBT_LOG_PATH=/tmp/dbt_logs "        # dbt 1.8+: replaces deprecated log-path in dbt_project.yml
-            "/opt/dbt-venv/bin/dbt-ol run "      # dbt-ol wraps dbt run and emits OpenLineage events after completion
-            "--select tag:weather "              # only run models tagged 'weather' — skips stocks models
-            "--project-dir /opt/airflow/dags/dbt "
-            "--no-use-colors"                   # cleaner logs in Airflow UI
-        ),
+    # Fire consumer DAG after publish; consumer owns Snowflake write + dbt
+    trigger_consumer = TriggerDagRunOperator(
+        task_id="trigger_consumer",
+        trigger_dag_id="weather_consumer_pipeline",
+        wait_for_completion=False,  # fire-and-forget — consumer DAG has its own retries
     )
-
-    # dbt test runs after dbt run — checks not_null, unique, and accepted_values on weather models
-    dbt_test = BashOperator(
-        task_id="dbt_test",
-        bash_command=(
-            "mkdir -p /tmp/dbt_target /tmp/dbt_logs && "  # ensure artifact dirs exist before dbt-ol runs
-            "PATH=/opt/dbt-venv/bin:$PATH "      # ensures dbt-ol's internal subprocess.Popen(['dbt']) resolves correctly
-            "DBT_PROFILES_DIR=/dbt "
-            "OPENLINEAGE_CONFIG=/opt/openlineage.yml "  # emits lineage events via console transport
-            "DBT_TARGET_PATH=/tmp/dbt_target "   # dbt-ol uses this env var for artifact reading and writing
-            "DBT_LOG_PATH=/tmp/dbt_logs "        # dbt 1.8+: write log file to /tmp, not project-dir
-            "/opt/dbt-venv/bin/dbt-ol test "     # dbt-ol wraps dbt test and emits events after completion
-            "--select tag:weather "
-            "--project-dir /opt/airflow/dags/dbt "
-            "--no-use-colors"
-        ),
-    )
-
-    load_task >> dbt_run >> dbt_test  # dbt only runs if load succeeds
+    publish_task >> trigger_consumer
 
 dag = weather_pipeline()  # assign to module-level variable — Airflow best practice for DAG discovery
