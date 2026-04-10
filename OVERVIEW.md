@@ -96,12 +96,23 @@ What deploy.sh does: validates DAG syntax → rsyncs files to EC2 → builds Doc
 
 ### Accessing the UIs
 
-**SSH tunnel (recommended)** — keeps ports closed in AWS:
+**SSH tunnel (recommended)** — keeps AWS ports closed; traffic goes through your SSH connection instead.
+
+**How to use it:**
+1. Open a Terminal window and run the command below. It will log you into the EC2 server and hold the connection open — **leave this Terminal window open the entire time you want to access the UIs.**
+2. While the tunnel is running, open your web browser and visit the URLs listed below — they work just like any local website.
+3. When you're done, close the Terminal window (or press `Ctrl+C`) to shut the tunnel down.
+
 ```bash
 ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
-# Airflow UI:  http://localhost:30080
-# Dashboard:   http://localhost:32147/dashboard/
 ```
+
+> If the terminal window is closed or the connection drops, the browser URLs will stop working. Just re-run the command above to reconnect.
+
+| UI | URL |
+|---|---|
+| Airflow | http://localhost:30080 |
+| Dashboard | http://localhost:32147/dashboard/ |
 
 **Public access (for demos):** Open port 32147 in the EC2 Security Group inbound rules. Remove the rule after the demo.
 

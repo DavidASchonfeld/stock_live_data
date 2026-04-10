@@ -19,6 +19,19 @@ RUN python3 -m venv /opt/dbt-venv \
          openlineage-dbt \
     && chown -R airflow: /opt/dbt-venv
 
+# /opt/ml-venv: isolated venv for MLflow + ML libs — avoids conflicts with Airflow's pinned deps
+# setuptools pinned <75: setuptools 80+ removed pkg_resources; mlflow 2.15.1 requires it at runtime
+RUN python3 -m venv /opt/ml-venv \
+    && /opt/ml-venv/bin/pip install --upgrade pip \
+    && /opt/ml-venv/bin/pip install \
+         mlflow==2.15.1 \
+         scikit-learn==1.5.2 \
+         pandas==2.2.2 \
+         snowflake-connector-python==3.10.1 \
+    && /opt/ml-venv/bin/pip install "setuptools<75" \
+    && /opt/ml-venv/bin/python -c "import pkg_resources" \
+    && chown -R airflow: /opt/ml-venv
+
 # OpenLineage config — console transport writes events to stdout (visible in Airflow task logs)
 # To use Marquez instead, replace "console" with: type: http\n  config:\n    url: http://marquez:5000
 COPY --chown=airflow:root openlineage.yml /opt/openlineage.yml

@@ -145,11 +145,18 @@ echo "=== Step 2b2: Building Airflow+dbt image and importing into K3S ==="
 #   docker build reuses cached layers when the Dockerfile and its inputs are unchanged.
 #   Only the changed layers are rebuilt — if only DAG files changed, the dbt venv layer
 #   (the slow pip install step) is served from cache in seconds.
+# Dynamic tag: K3S containerd caches unpacked image snapshots by content hash; re-importing
+# the same tag can silently reuse old snapshots even after k3s ctr images rm + re-import.
+# A new timestamp tag is unseen by K3S, so it always creates fresh snapshots from the new image.
+BUILD_TAG="3.1.8-dbt-$(date +%Y%m%d%H%M%S)"
+echo "Build tag: $BUILD_TAG"
 ssh "$EC2_HOST" "
-    echo 'Building airflow-dbt:3.1.8-dbt image...' &&
-    docker build -t airflow-dbt:3.1.8-dbt $EC2_HOME/airflow/docker/ &&
-    echo 'Importing image into K3S containerd (bypasses Docker image store, which K3S cannot see)...' &&
-    docker save airflow-dbt:3.1.8-dbt | sudo k3s ctr images import - &&
+    echo 'Building airflow-dbt:$BUILD_TAG image...' &&
+    docker build --no-cache -t airflow-dbt:$BUILD_TAG $EC2_HOME/airflow/docker/ &&
+    echo 'Purging ALL existing airflow-dbt images from K3S containerd (prevents stale snapshot reuse)...' &&
+    sudo k3s ctr images ls | grep 'airflow-dbt' | awk '{print \$1}' | xargs -r sudo k3s ctr images rm 2>/dev/null || true &&
+    echo 'Importing new image into K3S containerd (bypasses Docker image store, which K3S cannot see)...' &&
+    docker save airflow-dbt:$BUILD_TAG | sudo k3s ctr images import - &&
     echo 'Verifying image is visible to K3S...' &&
     sudo k3s ctr images list | grep airflow-dbt
 "
@@ -234,6 +241,54 @@ echo "  KAFKA_BOOTSTRAP_SERVERS = kafka.kafka.svc.cluster.local:9092"
 echo "  (Airflow UI → Admin → Variables, or: kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- airflow variables set KAFKA_BOOTSTRAP_SERVERS kafka.kafka.svc.cluster.local:9092)"
 echo ""
 
+echo "=== Step 2b5: Syncing MLflow manifests to EC2 ==="
+rsync -avz --progress airflow/manifests/mlflow/ "$EC2_HOST:$EC2_HOME/airflow/manifests/mlflow/"
+
+echo "=== Step 2b5a: Importing MLflow image into K3S containerd ==="
+# WHY import instead of letting K3S pull at runtime:
+#   K3S containerd is separate from Docker's image store. imagePullPolicy: Never tells K3S
+#   to use only its local containerd store — no runtime pull, no timeout risk.
+#   Same pattern used for the airflow-dbt image (Step 2b2).
+#   docker pull + docker save + k3s ctr import: pull via Docker (which has its own cache),
+#   then import the image bytes directly into K3S containerd. Fast on repeat deploys
+#   because docker pull reuses cached layers and only fetches what changed.
+MLFLOW_IMAGE="ghcr.io/mlflow/mlflow:latest"
+ssh "$EC2_HOST" "
+    echo 'Pulling MLflow image via Docker...' &&
+    docker pull $MLFLOW_IMAGE &&
+    echo 'Importing into K3S containerd...' &&
+    docker save $MLFLOW_IMAGE | sudo k3s ctr images import - &&
+    echo 'Verifying image is visible to K3S...' &&
+    sudo k3s ctr images list | grep mlflow
+"
+
+echo "=== Step 2b6: Deploying MLflow to K3s (idempotent) ==="
+ssh "$EC2_HOST" "
+    # Ensure data directory and artifacts subdirectory exist on the host (hostPath PV)
+    mkdir -p /home/ubuntu/mlflow-data/artifacts
+
+    # Apply manifests in dependency order: PV → PVC → Deployment → Service
+    kubectl apply -f $EC2_HOME/airflow/manifests/mlflow/pv-mlflow.yaml \
+    && kubectl apply -f $EC2_HOME/airflow/manifests/mlflow/pvc-mlflow.yaml -n airflow-my-namespace \
+    && kubectl apply -f $EC2_HOME/airflow/manifests/mlflow/deployment-mlflow.yaml -n airflow-my-namespace \
+    && kubectl apply -f $EC2_HOME/airflow/manifests/mlflow/service-mlflow.yaml -n airflow-my-namespace \
+    && echo 'MLflow manifests applied.'
+
+    # Recreate strategy: old pod terminates first, then new pod starts — no PVC contention
+    kubectl rollout status deployment/mlflow -n airflow-my-namespace --timeout=180s \
+    || {
+        echo 'ERROR: MLflow rollout timed out. Diagnosing...'
+        echo '--- MLflow pod status ---'
+        kubectl get pods -n airflow-my-namespace -l app=mlflow
+        echo '--- MLflow pod describe (last 30 lines) ---'
+        kubectl describe pod -n airflow-my-namespace -l app=mlflow | tail -30
+        echo '--- MLflow pod logs (last 30 lines) ---'
+        kubectl logs -n airflow-my-namespace -l app=mlflow --tail=30 2>/dev/null \
+            || echo '(no logs — pod may not have started)'
+        exit 1
+    }
+"
+
 echo "=== Step 2c2: Syncing dbt profiles secret to EC2 ==="
 # profiles.yml is gitignored (contains dbt connection config referencing Snowflake env vars).
 # scp copies it from Mac to EC2; kubectl apply creates or updates the dbt-profiles secret idempotently.
@@ -257,13 +312,34 @@ echo "=== Step 2d: Applying Helm values to live Airflow release ==="
 # No --reuse-values: use only values.yaml; --reuse-values injects stale 2.x Helm history and fails 3.x schema validation.
 # --atomic=false: keeps upgrade applied even if post-upgrade hooks time out (expected on this cluster).
 # || echo: hook timeout exits non-zero; suppress so set -e doesn't abort the script (upgrade was still applied).
+# FIX: flags are on separate lines with no inline comments — inline comments inside a double-quoted SSH
+# string are NOT stripped by bash; they become literal text, breaking argument parsing and leaving
+# --force on its own line where the shell treats it as a separate command ("command not found").
+# --set overrides the static tag in values.yaml with the dynamic BUILD_TAG so K3S picks up the new image
 ssh "$EC2_HOST" "helm upgrade airflow apache-airflow/airflow \
     -n airflow-my-namespace \
     --version 1.20.0 \
-    --atomic=false --timeout 10m \  # 10m: post-upgrade hook runs airflow db migrate, consistently exceeds 2m on this cluster
+    --atomic=false \
+    --timeout 10m \
     --force \
+    --set images.airflow.tag=$BUILD_TAG \
     -f $EC2_HELM_PATH/values.yaml" \
   || echo "Note: Helm hook timed out (expected — post-upgrade job takes >2m; upgrade was applied)."
+
+# Verify helm actually applied the new image tag; force-patch if it didn't (guards against silent helm failures)
+ssh "$EC2_HOST" "
+    ACTUAL_TAG=\$(kubectl get statefulset airflow-scheduler -n airflow-my-namespace \
+        -o jsonpath='{.spec.template.spec.containers[?(@.name==\"scheduler\")].image}' 2>/dev/null || echo '')
+    echo \"StatefulSet scheduler image after helm upgrade: \$ACTUAL_TAG\"
+    if [ \"\$ACTUAL_TAG\" != 'airflow-dbt:$BUILD_TAG' ]; then
+        echo 'WARNING: Helm did not update scheduler image — force-patching StatefulSet...'
+        kubectl set image statefulset/airflow-scheduler \
+            scheduler=airflow-dbt:$BUILD_TAG \
+            -n airflow-my-namespace
+    else
+        echo 'OK: StatefulSet has the correct image tag.'
+    fi
+"
 
 echo "=== Step 2c: Syncing Kubernetes manifests to EC2 ==="
 # Reference copies of manifests on EC2 enable direct kubectl apply from EC2 if needed

@@ -5,7 +5,7 @@ executor: LocalExecutor
 images:
   airflow:
     repository: airflow-dbt    # custom image built on EC2 and imported into K3S containerd — see airflow/docker/Dockerfile
-    tag: "3.1.8-dbt"           # built from apache/airflow:3.1.8 + /opt/dbt-venv (dbt-core + dbt-snowflake)
+    tag: "3.1.8-dbt"           # deploy.sh overrides this via --set images.airflow.tag at deploy time (dynamic timestamp tag)
     pullPolicy: Never          # use the locally imported image — no ECR needed, avoids registry storage cost
   redis:
     repository: redis
@@ -41,6 +41,8 @@ env:
     value: "spawn"   # Python 3.12+: use spawn instead of fork to avoid deadlocks in multi-threaded scheduler
   - name: PYTHONWARNINGS
     value: "ignore:This process:DeprecationWarning"   # suppress LocalExecutor os.fork() warning — harmless, Airflow calls os.fork() directly bypassing MP_START_METHOD
+  - name: MLFLOW_TRACKING_URI  # lets Airflow tasks log experiments to the in-cluster MLflow server
+    value: "http://mlflow.airflow-my-namespace.svc.cluster.local:5500"
 
 # Override postgresql image: chart default tag (16.1.0-debian-11-r15) removed from Docker Hub; ECR Public has no rate limits from EC2
 postgresql:

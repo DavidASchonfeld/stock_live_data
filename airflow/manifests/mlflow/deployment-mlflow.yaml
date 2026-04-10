@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: airflow-my-namespace
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # required for ReadWriteOnce PVC — terminate old pod before starting new
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      # initContainer runs as root to ensure /mlflow-data is writable by the mlflow process
+      initContainers:
+        - name: fix-permissions
+          image: busybox
+          command: ["sh", "-c", "chmod -R 777 /mlflow-data && chown -R 1000:1000 /mlflow-data"]  # fix perms + ownership so uvicorn worker (UID 1000) can write DB + artifacts
+          volumeMounts:
+            - name: mlflow-data
+              mountPath: /mlflow-data
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:latest
+          imagePullPolicy: Never    # image is pre-imported into K3S containerd by deploy.sh Step 2b5a
+          ports:
+            - containerPort: 5500
+          # sqlite backend keeps MLflow self-contained — no external DB needed
+          command:
+            - mlflow
+            - server
+            - --backend-store-uri
+            - sqlite:////mlflow-data/mlflow.db
+            - --default-artifact-root
+            - /mlflow-data/artifacts
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "5500"
+            - --workers          # cap at 1 worker — node is CPU/memory constrained, multiple workers OOMKill
+            - "1"
+            - --allowed-hosts    # allow K8s probe IPs through security middleware
+            - "*"
+          resources:
+            requests:
+              cpu: "50m"
+              # raised from 256Mi: request=limit ratio was 1:4; kubelet treats burstable pods (request < limit)
+              # as lower-priority eviction candidates under node memory pressure. 512Mi narrows the gap
+              # and reduces eviction risk without over-reserving on this constrained t3.large node.
+              memory: "512Mi"
+            limits:
+              cpu: "300m"
+              # raised from 1Gi: OOMKilled because ghcr.io/mlflow/mlflow:latest lazy-loads numpy/pandas/sklearn
+              # the first time Airflow logs an experiment. Memory profile: base MLflow+uvicorn ~400MB +
+              # lazy ML lib load ~600MB = ~1GB spike. 1536Mi gives ~500MB of safe headroom above observed peak.
+              memory: "1536Mi"
+          # readinessProbe: prevents traffic until MLflow HTTP server is up and accepting requests
+          readinessProbe:
+            httpGet:
+              path: /health      # MLflow built-in health endpoint
+              port: 5500
+            initialDelaySeconds: 10  # allow time for SQLite DB initialization on first start
+            periodSeconds: 5
+            failureThreshold: 6      # ~30s grace before marking pod unready
+          # livenessProbe: auto-restarts the pod if MLflow process hangs or crashes post-start
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5500
+            initialDelaySeconds: 60  # MLflow needs time for SQLite init + gunicorn start
+            periodSeconds: 10
+            failureThreshold: 6      # gives 120s total before kill (was defaulting to 3 = 50s)
+          volumeMounts:
+            - name: mlflow-data
+              mountPath: /mlflow-data  # PVC mounted here for DB + artifact persistence
+      volumes:
+        - name: mlflow-data
+          persistentVolumeClaim:
+            claimName: mlflow-pvc

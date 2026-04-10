@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: airflow-my-namespace
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflow
+  ports:
+    - port: 5500
+      targetPort: 5500  # Airflow reaches MLflow at http://mlflow.airflow-my-namespace.svc.cluster.local:5500
