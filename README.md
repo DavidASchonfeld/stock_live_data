@@ -161,7 +161,7 @@ ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
 
 - **Validation gates** at every ETL stage — extract, transform, load, and serve
 - **Alerting layer** — task failure/retry/recovery callbacks; data staleness monitor (30 min); Slack webhook supported
-- **Cost controls** — daily batch gate (write to Snowflake once/day, not every hourly run); weather dedup against existing timestamps; Snowflake XSMALL + auto-suspend 60s; Flask query cache (1hr financials, 15min weather)
+- **Cost controls** — daily batch gate (write to Snowflake once/day, not every hourly run); weather deduplication (skipping rows that already exist in Snowflake) against existing timestamps; Snowflake XSMALL + auto-suspend 60s; dashboard query cache remembers Snowflake results for 1 hour so the warehouse is queried ~4 times/hour regardless of traffic (see [Dashboard Cache](docs/architecture/DASHBOARD_CACHE.md))
 - **Vacation mode** — set `VACATION_MODE=true` to pause all pipelines without deleting DAGs
 - **Rate limiting** — SEC EDGAR client uses a token-bucket limiter (8 req/sec, thread-safe)
 - **Anomaly detection** — IsolationForest model scores each ticker's year-over-year revenue and net income growth; flagged rows written to `ANALYTICS.FCT_ANOMALIES` and visible in the dashboard's "Data Quality" tab
@@ -193,6 +193,11 @@ A fixed threshold (for example, "flag any year-over-year drop greater than 50%")
 
 **ml-venv: a separate Python environment for the ML step**
 scikit-learn and mlflow are not installed in the main Airflow image — adding them would bloat the image and risk version conflicts with Airflow's own dependencies. Instead, the anomaly detector runs as a subprocess under `/opt/ml-venv`, a dedicated Python environment provisioned on the EC2 host. The Airflow task just calls `subprocess.run(["ml-venv/bin/python", "anomaly_detector.py"])` and reads the JSON result from stdout.
+
+**Dashboard query cache: remembering answers instead of asking Snowflake every time**
+Every time someone loads the dashboard, it needs data from Snowflake. Snowflake charges by how long the warehouse is running, so asking it the same question over and over — once per page load — adds up fast. The cache solves this by remembering the answer. After the first query, the result is stored in memory inside the Flask container. For the next hour, every user who loads the dashboard gets that stored answer instantly, without ever touching Snowflake. After an hour the stored answer expires (since it could be stale), and the next page load fetches a fresh copy and stores that. This keeps Snowflake queries at roughly 4 per hour no matter how many people are using the dashboard, instead of one query per user per load.
+
+When the container first starts (after a deploy or restart), the cache is empty. To avoid the first visitor sitting through a slow load, a background process fills the cache immediately on startup — before any user arrives. This "pre-warm" takes about 5–10 seconds and runs in parallel while the web server is already accepting requests. The implementation is a plain Python dictionary; no Redis or external cache service is needed for a single-container deployment. See [docs/architecture/DASHBOARD_CACHE.md](docs/architecture/DASHBOARD_CACHE.md) for technical details.
 
 ---
 
