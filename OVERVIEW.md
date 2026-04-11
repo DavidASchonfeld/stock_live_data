@@ -104,7 +104,7 @@ What deploy.sh does: validates DAG syntax → rsyncs files to EC2 → builds Doc
 3. When you're done, close the Terminal window (or press `Ctrl+C`) to shut the tunnel down.
 
 ```bash
-ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
+ssh -L 30080:localhost:30080 -L 32147:localhost:32147 -L 5500:localhost:5500 ec2-stock
 ```
 
 > If the terminal window is closed or the connection drops, the browser URLs will stop working. Just re-run the command above to reconnect.
@@ -113,6 +113,7 @@ ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
 |---|---|
 | Airflow | http://localhost:30080 |
 | Dashboard | http://localhost:32147/dashboard/ |
+| MLflow | http://localhost:5500 |
 
 **Public access (for demos):** Open port 32147 in the EC2 Security Group inbound rules. Remove the rule after the demo.
 

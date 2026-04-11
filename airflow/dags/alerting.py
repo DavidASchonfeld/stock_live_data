@@ -5,7 +5,7 @@ import requests
 from airflow.models import Variable
 
 # Only fire success alert on the final task in each DAG
-_SUCCESS_TASKS = {"dbt_test"}
+_SUCCESS_TASKS = {"detect_anomalies"}  # detect_anomalies is now the final task — success alert fires here
 
 
 def _post_slack(webhook_url: str, text: str) -> None:

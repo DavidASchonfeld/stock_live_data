@@ -28,7 +28,7 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
         'on_success_callback': on_success_alert,
         'on_retry_callback': on_retry_alert,
     },
-    description="Stocks consumer: reads Kafka → writes Snowflake COMPANY_FINANCIALS → dbt",
+    description="Stocks consumer: reads Kafka → writes Snowflake COMPANY_FINANCIALS → dbt → anomaly detection",
     schedule=None,  # triggered by TriggerDagRunOperator in dag_stocks.py — not time-based
     start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York"),
     catchup=False,
@@ -43,7 +43,7 @@ def stock_consumer_pipeline():
     Snowflake (COMPANY_FINANCIALS), then runs dbt marts.
 
     #### Pipeline stages:
-    consume_from_kafka()  →  write_to_snowflake()  →  check_new_rows  →  dbt_run  →  dbt_test
+    consume_from_kafka()  →  write_to_snowflake()  →  check_new_rows  →  dbt_run  →  dbt_test  →  detect_anomalies()
     """
 
     @task()
@@ -184,7 +184,47 @@ def stock_consumer_pipeline():
         ),
     )
 
-    check_new_rows >> dbt_run >> dbt_test  # dbt only runs if rows were actually written
+    # detect_anomalies: runs IsolationForest on FCT_COMPANY_FINANCIALS via ml-venv subprocess
+    @task()
+    def detect_anomalies() -> dict:
+        """
+        ### Detect Anomalies
+        Runs anomaly_detector.py under /opt/ml-venv (scikit-learn + mlflow).
+        Fits IsolationForest on YoY revenue/net-income % changes, writes results
+        to PIPELINE_DB.ANALYTICS.FCT_ANOMALIES, and logs the run to MLflow.
+        Returns the JSON summary dict: {n_anomalies, n_total, mlflow_run_id}.
+        """
+        import subprocess
+
+        writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
+
+        # Run anomaly_detector.py in the ml-venv which has scikit-learn and mlflow installed
+        result = subprocess.run(
+            [
+                "/opt/ml-venv/bin/python",
+                "/opt/airflow/dags/anomaly_detector.py",
+                "--contamination", "0.05",
+                "--n-estimators", "100",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,    # 5-minute ceiling — model fit + Snowflake write should complete well within this
+        )
+
+        # Log full stdout so the Airflow UI shows model output and row counts
+        for line in result.stdout.splitlines():
+            writer.log(line)
+
+        if result.returncode != 0:
+            writer.log(f"[ERROR] anomaly_detector stderr: {result.stderr}")
+            raise RuntimeError(f"anomaly_detector.py failed (rc={result.returncode})")
+
+        # Last stdout line is the JSON summary printed by anomaly_detector.__main__
+        last_line = result.stdout.strip().splitlines()[-1]
+        return json.loads(last_line)
+
+    detect_anomalies_task = detect_anomalies()
+    check_new_rows >> dbt_run >> dbt_test >> detect_anomalies_task  # dbt only runs if rows were actually written
 
 
 dag = stock_consumer_pipeline()

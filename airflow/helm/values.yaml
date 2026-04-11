@@ -56,7 +56,7 @@ extraEnvFrom: |
   - secretRef:
       name: db-credentials
   - secretRef:
-      name: snowflake-credentials  # injects SNOWFLAKE_ACCOUNT, USER, PASSWORD, DATABASE, SCHEMA, WAREHOUSE
+      name: snowflake-credentials  # injects SNOWFLAKE_ACCOUNT, USER, PASSWORD, DATABASE, SCHEMA, WAREHOUSE, ROLE
 
 dags:
   gitSync:
@@ -248,3 +248,11 @@ dagProcessor:
     limits:
       memory: "512Mi"
       cpu: "500m"
+
+# Run DB migration as a regular K8s Job instead of a Helm post-upgrade hook.
+# useHelmHooks: true (chart default) makes helm upgrade block until the migrate job
+# finishes — on this single-node K3S cluster that exceeds --timeout 10m, causing
+# "timed out waiting for the condition". With false, Helm returns immediately;
+# the job still runs and each pod's waitForMigrations init container waits for it.
+migrateDatabaseJob:
+  useHelmHooks: false

@@ -35,8 +35,11 @@ spec:
             - server
             - --backend-store-uri
             - sqlite:////mlflow-data/mlflow.db
-            - --default-artifact-root
+            - --artifacts-destination    # server writes artifact bytes here on the PVC
             - /mlflow-data/artifacts
+            - --default-artifact-root    # clients receive this proxied URI — no direct /mlflow-data mount needed
+            - mlflow-artifacts:/
+            - --serve-artifacts          # proxy artifact uploads via HTTP — clients upload through tracking server
             - --host
             - "0.0.0.0"
             - --port
@@ -52,12 +55,16 @@ spec:
               # as lower-priority eviction candidates under node memory pressure. 512Mi narrows the gap
               # and reduces eviction risk without over-reserving on this constrained t3.large node.
               memory: "512Mi"
+              # prevents kubelet from evicting this pod first under ephemeral-storage pressure (request=0 = immediate eviction candidate)
+              ephemeral-storage: "100Mi"
             limits:
               cpu: "300m"
               # raised from 1Gi: OOMKilled because ghcr.io/mlflow/mlflow:latest lazy-loads numpy/pandas/sklearn
               # the first time Airflow logs an experiment. Memory profile: base MLflow+uvicorn ~400MB +
               # lazy ML lib load ~600MB = ~1GB spike. 1536Mi gives ~500MB of safe headroom above observed peak.
               memory: "1536Mi"
+              # caps container ephemeral usage (logs, tmp files) — prevents unbounded growth
+              ephemeral-storage: "500Mi"
           # readinessProbe: prevents traffic until MLflow HTTP server is up and accepting requests
           readinessProbe:
             httpGet:
