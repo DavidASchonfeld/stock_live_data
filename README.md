@@ -1,10 +1,11 @@
 # data_pipeline
 
-> **Status: Step 2 Complete**
+> **Status: Steps 1, 2, and 4 Complete**
 > Step 1 ✓ Airflow + MariaDB + Flask/Dash on EC2/K3S — complete.
 > Step 2 ✓ Snowflake · dbt · Kafka streaming — complete.
+> Step 4 ✓ MLflow · IsolationForest anomaly detection · Data Quality dashboard — complete.
 
-End-to-end data pipeline that pulls daily stock financials (AAPL, MSFT, GOOGL) from SEC EDGAR and hourly weather data from Open-Meteo, streams them through Apache Kafka, stores them in Snowflake, transforms them with dbt, and serves an interactive Plotly/Dash dashboard — orchestrated by Apache Airflow and hosted on AWS EC2 via K3S Kubernetes.
+End-to-end data pipeline that pulls daily stock financials (AAPL, MSFT, GOOGL) from SEC EDGAR and hourly weather data from Open-Meteo, streams them through Apache Kafka, stores them in Snowflake, transforms them with dbt, detects anomalies with an IsolationForest model tracked in MLflow, and serves an interactive Plotly/Dash dashboard — orchestrated by Apache Airflow and hosted on AWS EC2 via K3S Kubernetes.
 
 ---
 
@@ -13,12 +14,12 @@ End-to-end data pipeline that pulls daily stock financials (AAPL, MSFT, GOOGL) f
 Five Airflow DAGs work together in two pairs plus one monitor:
 
 1. **Stock producer** (`dag_stocks.py`, daily) — resolves ticker → CIK, fetches XBRL financial data from SEC EDGAR, cleans it, then publishes a JSON message to the `stocks-financials-raw` Kafka topic.
-2. **Stock consumer** (`dag_stocks_consumer.py`, event-driven) — triggered by the producer; reads the message from Kafka, writes new rows to Snowflake `RAW.COMPANY_FINANCIALS`, then runs dbt to build staging views and mart tables.
+2. **Stock consumer** (`dag_stocks_consumer.py`, event-driven) — triggered by the producer; reads the message from Kafka, writes new rows to Snowflake `RAW.COMPANY_FINANCIALS`, runs dbt to build staging views and mart tables, then runs the anomaly detector (`anomaly_detector.py`) under a separate ml-venv, which fits an IsolationForest model on year-over-year financial growth, writes flagged rows to `ANALYTICS.FCT_ANOMALIES`, and logs the run to MLflow.
 3. **Weather producer** (`dag_weather.py`, hourly) — fetches a 7-day hourly forecast from Open-Meteo and publishes it to the `weather-hourly-raw` Kafka topic.
 4. **Weather consumer** (`dag_weather_consumer.py`, event-driven) — triggered by the producer; reads from Kafka, deduplicates against existing Snowflake rows, writes net-new rows to `RAW.WEATHER_HOURLY`, then runs dbt.
 5. **Staleness monitor** (`dag_staleness_check.py`, every 30 min) — checks that both pipelines ran recently and fires a Slack alert if they haven't.
 
-Flask + Dash queries Snowflake's `MARTS` schema (the dbt-built tables) and renders an interactive candlestick chart with volume bars and a stats table.
+Flask + Dash queries Snowflake's `MARTS` schema (the dbt-built tables) and renders an interactive candlestick chart with volume bars and a stats table. A separate "Data Quality" section queries `FCT_ANOMALIES` and displays a scatter chart and detail table of flagged records.
 
 ---
 
@@ -32,8 +33,9 @@ Flask + Dash queries Snowflake's `MARTS` schema (the dbt-built tables) and rende
 | **Kafka** | A message queue that sits between "fetch data" and "store data." The producer DAG drops a message into a Kafka topic (like a mailbox); the consumer DAG picks it up. This decouples the two sides — the producer doesn't need to know or care where the data ends up. |
 | **Snowflake** | The cloud data warehouse. It's the permanent home for all cleaned data. Raw API data lands in the `RAW` schema; dbt-built tables live in `STAGING` and `MARTS`. |
 | **dbt** | The transformation layer. It takes the raw Snowflake tables and builds clean, deduplicated, tested views and tables on top — all in versioned SQL. The consumer DAGs call dbt automatically after every load. |
-| **Flask + Dash** | The web app. It queries Snowflake's mart tables and renders charts in the browser. |
-| **K3S / Kubernetes** | Runs all services (Airflow, Kafka, Flask) as containers on EC2. If a pod crashes, Kubernetes restarts it automatically. |
+| **Flask + Dash** | The web app. It queries Snowflake's mart tables and renders charts in the browser, including a "Data Quality" section that shows anomaly-flagged records. |
+| **MLflow** | Experiment tracking server. Every time the anomaly detection model runs, MLflow records which parameters were used, what the results were, and stores the model artifact — so any run can be reproduced later. |
+| **K3S / Kubernetes** | Runs all services (Airflow, Kafka, Flask, MLflow) as containers on EC2. If a pod crashes, Kubernetes restarts it automatically. |
 
 ### Data flow, step by step
 
@@ -59,7 +61,11 @@ Flask + Dash queries Snowflake's `MARTS` schema (the dbt-built tables) and rende
         ↓
 9. dbt_test — runs data quality checks (not_null, unique, custom)
         ↓
-10. Flask/Dash — queries MARTS and renders the dashboard
+10. run_anomaly_detector — IsolationForest model scores each ticker's
+        YoY revenue and net income growth; anomalies written to
+        ANALYTICS.FCT_ANOMALIES; run logged to MLflow
+        ↓
+11. Flask/Dash — queries MARTS + FCT_ANOMALIES and renders the dashboard
 ```
 
 ### Why Kafka in the middle?
@@ -79,18 +85,21 @@ AWS EC2 t3.large (2 vCPU, 8 GB RAM, 100 GiB EBS)
 └── K3S Kubernetes
     │
     ├── Pod: Apache Airflow 3.1.8  (Helm chart, LocalExecutor)
-    │   ├── dag_stocks.py            SEC EDGAR API → Kafka     (daily)
-    │   ├── dag_stocks_consumer.py   Kafka → Snowflake → dbt   (triggered)
-    │   ├── dag_weather.py           Open-Meteo API → Kafka    (hourly)
-    │   ├── dag_weather_consumer.py  Kafka → Snowflake → dbt   (triggered)
-    │   └── dag_staleness_check.py   freshness monitor         (every 30 min)
+    │   ├── dag_stocks.py            SEC EDGAR API → Kafka               (daily)
+    │   ├── dag_stocks_consumer.py   Kafka → Snowflake → dbt → anomalies (triggered)
+    │   ├── dag_weather.py           Open-Meteo API → Kafka              (hourly)
+    │   ├── dag_weather_consumer.py  Kafka → Snowflake → dbt             (triggered)
+    │   └── dag_staleness_check.py   freshness monitor                   (every 30 min)
+    │
+    ├── Pod: MLflow  (Deployment, port 5000, artifact root on PVC)
+    │   └── tracks anomaly detection runs — parameters, metrics, model artifacts
     │
     ├── Pod: Apache Kafka 4.0  (StatefulSet, KRaft mode, 2Gi PVC)
     │   ├── stocks-financials-raw   (1 partition, 48h/100MB retention)
     │   └── weather-hourly-raw      (1 partition, 48h/100MB retention)
     │
     ├── Pod: Flask + Dash  (Gunicorn, NodePort 32147)
-    │   ├── /dashboard/   candlestick chart, volume bars, stats table
+    │   ├── /dashboard/   candlestick chart, volume bars, stats table, Data Quality section
     │   └── /health       Kubernetes liveness probe
     │
     ├── Pod: PostgreSQL   (Airflow metadata — not your pipeline data)
@@ -102,10 +111,11 @@ AWS EC2 t3.large (2 vCPU, 8 GB RAM, 100 GiB EBS)
 
 Snowflake (external cloud warehouse)
     └── PIPELINE_DB
-        ├── RAW.COMPANY_FINANCIALS    — stock rows written by consumer DAG
-        ├── RAW.WEATHER_HOURLY        — weather rows written by consumer DAG
-        ├── STAGING.*                 — dbt VIEWs (zero storage cost)
-        └── MARTS.*                   — dbt TABLEs (queried by Flask/Dash)
+        ├── RAW.COMPANY_FINANCIALS      — stock rows written by consumer DAG
+        ├── RAW.WEATHER_HOURLY          — weather rows written by consumer DAG
+        ├── STAGING.*                   — dbt VIEWs (zero storage cost)
+        ├── MARTS.*                     — dbt TABLEs (queried by Flask/Dash)
+        └── ANALYTICS.FCT_ANOMALIES     — anomaly-flagged rows written by anomaly_detector.py
 ```
 
 ---
@@ -120,6 +130,7 @@ Snowflake (external cloud warehouse)
 | Data warehouse | Snowflake Standard Edition (XSMALL warehouse, auto-suspend 60s) |
 | Transformations | dbt 1.8.0 + dbt-snowflake (models + tests, run by consumer DAGs) |
 | Web / Dashboard | Flask 2.3.3 + Dash 2.17.1 + Plotly 5.22.0 |
+| ML / Experiment tracking | MLflow 2.x + scikit-learn IsolationForest (runs under dedicated ml-venv on EC2) |
 | Container runtime | containerd (via K3S) |
 | Cloud | AWS EC2 t3.large, 100 GiB EBS gp3 (~$70–75/month total) |
 | Stock data | SEC EDGAR XBRL API (free, no API key) |
@@ -153,6 +164,8 @@ ssh -L 30080:localhost:30080 -L 32147:localhost:32147 ec2-stock
 - **Cost controls** — daily batch gate (write to Snowflake once/day, not every hourly run); weather dedup against existing timestamps; Snowflake XSMALL + auto-suspend 60s; Flask query cache (1hr financials, 15min weather)
 - **Vacation mode** — set `VACATION_MODE=true` to pause all pipelines without deleting DAGs
 - **Rate limiting** — SEC EDGAR client uses a token-bucket limiter (8 req/sec, thread-safe)
+- **Anomaly detection** — IsolationForest model scores each ticker's year-over-year revenue and net income growth; flagged rows written to `ANALYTICS.FCT_ANOMALIES` and visible in the dashboard's "Data Quality" tab
+- **ML experiment tracking** — every anomaly detection run is logged to MLflow (parameters, metrics, model artifact) so any result can be reproduced or compared later
 - **PVC-backed task logs** — structured logs survive pod restarts
 - **Secrets management** — credentials via K8s Secrets (prod) or `.env` files (local)
 
@@ -172,6 +185,15 @@ Each consumer DAG calls `dbt run` + `dbt test` after it writes to Snowflake. Thi
 **Large payloads staged to PVC, not XCom**
 SEC EDGAR returns ~45 MB of XBRL JSON. Airflow's XCom uses the metadata DB (PostgreSQL), which has a practical size limit. The DAG writes the payload to a shared PVC and passes only the file path (~100 bytes) through XCom.
 
+**MLflow: tracking anomaly detection as a data engineering responsibility**
+The pipeline uses MLflow to log every anomaly detection run — not because this is a data science project, but because model reproducibility is a data engineering responsibility. If an anomaly is flagged in `FCT_ANOMALIES`, an engineer needs to know exactly which model version, which parameters, and which data snapshot produced it. MLflow provides that audit trail automatically, without any manual bookkeeping.
+
+**IsolationForest over a hard-coded threshold**
+A fixed threshold (for example, "flag any year-over-year drop greater than 50%") breaks the moment the data distribution shifts — new companies, new economic conditions, a one-time write-off. IsolationForest learns the normal distribution from the data itself and scores each data point relative to its peers. It also requires no labeled training data, which fits a pipeline that runs automatically without human annotation.
+
+**ml-venv: a separate Python environment for the ML step**
+scikit-learn and mlflow are not installed in the main Airflow image — adding them would bloat the image and risk version conflicts with Airflow's own dependencies. Instead, the anomaly detector runs as a subprocess under `/opt/ml-venv`, a dedicated Python environment provisioned on the EC2 host. The Airflow task just calls `subprocess.run(["ml-venv/bin/python", "anomaly_detector.py"])` and reads the JSON result from stdout.
+
 ---
 
 ## Roadmap
@@ -181,7 +203,7 @@ SEC EDGAR returns ~45 MB of XBRL JSON. Airflow's XCom uses the metadata DB (Post
 | Step 1 | ✓ Complete | Airflow + MariaDB + Flask/Dash on EC2/K3S |
 | Step 2 | ✓ Complete | Snowflake · dbt · Kafka streaming layer |
 | Step 3 | Planned | Portfolio polish: public dashboard URL, architecture diagram, GitHub Actions CI (dbt test on PR) |
-| Step 4 | Planned | MLflow anomaly detection on financial metrics |
+| Step 4 | ✓ Complete | MLflow anomaly detection — IsolationForest on financial metrics, FCT_ANOMALIES, Data Quality dashboard section |
 | Step 5 | Planned | Terraform (codify EC2 infra as IaC) |
 
 ---

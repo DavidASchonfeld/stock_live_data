@@ -15,6 +15,10 @@ set -euo pipefail
 DEPLOY_FAILED_CMD=""
 trap 'DEPLOY_FAILED_CMD="$BASH_COMMAND"' ERR
 
+# Set a flag when the user presses Ctrl+C so the summary can say why it stopped
+DEPLOY_INTERRUPTED=false
+trap 'DEPLOY_INTERRUPTED=true; exit 130' INT
+
 # ── Log setup ─────────────────────────────────────────────────────────────────
 # Save all output to a log file so we can search it for the end-of-run summary
 DEPLOY_LOGFILE="/tmp/deploy-last.log"

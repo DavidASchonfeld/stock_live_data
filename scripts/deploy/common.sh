@@ -58,6 +58,10 @@ _print_deploy_summary() {
         echo "  DEPLOY COMPLETE"
     else
         echo "  DEPLOY FAILED  (exit code: $exit_code)"
+        # Show a clear note when the user pressed Ctrl+C — makes it obvious later why the deploy stopped
+        if [ "${DEPLOY_INTERRUPTED:-false}" = true ]; then
+            echo "  Stopped by: Ctrl+C (manually interrupted)"
+        fi
         # Show the exact bash command that triggered the failure — set by the ERR trap in deploy.sh
         if [ -n "${DEPLOY_FAILED_CMD:-}" ]; then
             echo "  Failed command: $DEPLOY_FAILED_CMD"
