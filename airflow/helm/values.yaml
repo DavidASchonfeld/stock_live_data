@@ -25,7 +25,7 @@ imagePullSecrets:
 #   causes pip to downgrade them at every pod startup (~7 min download), breaking the startup probe
 env:
   - name: _PIP_ADDITIONAL_REQUIREMENTS
-    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0 kafka-python"
+    value: "pymysql requests>=2.32.3 apache-airflow-providers-common-compat>=1.5.0 kafka-python python-dotenv"
   - name: AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE  # prevents moment.tz.guess() on login; moment.tz() error on Home Page is a known Airflow 3.x cosmetic bug (non-blocking, unfixable via Helm)
     value: "America/New_York"
   # OpenLineage — native to Airflow 3.x (apache-airflow-providers-openlineage bundled)
@@ -43,6 +43,13 @@ env:
     value: "ignore:This process:DeprecationWarning"   # suppress LocalExecutor os.fork() warning — harmless, Airflow calls os.fork() directly bypassing MP_START_METHOD
   - name: MLFLOW_TRACKING_URI  # lets Airflow tasks log experiments to the in-cluster MLflow server
     value: "http://mlflow.airflow-my-namespace.svc.cluster.local:5500"
+  # AIRFLOW_VAR_ prefix: Airflow natively exposes these as Variable.get() without any kubectl exec or DB write.
+  # Running `airflow variables set` via kubectl exec spawns a full Python process that imports all providers —
+  # on Airflow 3.x this memory spike OOM-kills (exit 137) the scheduler container. Env vars avoid that entirely.
+  - name: AIRFLOW_VAR_MLFLOW_TRACKING_URI  # Variable.get('MLFLOW_TRACKING_URI') in DAGs/anomaly_detector.py
+    value: "http://mlflow.airflow-my-namespace.svc.cluster.local:5500"
+  - name: AIRFLOW_VAR_KAFKA_BOOTSTRAP_SERVERS  # Variable.get('KAFKA_BOOTSTRAP_SERVERS') in consumer DAGs
+    value: "kafka.kafka.svc.cluster.local:9092"
 
 # Override postgresql image: chart default tag (16.1.0-debian-11-r15) removed from Docker Hub; ECR Public has no rate limits from EC2
 postgresql:
@@ -135,27 +142,34 @@ scheduler:
    - name: dbt-profiles
      mountPath: /dbt              # matches DBT_PROFILES_DIR=/dbt in BashOperator bash_command
      readOnly: true
-  # Airflow 3.x loads full provider stack per jobs-check call; needs 45s. 10 chances × 30s = 5 min startup window.
+  # Airflow 3.x loads full provider stack per jobs-check call; needs up to 45s on t3.large.
+  # timeoutSeconds raised 45→60: probes were hitting the 45s ceiling under load, causing CrashLoopBackOff.
+  # failureThreshold raised 15→30 (Apr 2026): belt-and-suspenders for CPU-starved deploys;
+  # 30 chances × 60s (timeoutSeconds dominates periodSeconds) = 30 min startup window.
   startupProbe:
-    failureThreshold: 10
+    failureThreshold: 30
     periodSeconds: 30
-    timeoutSeconds: 45
+    timeoutSeconds: 60
   # Auto-restarts scheduler if it freezes without crashing (startup probe only fires once at boot)
   livenessProbe:
     initialDelaySeconds: 10   # wait 10s after startup probe passes before first check
-    timeoutSeconds: 45        # Airflow 3.x loads full provider stack per jobs-check call; needs up to 45s
+    timeoutSeconds: 60        # raised 45→60 to match startupProbe (same provider-load reason)
     failureThreshold: 5       # 5 consecutive failures (5 min) before K8s kills and restarts the pod
     periodSeconds: 60         # check every 60s — scheduler heartbeats every 5s so this avoids false positives
   # Heart of Airflow — parses DAGs and triggers tasks. Guaranteed 512Mi prevents slow scheduling under load.
-  # 2Gi limit: Airflow 3.x supervisor model spawns ~15 worker subprocesses (each loads providers); OOMKilled at 1Gi.
-  # cpu request lowered 200m→100m (Apr 2026): Kafka added ~100m, pushing node to 97% CPU requests;
-  # scheduler stayed Pending. Requests are scheduling guarantees only — burst limit (1000m) unchanged.
+  # 3Gi limit: raised from 2Gi (Apr 2026) — OpenLineage integration (MLflow Thread 1) spawns a second subprocess
+  # per task to emit lineage events; each OL subprocess loads the full provider stack (~300MB). Two concurrent DAGs
+  # (weather + stocks) produce 4 subprocesses total (2 task workers + 2 OL emitters) at ~400MB each, pushing the
+  # old 2Gi ceiling to ~2.2GB and OOM-killing the pod. 3Gi provides safe headroom.
+  # cpu request raised 100m→200m (Apr 2026): 100m caused CPU starvation during startup — Airflow 3.x provider loading
+  # (~45s normally) was hitting 60s probe timeouts on every attempt, exhausting all 15 startup probe failures (900s)
+  # and triggering CrashLoopBackOff. Offset by reducing webserver/triggerer/dagProcessor requests by 25m each (net +25m).
   resources:
     requests:
       memory: "512Mi"
-      cpu: "100m"
+      cpu: "200m"
     limits:
-      memory: "2Gi"
+      memory: "3Gi"
       cpu: "1000m"
 
 # Resource limits required on t3.large (8 GB RAM). Without limits a runaway component can OOMKill (Out Of Memory Kill — OS force-kills the pod when it exceeds its RAM allowance) other pods.
@@ -172,14 +186,14 @@ enableBuiltInSecretEnvVars:
 webserver:
   # Airflow UI + REST API server. OOMKilled at 1Gi with azure+snowflake providers loaded across 4 workers.
   # Increased to 2Gi limit + 2 workers (AIRFLOW__WEBSERVER__WORKERS=2) to stay well under ceiling.
-  # cpu request lowered 200m→100m (Apr 2026): same CPU-starvation fix as scheduler (see above).
+  # cpu request lowered 100m→75m (Apr 2026): offset for scheduler increase; Gunicorn UI is mostly idle at steady-state.
   env:
     - name: AIRFLOW__WEBSERVER__WORKERS  # reduce from 4→2 workers; each worker loads all providers (~300MB each)
       value: "2"
   resources:
     requests:
       memory: "512Mi"
-      cpu: "100m"
+      cpu: "75m"
     limits:
       memory: "2Gi"
       cpu: "1000m"
@@ -218,6 +232,7 @@ triggerer:
   # Runs deferred operators (async sensors). Baseline is lightweight (~100 MB).
   # 512Mi limit: observed OOMKill at 256Mi on t3.large with providers loaded at startup.
   # Airflow 3.x loads full provider stack per jobs-check call; needs 45s. Same fix as scheduler/api-server/dagProcessor.
+  # cpu request lowered 75m→50m (Apr 2026): offset for scheduler increase; triggerer is lightweight at steady-state.
   livenessProbe:
     initialDelaySeconds: 10
     timeoutSeconds: 45  # Airflow 3.x provider loading takes 30-45s
@@ -226,7 +241,7 @@ triggerer:
   resources:
     requests:
       memory: "128Mi"
-      cpu: "75m"
+      cpu: "50m"
     limits:
       memory: "512Mi"
       cpu: "300m"
@@ -236,6 +251,7 @@ dagProcessor:
   # 512Mi limit: if exceeded it signals a DAG code problem (e.g. import loop), not a sizing issue.
   # dagProcessor schema doesn't support startupProbe — only livenessProbe fields.
   # Raise timeout from default 20s: Airflow 3.x loads full provider stack per jobs-check call (30-45s).
+  # cpu request lowered 75m→50m (Apr 2026): offset for scheduler increase; DAG parsing is periodic, not CPU-intensive.
   livenessProbe:
     initialDelaySeconds: 10
     timeoutSeconds: 45  # Airflow 3.x provider loading takes 30-45s (same fix as scheduler/api-server)
@@ -244,7 +260,7 @@ dagProcessor:
   resources:
     requests:
       memory: "256Mi"
-      cpu: "75m"
+      cpu: "50m"
     limits:
       memory: "512Mi"
       cpu: "500m"

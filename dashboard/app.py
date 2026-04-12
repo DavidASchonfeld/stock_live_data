@@ -17,7 +17,7 @@ from flask import Flask
 # ─────────────────────────────────────────────────────────────────────────────
 
 from routes import register_routes
-from callbacks import register_callbacks
+from callbacks import register_callbacks, register_weather_callbacks  # weather callbacks added for the second Dash app
 from db import prewarm_cache  # imported here to fire pre-warming without going through the callback layer
 
 app = Flask(__name__)
@@ -39,6 +39,13 @@ dash_app.layout = html.Div(
         html.P(
             "SEC EDGAR financial data pulled daily by Airflow → stored in MariaDB (→ Snowflake in Step 2).",
             style={"color": "#6b7280"}
+        ),
+
+        # Navigation link to the weather dashboard page
+        html.A(
+            "View Weather Dashboard →",
+            href="/weather/",  # points to the weather Dash app mounted below
+            style={"color": "#3b82f6", "textDecoration": "none", "fontSize": "14px", "display": "inline-block", "marginBottom": "20px"},
         ),
 
         # ── Ticker selector ───────────────────────────────────────────────
@@ -96,6 +103,55 @@ dash_app.layout = html.Div(
 
 register_routes(app)
 register_callbacks(dash_app)
+
+# ── Weather Dashboard — second Dash app mounted on the same Flask server ──────
+# Dash supports multiple Dash instances on one Flask app; each gets its own URL prefix
+# and its own callback namespace, so there are no conflicts with the stocks callbacks.
+weather_dash_app = dash.Dash(
+    __name__,
+    server=app,                    # share the same Flask instance to avoid spinning up a second server
+    url_base_pathname="/weather/", # weather page lives at /weather/, stocks stays at /dashboard/
+)
+
+weather_dash_app.layout = html.Div(
+    style={"fontFamily": "Arial, sans-serif", "maxWidth": "1100px", "margin": "0 auto", "padding": "20px"},
+    children=[
+
+        html.H1("Weather Analytics Pipeline", style={"color": "#1f2937"}),
+        html.P(
+            "Open-Meteo hourly forecast data (lat=40°N, lon=40°E) ingested via Airflow → Kafka → Snowflake.",
+            style={"color": "#6b7280"},
+        ),
+
+        # Navigation link back to the stocks dashboard
+        html.A(
+            "← View Stocks Dashboard",
+            href="/dashboard/",  # points back to the stocks Dash app
+            style={"color": "#3b82f6", "textDecoration": "none", "fontSize": "14px", "display": "inline-block", "marginBottom": "20px"},
+        ),
+
+        # Refresh button triggers the weather callback to reload data from Snowflake
+        html.Button(
+            "Refresh Weather",
+            id="weather-refresh-btn",  # id referenced by update_weather callback in callbacks.py
+            n_clicks=0,
+            style={"display": "block", "marginBottom": "20px"},
+        ),
+
+        # dcc.Loading wraps both weather outputs — shows a spinner while Snowflake is queried
+        dcc.Loading(
+            id="loading-weather",
+            type="circle",  # consistent spinner style with the stocks dashboard
+            children=[
+                dcc.Graph(id="weather-temp-chart"),  # populated by update_weather callback — 7-day temperature line chart
+                html.Div(id="weather-stats-table", style={"marginTop": "20px"}),  # populated by update_weather callback — current temp + 24h stats
+            ],
+        ),
+    ],
+)
+
+register_weather_callbacks(weather_dash_app)  # wire the weather callbacks onto the weather Dash app
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Pre-warm the cache in a background thread immediately after startup — Snowflake is queried
 # once here so every subsequent user request hits the in-memory cache instead of the DB.

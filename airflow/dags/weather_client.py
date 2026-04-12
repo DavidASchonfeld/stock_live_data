@@ -3,8 +3,7 @@
 import requests
 import json
 
-import pandas as pd
-from file_logger import OutputTextWriter  # renamed from outputTextWriter
+from file_logger import OutputTextWriter  # renamed from outputTextWriter; pandas moved to __main__ block to avoid DAG parse timeout
 
 
 # Removed: from api_key import api_keys — Open-Meteo is free/keyless; import was unused leftover from OpenWeatherMap era
@@ -48,7 +47,7 @@ def fetch_weather_forecast(latitude: float, longitude: float, fahrenheit: bool) 
         "temperature_unit" : measurement_tool
     }
     try:
-        response : requests.Response = requests.get(base_url, params = parameters)
+        response : requests.Response = requests.get(base_url, params=parameters, timeout=10)  # fail fast if Open-Meteo is unresponsive
         response.raise_for_status()
     except requests.exceptions.HTTPError as error:
         print(f"response.status_code: {response.status_code}")
@@ -63,6 +62,7 @@ def fetch_weather_forecast(latitude: float, longitude: float, fahrenheit: bool) 
 
 # Only runs if this script is called directly, not if this script is imported
 if __name__ == "__main__":
+    import pandas as pd  # deferred: only needed for local testing; not loaded when DAG imports this module
 
     raw_data : dict = fetch_weather_forecast(latitude=40, longitude=40, fahrenheit=True)
     print(raw_data)

@@ -1,0 +1,11 @@
+# Copy this file to terraform.tfvars and fill in your real values.
+# terraform.tfvars is gitignored — never commit it.
+# See docs/architecture/TERRAFORM_IaC.md for full setup and import instructions.
+
+aws_region = "us-east-1"
+
+# Name exactly as it appears in AWS Console → EC2 → Key Pairs (not the .pem filename)
+key_pair_name = "kafkaProjectKeyPair_4-29-2025"
+
+# Do NOT set ssh_ingress_cidr here — terraform.sh detects your current public IP automatically.
+# To override manually: SSH_INGRESS_CIDR="1.2.3.4/32" ./scripts/deploy/terraform.sh apply

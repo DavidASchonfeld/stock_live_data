@@ -9,9 +9,6 @@ import pendulum
 from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator  # fires consumer DAG after publish
 
-import pandas as pd
-
-
 # My Files
 from edgar_client import resolve_cik, fetch_company_facts, flatten_company_financials  # SEC EDGAR XBRL API calls and data flattening
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
@@ -48,6 +45,7 @@ TICKERS: list[str] = ["AAPL", "MSFT", "GOOGL"]  # Must match TICKERS in dashboar
         "depends_on_past": False,
         "retries": 1,
         "retry_delay": timedelta(minutes=5),
+        "execution_timeout": timedelta(minutes=10),  # hard ceiling: kills task if it hangs past this
         'on_failure_callback': on_failure_alert,  # Slack + PVC log on task failure
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
@@ -144,6 +142,7 @@ def stock_market_pipeline():
 
     @task()
     def transform(staging_path: str) -> list[dict[str, Any]]:
+        import pandas as pd  # deferred: avoid slow pandas init during DagBag parse (30s timeout)
         """
         ### Transform
         Flatten each ticker's nested XBRL JSON into a list of row-dicts.
@@ -205,6 +204,7 @@ def stock_market_pipeline():
         producer = KafkaProducer(
             bootstrap_servers=bootstrap,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            max_block_ms=15000,  # fail fast if broker unreachable during send/flush
         )
 
         # Single message per run — full list-of-dicts as one JSON payload

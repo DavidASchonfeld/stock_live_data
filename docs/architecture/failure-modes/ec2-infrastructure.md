@@ -49,3 +49,17 @@ Back to [Failure Mode Index](../FAILURE_MODE_MAP.md)
 | **Root cause** | All RAM and vCPU shared across all K3s pods plus the OS. Large DataFrame operations in DAGs, runaway log growth, or memory leaks push past limits. |
 | **Blast radius** | Cascading pod evictions. SSH itself may become unusable if the OOM killer targets system processes. |
 | **Prevention** | Set K8s resource limits per pod. Monitor with `kubectl top nodes` and `kubectl top pods`. |
+
+---
+
+### EC-6: Terraform IAM Instance Profile Name Mismatch (Apr 11 2026)
+
+| Field | Detail |
+|-------|--------|
+| **Symptoms** | `./scripts/deploy/terraform.sh import` printed `aws_iam_instance_profile.ec2_ecr_profile not found in AWS — apply will create it` even though the IAM role existed. |
+| **Root cause** | When you create an IAM role via the AWS console "EC2 use case" wizard, the console **auto-creates an instance profile with the same name as the role** (`ec2-ecr-role`). The Terraform config and import script were using a different name (`ec2-ecr-profile`), so the AWS lookup returned nothing. |
+| **Why it matters** | An IAM role cannot be attached directly to an EC2 instance — AWS requires the role to be wrapped in an instance profile first. Without importing the existing profile, Terraform would have created a second orphaned profile (`ec2-ecr-profile`) alongside the console-created `ec2-ecr-role` profile. |
+| **Fix** | Changed `name` in `aws_iam_instance_profile.ec2_ecr_profile` (`terraform/main.tf:98`) from `"ec2-ecr-profile"` → `"ec2-ecr-role"`. Updated the import script (`scripts/deploy/terraform.sh` import section) to look up and import `ec2-ecr-role` instead of `ec2-ecr-profile`. |
+| **Why this fix (not alternative)** | Option B was to let Terraform create a new `ec2-ecr-profile` profile. Rejected: it would leave the console-created `ec2-ecr-role` profile orphaned in AWS with no Terraform owner. Since EC2 didn't exist yet (fresh create), there was zero disruption from importing the existing profile instead. |
+| **Verification** | Re-ran `./scripts/deploy/terraform.sh import` → `aws_iam_instance_profile.ec2_ecr_profile: Import prepared! ... Import successful!` |
+| **Real incident?** | Yes — Apr 11 2026. One-time: occurs when migrating manually-created IAM roles into Terraform if the profile name was assumed rather than verified. |

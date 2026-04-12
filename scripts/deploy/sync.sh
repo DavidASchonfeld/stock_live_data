@@ -46,19 +46,44 @@ step_sync_manifests_secrets() {
         fi
     "
 
-    echo "=== Step 2c1a: Patching SNOWFLAKE_ROLE into snowflake-credentials secret ==="
+    echo "=== Step 2c1a: Patching SNOWFLAKE_ROLE + AIRFLOW_CONN_SNOWFLAKE_DEFAULT into snowflake-credentials secret ==="
     # SNOWFLAKE_ROLE is not stored in snowflake-secret.yaml, so we add it here on every deploy.
     # anomaly_detector.py reads this value from the environment at runtime.
+    #
+    # AIRFLOW_CONN_SNOWFLAKE_DEFAULT is also injected here.
+    # Airflow 3 reads AIRFLOW_CONN_<CONN_ID> env vars at startup and auto-registers the connection —
+    # this means SnowflakeHook(snowflake_conn_id="snowflake_default") works on a fresh install
+    # without any manual setup in the Airflow UI.
+    #
     # The JSON patch `add` operation creates the key if it doesn't exist, or updates it if it does — safe to run every time.
     ssh "$EC2_HOST" "
+        # Read Snowflake credentials from the already-applied snowflake-credentials secret
+        SF_ACCOUNT=\$(kubectl get secret snowflake-credentials -n airflow-my-namespace -o jsonpath='{.data.SNOWFLAKE_ACCOUNT}' | base64 -d) &&
+        SF_USER=\$(kubectl get secret snowflake-credentials -n airflow-my-namespace -o jsonpath='{.data.SNOWFLAKE_USER}' | base64 -d) &&
+        SF_PASS=\$(kubectl get secret snowflake-credentials -n airflow-my-namespace -o jsonpath='{.data.SNOWFLAKE_PASSWORD}' | base64 -d) &&
+
+        # Build the Airflow connection in JSON format — SnowflakeHook 6.x reads 'account' from extra,
+        # not from the URI host field. Using JSON ensures account is correctly set in extra.
+        # JSON-escape the password to handle special characters safely.
+        SF_PASS_ESC=\$(python3 -c \"import json, sys; print(json.dumps(sys.argv[1])[1:-1])\" \"\$SF_PASS\") &&
+        CONN_URI=\"{\\\"conn_type\\\": \\\"snowflake\\\", \\\"login\\\": \\\"\$SF_USER\\\", \\\"password\\\": \\\"\$SF_PASS_ESC\\\", \\\"extra\\\": {\\\"account\\\": \\\"\$SF_ACCOUNT\\\", \\\"database\\\": \\\"PIPELINE_DB\\\", \\\"schema\\\": \\\"RAW\\\", \\\"warehouse\\\": \\\"PIPELINE_WH\\\", \\\"role\\\": \\\"PIPELINE_ROLE\\\"}}\" &&
+
         ROLE_B64=\$(printf 'PIPELINE_ROLE' | base64 -w0) &&
+        CONN_B64=\$(printf '%s' \"\$CONN_URI\" | base64 -w0) &&
+
         kubectl patch secret snowflake-credentials -n airflow-my-namespace \
             --type=json \
-            -p=\"[{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/data/SNOWFLAKE_ROLE\\\",\\\"value\\\":\\\"\$ROLE_B64\\\"}]\" &&
+            -p=\"[
+                {\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/data/SNOWFLAKE_ROLE\\\",\\\"value\\\":\\\"\$ROLE_B64\\\"},
+                {\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/data/AIRFLOW_CONN_SNOWFLAKE_DEFAULT\\\",\\\"value\\\":\\\"\$CONN_B64\\\"}
+            ]\" &&
         kubectl patch secret snowflake-credentials -n default \
             --type=json \
-            -p=\"[{\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/data/SNOWFLAKE_ROLE\\\",\\\"value\\\":\\\"\$ROLE_B64\\\"}]\" &&
-        echo 'SNOWFLAKE_ROLE=PIPELINE_ROLE patched into both namespaces.'
+            -p=\"[
+                {\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/data/SNOWFLAKE_ROLE\\\",\\\"value\\\":\\\"\$ROLE_B64\\\"},
+                {\\\"op\\\":\\\"add\\\",\\\"path\\\":\\\"/data/AIRFLOW_CONN_SNOWFLAKE_DEFAULT\\\",\\\"value\\\":\\\"\$CONN_B64\\\"}
+            ]\" &&
+        echo 'SNOWFLAKE_ROLE + AIRFLOW_CONN_SNOWFLAKE_DEFAULT patched into both namespaces.'
     "
 
     echo "=== Step 2c2: Syncing dbt profiles secret to EC2 ==="

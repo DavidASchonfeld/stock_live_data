@@ -2,8 +2,9 @@ import plotly.graph_objects as go
 from dash import html
 from dash.dependencies import Input, Output
 
-from db import _load_ticker_data, load_anomalies  # load_anomalies added for the Data Quality section
+from db import _load_ticker_data, load_anomalies, load_weather_data  # load_weather_data added for the weather page
 from charts import build_revenue_net_income_fig, build_net_income_fig, build_stats_table, build_anomaly_scatter, build_anomaly_table  # anomaly chart builders added
+from weather_charts import build_temperature_fig, build_weather_stats_table  # weather chart builders added
 
 
 def register_callbacks(dash_app) -> None:
@@ -57,3 +58,24 @@ def register_callbacks(dash_app) -> None:
             empty_fig.add_annotation(text=f"DB error: {e}", showarrow=False, font={"size": 14})
             return empty_fig, html.P(f"Could not load anomaly data: {e}", style={"color": "red"})
         return build_anomaly_scatter(df), build_anomaly_table(df)  # chart + table rendered from the same DataFrame
+
+
+def register_weather_callbacks(weather_dash_app) -> None:
+    """Register all Dash callbacks onto the weather Dash app instance."""
+
+    @weather_dash_app.callback(
+        Output("weather-temp-chart", "figure"),    # 1st return value → sets the temperature line chart
+        Output("weather-stats-table", "children"), # 2nd return value → sets the stats table's HTML children
+        Input("weather-refresh-btn", "n_clicks"),  # triggers on button click and on initial page load
+        prevent_initial_call=False,  # load data immediately on page load, not just on button click
+    )
+    def update_weather(n_clicks):
+        """Re-render temperature chart and stats table on page load or when the user clicks Refresh."""
+        try:
+            df = load_weather_data()  # query Snowflake (or return empty frame for non-Snowflake backends)
+        except Exception as e:
+            # Show an error annotation in the chart area if Snowflake is unreachable
+            empty_fig = go.Figure()
+            empty_fig.add_annotation(text=f"DB error: {e}", showarrow=False, font={"size": 14})  # error visible in the chart area
+            return empty_fig, html.P(f"Could not load weather data: {e}", style={"color": "red"})
+        return build_temperature_fig(df), build_weather_stats_table(df)  # chart + stats rendered from the same DataFrame

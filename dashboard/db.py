@@ -123,6 +123,46 @@ def prewarm_cache(tickers: list) -> None:
         load_anomalies()  # populates the anomalies cache entry
     except Exception:
         pass
+    try:
+        load_weather_data()  # populates the weather cache entry so the weather page loads instantly
+    except Exception:
+        pass  # non-fatal — same pattern as financials and anomalies above
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Weather data ─────────────────────────────────────────────────────────────
+# Column list defined once so the guard path and real query always return the same schema
+WEATHER_COLUMNS = ["observation_time", "temperature_f", "latitude", "longitude", "elevation", "timezone"]
+
+def load_weather_data() -> pd.DataFrame:
+    """Return last 7 days of hourly weather from FCT_WEATHER_HOURLY; empty DataFrame if unavailable.
+
+    Only runs against Snowflake — FCT_WEATHER_HOURLY does not exist in MariaDB.
+    Cached for 15 minutes (CACHE_TTL_WEATHER) because forecast data updates hourly.
+    """
+    # Guard: FCT_WEATHER_HOURLY only exists in Snowflake — skip for other backends
+    if DB_BACKEND != "snowflake":
+        return pd.DataFrame(columns=WEATHER_COLUMNS)  # typed empty frame keeps callers from getting None
+
+    # Return in-memory cache hit to avoid a Snowflake round-trip on every page load
+    cached = _cache_get("weather")
+    if cached is not None:
+        return cached  # cache hit — return immediately
+
+    # Fetch last 7 days of hourly rows ordered chronologically for the line chart
+    query = text("""
+        SELECT observation_time, temperature_f, latitude, longitude, elevation, timezone
+        FROM PIPELINE_DB.MARTS.FCT_WEATHER_HOURLY
+        WHERE observation_time >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+        ORDER BY observation_time ASC
+    """)
+    try:
+        with DB_ENGINE.connect() as conn:
+            df = pd.read_sql(query, conn)  # execute and load all rows into a DataFrame
+        _cache_set("weather", df, CACHE_TTL_WEATHER)  # cache for 15 min — matches Open-Meteo refresh cadence
+        return df
+    except Exception:
+        # Table may not have data yet or Snowflake may be briefly unavailable — return empty frame
+        return pd.DataFrame(columns=WEATHER_COLUMNS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Anomaly detection results ─────────────────────────────────────────────────

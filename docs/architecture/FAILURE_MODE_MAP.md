@@ -19,10 +19,11 @@ When something breaks, find the component showing symptoms in the relevant secti
 
 | Component | Failure modes | Guide |
 |-----------|--------------|-------|
-| Airflow (Scheduler + DAG Processor) | AF-1 through AF-8 | [failure-modes/airflow.md](failure-modes/airflow.md) |
+| Airflow (Scheduler + DAG Processor) | AF-1 through AF-9 | [failure-modes/airflow.md](failure-modes/airflow.md) |
 | Flask / Dash (API + Dashboard) | FL-1 through FL-5 | [failure-modes/flask-dash.md](failure-modes/flask-dash.md) |
 | K3s / Kubernetes | K8-1 through K8-6 | [failure-modes/kubernetes.md](failure-modes/kubernetes.md) |
-| AWS EC2 / Infrastructure | EC-1 through EC-5 | [failure-modes/ec2-infrastructure.md](failure-modes/ec2-infrastructure.md) |
+| AWS EC2 / Infrastructure | EC-1 through EC-7 | [failure-modes/ec2-infrastructure.md](failure-modes/ec2-infrastructure.md) |
+| Terraform Apply — EC2 Migration | EC-7 + runbook | [failure-modes/terraform-apply-migration.md](failure-modes/terraform-apply-migration.md) |
 | API Layer (SEC EDGAR / Open-Meteo) | API-1 through API-5 | [failure-modes/api-layer.md](failure-modes/api-layer.md) |
 
 ---
@@ -38,6 +39,7 @@ When something breaks, find the component showing symptoms in the relevant secti
 | All pods CreateContainerConfigError after helm upgrade | AF-7 (missing chart secret — run with enableBuiltInSecretEnvVars fix) |
 | Scheduler OOMKilled every few minutes after upgrade | AF-6 (2Gi memory limit needed for Airflow 3.x) |
 | helm upgrade accidentally jumped major versions, can't roll back | AF-8 (DB schema upgraded — move forward, don't roll back) |
+| deploy fails: timed out waiting for airflow-scheduler-0 Ready | AF-9 (kubectl wait timeout < startup probe ceiling) |
 | Pod shows ImagePullBackOff | FL-2 (ECR token) or AF-3 (deleted image) |
 | Port unreachable, pod is Running | K8-3 or FL-5 (selector mismatch) |
 | Pod empty directory, files on EC2 | K8-1 (PV path mismatch) |
@@ -47,7 +49,15 @@ When something breaks, find the component showing symptoms in the relevant secti
 | SSH timeout from new location | EC-1 (IP restriction) |
 | API returns data but it's wrong | API-2 (schema change) |
 | Dashboard shows old data, no errors | FL-4 (stale data, silent DAG failure) |
+| Task log ends mid-DagBag-load, no traceback, process restarts → OOM Kill | AF-10 (see alerting-staleness-oom-apr12-2026.md) |
+| deploy: "airflow health failed after 5 attempts" (exit 137) | AF-11 (see airflow-health-check-oom-apr12-2026.md) — `airflow health` CLI OOM-kills scheduler |
+| deploy: "airflow health failed after 5 attempts" (exit 7) | AF-12 (see airflow-health-check-exit7-apr12-2026.md) — port 8974 is Airflow 2.x only |
+| deploy: "airflow health failed after 5 attempts" (exit 1) | AF-13 (see airflow-health-check-pgrep-exit1-apr12-2026.md) — pgrep pattern doesn't match Airflow 3.x process name |
+
+> **Diagnostic rule:** No Python traceback in a task log = OOM Kill. Python exceptions always produce tracebacks — SIGKILL doesn't.
+
+> **Health check rule:** Never exec an Airflow CLI command into a running scheduler pod — it imports all providers (~400 MB) and risks OOM. Use port 8793 (Airflow 3.x internal API) or `/bin/true` to verify exec connectivity only.
 
 ---
 
-**Last updated:** 2026-04-06 — Added AF-6 (scheduler OOMKill in 3.x), AF-7 (missing chart secret after upgrade), AF-8 (helm upgrade without version pin); updated AF-3; updated quick lookup table.
+**Last updated:** 2026-04-12 — Added AF-11/12/13: three successive health check failures (exit 137 OOM → exit 7 wrong port → exit 1 wrong pgrep pattern). Final fix: `curl http://localhost:8793/` checks Airflow 3.x internal execution API server. Added OOM audit confirming no remaining risky exec commands in deploy scripts.

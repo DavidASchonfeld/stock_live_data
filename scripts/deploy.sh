@@ -1,10 +1,16 @@
 #!/bin/bash
 # Deploy updated DAGs and dashboard to EC2 production.
 # Usage:
-#   ./scripts/deploy.sh              — full deploy (Docker build, Kafka, MLflow, Flask, Helm, pods)
-#   ./scripts/deploy.sh --dags-only  — fast path: only sync DAG files + restart Airflow pods (~5-7 min)
-#                                      Use when you only changed .py files in airflow/dags/
-#                                      For Dockerfile, values.yaml, Kafka, MLflow, or dashboard changes — run the full deploy.
+#   ./scripts/deploy.sh                  — full deploy (Docker build, Kafka, MLflow, Flask, Helm, pods)
+#   ./scripts/deploy.sh --dags-only      — fast path: only sync DAG files + restart Airflow pods (~5-7 min)
+#                                          Use when you only changed .py files in airflow/dags/
+#                                          For Dockerfile, values.yaml, Kafka, MLflow, or dashboard changes — run the full deploy.
+#   ./scripts/deploy.sh --provision      — run terraform apply first (updates security group IP), then full deploy
+#                                          Use when creating a new instance or switching networks
+#   ./scripts/deploy.sh --snowflake-setup — bootstrap all Snowflake objects (warehouse, DB, schemas, role, user)
+#                                          Run once on a fresh Snowflake account or after a full project teardown.
+#                                          Requires SNOWFLAKE_ADMIN_USER, SNOWFLAKE_ADMIN_PASSWORD, SNOWFLAKE_PASSWORD in .env.deploy.
+#                                          Safe to re-run — all statements are CREATE IF NOT EXISTS.
 
 # Exit immediately if any command fails, unset variable is used, or pipe fails
 set -euo pipefail
@@ -36,6 +42,7 @@ DEPLOY_DIR="$SCRIPT_DIR/deploy"
 source "$DEPLOY_DIR/common.sh"       # shared vars, _wait_bg, _print_deploy_summary, .env.deploy
 source "$DEPLOY_DIR/setup.sh"        # step_setup
 source "$DEPLOY_DIR/sync.sh"         # step_sync_dags, step_sync_helm_dockerfile, step_sync_manifests_secrets
+source "$DEPLOY_DIR/snowflake.sh"    # step_snowflake_setup
 source "$DEPLOY_DIR/airflow_image.sh" # step_build_airflow_image
 source "$DEPLOY_DIR/kafka.sh"        # step_deploy_kafka
 source "$DEPLOY_DIR/mlflow.sh"       # step_deploy_mlflow, step_fix_mlflow_experiment, step_mlflow_portforward
@@ -48,13 +55,33 @@ trap '_print_deploy_summary' EXIT  # print the summary whenever the script exits
 # ── Argument parsing ──────────────────────────────────────────────────────────
 # --dags-only: fast path for DAG-only changes — skips Docker build, Kafka, MLflow, Flask, Helm
 DAGS_ONLY=false
+# --provision: run terraform apply before the deploy to ensure EC2 infrastructure is current
+PROVISION=false
+# --snowflake-setup: bootstrap Snowflake objects before the rest of the deploy (one-time or after teardown)
+SNOWFLAKE_SETUP=false
+# --fix-ml-venv: repair a broken ml-venv in the running scheduler pod without a full redeploy (~60s)
+FIX_ML_VENV=false
 for _arg in "$@"; do
     case "$_arg" in
-        --dags-only) DAGS_ONLY=true ;;
+        --dags-only)       DAGS_ONLY=true ;;
+        --provision)       PROVISION=true ;;
+        --snowflake-setup) SNOWFLAKE_SETUP=true ;;
+        --fix-ml-venv)     FIX_ML_VENV=true ;;
         *) echo "ERROR: Unknown argument: $_arg"; exit 1 ;;
     esac
 done
-[ "$DAGS_ONLY" = true ] && echo "--- Mode: --dags-only (skipping Docker build, Kafka, MLflow, Flask, Helm) ---"
+[ "$DAGS_ONLY" = true ]       && echo "--- Mode: --dags-only (skipping Docker build, Kafka, MLflow, Flask, Helm) ---"
+[ "$PROVISION" = true ]       && echo "--- Mode: --provision (running Terraform before deploy) ---"
+[ "$SNOWFLAKE_SETUP" = true ] && echo "--- Mode: --snowflake-setup (bootstrapping Snowflake objects before deploy) ---"
+[ "$FIX_ML_VENV" = true ]     && echo "--- Mode: --fix-ml-venv (repairing ml-venv in running scheduler pod only) ---"
+
+# --fix-ml-venv: skip the full deploy and only rebuild the ml-venv in the running pod
+# Useful after a deploy where step_setup_ml_venv printed a WARNING — no pod restart or Docker build needed
+if [ "$FIX_ML_VENV" = true ]; then
+    _wait_scheduler_exec  # confirm the scheduler container is exec-ready before attempting pip install
+    step_setup_ml_venv
+    exit 0
+fi
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Rollback procedure ────────────────────────────────────────────────────────
@@ -74,6 +101,25 @@ done
 # The `my-flask-app:previous` image is tagged at the start of Step 4 on every deploy,
 # so it always points to whatever was running before the current deploy started.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase -1: Snowflake bootstrap (only with --snowflake-setup flag)
+# Runs first so all Snowflake objects exist before the pipeline DAGs are deployed.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [ "$SNOWFLAKE_SETUP" = true ]; then
+    echo "=== Phase -1: Bootstrapping Snowflake infrastructure ==="
+    step_snowflake_setup  # creates warehouse, DB, schemas, role, user via scripts/snowflake_setup.sql
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 0: Terraform provision (only with --provision flag)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if [ "$PROVISION" = true ]; then
+    echo "=== Phase 0: Provisioning infrastructure via Terraform ==="
+    "$SCRIPT_DIR/deploy/terraform.sh" apply  # updates security group IP + no-ops if nothing else changed
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 1: Setup + Sync (always runs)

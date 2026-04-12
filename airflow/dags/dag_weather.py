@@ -9,9 +9,6 @@ import pendulum
 from airflow.sdk import dag, task, XComArg, get_current_context, Variable  # Airflow 3.x SDK — replaces airflow.decorators and airflow.models.xcom_arg
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator  # fires consumer DAG after publish
 
-import pandas as pd
-
-
 # My Files
 from weather_client import fetch_weather_forecast  # renamed from sendRequest_openMeteo
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
@@ -38,6 +35,7 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
         "depends_on_past": False,
         "retries": 1,
         "retry_delay": timedelta(minutes=5),
+        "execution_timeout": timedelta(minutes=10),  # hard ceiling: kills task if it hangs past this
         'on_failure_callback': on_failure_alert,  # Slack + PVC log on task failure
         'on_success_callback': on_success_alert,  # Slack recovery message + clear alert state
         'on_retry_callback': on_retry_alert,  # Slack + PVC log on task retry
@@ -94,6 +92,7 @@ def weather_pipeline():
     @task()
     # def transform(inData: Annotated[XComArg, dict[str, Any]]):
     def transform(inData):
+        import pandas as pd  # deferred: avoid slow pandas init during DagBag parse (30s timeout)
         # Not adding type hinting since type hinting for
         # XComArg causes issues when importing the data into a Pandas dataframe
         # cast() is a no-op at runtime — it only tells the type-checker that inData
@@ -152,6 +151,7 @@ def weather_pipeline():
         producer = KafkaProducer(
             bootstrap_servers=bootstrap,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            max_block_ms=15000,  # fail fast if broker unreachable during send/flush
         )
 
         # Single message per run — full list-of-dicts as one JSON payload

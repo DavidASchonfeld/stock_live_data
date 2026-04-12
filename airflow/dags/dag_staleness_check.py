@@ -9,7 +9,7 @@ from airflow.sdk import dag, task  # Airflow 3.x SDK — replaces airflow.decora
 
 # My Files
 from dag_utils import check_vacation_mode  # shared guard: skips task if VACATION_MODE Variable is "true"
-from alerting import on_failure_alert, on_retry_alert, check_data_staleness  # Slack + PVC log alerts
+from alerting import on_failure_alert, on_retry_alert  # Slack + PVC log alerts
 
 
 @dag(  # type:ignore
@@ -23,6 +23,7 @@ from alerting import on_failure_alert, on_retry_alert, check_data_staleness  # S
     },
     description="Monitors data freshness in company_financials and weather_hourly tables",
     schedule=None,  # Manual trigger only to minimize Snowflake query costs (cost optimization)
+    is_paused_upon_creation=True,  # Stays paused after deploy — must be manually unpaused to run
     start_date=pendulum.datetime(2025, 3, 29, 0, 0, tz="America/New_York"),
     catchup=False,
     tags=["monitoring", "alerting", "staleness"]
@@ -42,6 +43,7 @@ def data_staleness_monitor():
     @task()
     def run_staleness_check() -> None:
         """Query MAX timestamps and alert if data is stale."""
+        from alerting.staleness import check_data_staleness  # deferred: avoids loading sqlalchemy during DAG parse (reduces dagProcessor memory)
         # Skip during vacation — stale data is expected when pipelines are paused
         check_vacation_mode()
         check_data_staleness()

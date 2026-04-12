@@ -9,9 +9,6 @@ from airflow.sdk import dag, task, XComArg, Variable  # Airflow 3.x SDK
 from airflow.providers.standard.operators.bash import BashOperator  # calls dbt CLI in its isolated virtualenv
 from airflow.providers.standard.operators.python import ShortCircuitOperator  # skips dbt if no new rows written
 
-import pandas as pd
-from sqlalchemy.exc import SQLAlchemyError
-
 
 # My Files
 from file_logger import OutputTextWriter  # renamed from outputTextWriter
@@ -24,6 +21,7 @@ from alerting import on_failure_alert, on_retry_alert, on_success_alert  # Slack
         "depends_on_past": False,
         "retries": 1,
         "retry_delay": timedelta(minutes=5),
+        "execution_timeout": timedelta(minutes=20),  # hard ceiling: covers consume + write + dbt_run + dbt_test
         'on_failure_callback': on_failure_alert,
         'on_success_callback': on_success_alert,
         'on_retry_callback': on_retry_alert,
@@ -52,7 +50,9 @@ def weather_consumer_pipeline():
         """
         ### Consume
         Read the latest batch from weather.hourly.raw.
-        Commits offset only after successful read — prevents message loss on retry.
+        Commits offset immediately after read (before Snowflake write).
+        Safe because: (a) daily batch gate prevents duplicate writes within a day,
+        and (b) weather dedup logic filters already-seen timestamps before inserting.
         Polls for up to 30s then exits (DAG run already triggered, message should be present).
         """
         from kafka import KafkaConsumer  # kafka-python, installed via _PIP_ADDITIONAL_REQUIREMENTS
@@ -65,7 +65,7 @@ def weather_consumer_pipeline():
             bootstrap_servers=bootstrap,
             group_id="weather-consumer-group",
             auto_offset_reset="latest",
-            enable_auto_commit=False,    # manual commit: offset advances only after Snowflake write
+            enable_auto_commit=False,    # manual commit: we control when to advance the bookmark
             consumer_timeout_ms=30000,   # stop polling after 30s — message should arrive quickly after trigger
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         )
@@ -73,7 +73,7 @@ def weather_consumer_pipeline():
         records: list[dict[str, Any]] = []
         for msg in consumer:
             records.extend(msg.value)   # msg.value is list[dict] (the full batch from publish_to_kafka)
-            consumer.commit()           # advance offset after reading
+            consumer.commit()           # commit here (before Snowflake write); daily gate + timestamp dedup prevent duplicates
             writer.log(f"Consumed message offset={msg.offset}, partition={msg.partition}")
 
         consumer.close()
@@ -90,6 +90,9 @@ def weather_consumer_pipeline():
         (7-day forecast window) so re-runs would insert duplicates without this check.
         Returns number of net-new rows written (0 if gate or dedup skips the write).
         """
+        import pandas as pd                          # deferred: avoid slow pandas load during DAG parse
+        from sqlalchemy.exc import SQLAlchemyError   # deferred: used in except clause below; kept with pandas
+
         writer: OutputTextWriter = OutputTextWriter("/opt/airflow/out")
 
         if not records:

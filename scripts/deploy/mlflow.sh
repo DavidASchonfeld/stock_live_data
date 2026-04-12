@@ -75,25 +75,10 @@ step_fix_mlflow_experiment() {
     # 'connection refused' error on port 5500.
     ssh "$EC2_HOST" "kubectl rollout status deployment/mlflow -n airflow-my-namespace --timeout=120s"
 
-    ssh "$EC2_HOST" "kubectl exec -i airflow-scheduler-0 -n airflow-my-namespace -- /opt/ml-venv/bin/python" << 'PYEOF'
-import os, mlflow
-from mlflow.entities import ViewType
-os.environ['MLFLOW_TRACKING_URI'] = 'http://mlflow.airflow-my-namespace.svc.cluster.local:5500'
-client = mlflow.tracking.MlflowClient()
-# Look for the active experiment — search_experiments only returns active (not deleted) experiments by default
-active = client.search_experiments(filter_string="name = 'anomaly_detection'")
-if active and active[0].artifact_location == 'mlflow-artifacts:/':
-    print('anomaly_detection already has correct artifact root — skipping reset')
-else:
-    # Log what we found before fixing
-    for exp in active:
-        print(f'Found active experiment {exp.experiment_id} with wrong root: {exp.artifact_location}')
-    all_named = [e for e in client.search_experiments(view_type=ViewType.ALL, filter_string="name = 'anomaly_detection'")]
-    for exp in all_named:
-        print(f'  (all) id={exp.experiment_id} stage={exp.lifecycle_stage} root={exp.artifact_location}')
-    print('Fixing artifact_location via sqlite3 UPDATE in MLflow pod — avoids UNIQUE constraint from soft-deleted rows')
-PYEOF
     # Fix the artifact storage path directly in the SQLite database inside the MLflow pod.
+    # Skipping the scheduler-pod Python diagnostic check that was here previously — importing mlflow inside
+    # the scheduler container spiked 500–800 MB and OOM-killed it (exit 137). The sqlite3 command below
+    # already prints pre-fix state and skips if already correct, so the diagnostic check was redundant.
     # MLflow doesn't truly delete experiments — it just marks them deleted. So trying to create a new one
     # with the same name fails with a 'name already taken' error.
     # Updating the row directly avoids that problem: we set the correct artifact path and mark it active again in one step.
@@ -118,12 +103,9 @@ db.commit(); db.close()
 print(f'sqlite3 UPDATE: fixed {updated} row(s) — id={exp_id}, was root={art_loc}, stage={stage}')
 \""
 
-    # Set Airflow variable so anomaly_detector.py can reach MLflow
-    echo "=== Setting Airflow Variable: MLFLOW_TRACKING_URI ==="
-    # Run over SSH — kubectl commands need to run on EC2, where the Kubernetes cluster is
-    ssh "$EC2_HOST" "kubectl exec airflow-scheduler-0 -n airflow-my-namespace -- \
-        airflow variables set MLFLOW_TRACKING_URI http://mlflow.airflow-my-namespace.svc.cluster.local:5500"
-    echo "  MLFLOW_TRACKING_URI set."
+    # MLFLOW_TRACKING_URI is set via AIRFLOW_VAR_MLFLOW_TRACKING_URI in values.yaml — no kubectl exec needed.
+    # kubectl exec airflow variables set OOM-kills (exit 137) the scheduler on Airflow 3.x because importing
+    # the full provider stack spikes memory past the container's 2Gi limit.
 }
 
 step_cleanup_dead_pods() {

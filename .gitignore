@@ -19,3 +19,9 @@ profiles.yml
 __pycache__/
 # local development notes
 dev_notes_private.md
+# Terraform — state has resource IDs (stay local), tfvars has your IP and account ID
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup

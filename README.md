@@ -13,7 +13,7 @@ End-to-end data pipeline that pulls daily stock financials (AAPL, MSFT, GOOGL) f
 
 Five Airflow DAGs work together in two pairs plus one monitor:
 
-1. **Stock producer** (`dag_stocks.py`, daily) — resolves ticker → CIK, fetches XBRL financial data from SEC EDGAR, cleans it, then publishes a JSON message to the `stocks-financials-raw` Kafka topic.
+1. **Stock producer** (`dag_stocks.py`, daily) — resolves ticker → CIK (the SEC's internal numeric ID for each company — e.g. Apple files under `0000320193`, not "AAPL"), fetches XBRL financial data (a structured XML format the SEC requires companies to use in their filings — it lets code reliably extract specific line items like revenue or net income) from SEC EDGAR, cleans it, then publishes a JSON message to the `stocks-financials-raw` Kafka topic.
 2. **Stock consumer** (`dag_stocks_consumer.py`, event-driven) — triggered by the producer; reads the message from Kafka, writes new rows to Snowflake `RAW.COMPANY_FINANCIALS`, runs dbt to build staging views and mart tables, then runs the anomaly detector (`anomaly_detector.py`) under a separate ml-venv, which fits an IsolationForest model on year-over-year financial growth, writes flagged rows to `ANALYTICS.FCT_ANOMALIES`, and logs the run to MLflow.
 3. **Weather producer** (`dag_weather.py`, hourly) — fetches a 7-day hourly forecast from Open-Meteo and publishes it to the `weather-hourly-raw` Kafka topic.
 4. **Weather consumer** (`dag_weather_consumer.py`, event-driven) — triggered by the producer; reads from Kafka, deduplicates against existing Snowflake rows, writes net-new rows to `RAW.WEATHER_HOURLY`, then runs dbt.
@@ -23,7 +23,7 @@ Flask + Dash queries Snowflake's `MARTS` schema (the dbt-built tables) and rende
 
 ---
 
-## How Everything Connects (Plain English)
+## How Everything Connects
 
 ### What each tool does
 
@@ -36,6 +36,20 @@ Flask + Dash queries Snowflake's `MARTS` schema (the dbt-built tables) and rende
 | **Flask + Dash** | The web app. It queries Snowflake's mart tables and renders charts in the browser, including a "Data Quality" section that shows anomaly-flagged records. |
 | **MLflow** | Experiment tracking server. Every time the anomaly detection model runs, MLflow records which parameters were used, what the results were, and stores the model artifact — so any run can be reproduced later. |
 | **K3S / Kubernetes** | Runs all services (Airflow, Kafka, Flask, MLflow) as containers on EC2. If a pod crashes, Kubernetes restarts it automatically. |
+
+### What the Snowflake layers mean
+
+Data passes through three layers inside Snowflake, each with a different job:
+
+| Layer | What it is | Who writes it |
+|---|---|---|
+| **RAW** | The raw dump. Rows land here exactly as they came from Kafka/the API, unmodified. Think of it as the "never delete this" archive. | Consumer DAGs |
+| **STAGING** | dbt's cleaning step. These are SQL *views* — not actual stored tables — that rename columns, cast types, and apply consistent formatting on top of RAW. Because they're views, they cost nothing extra to store; they're just saved queries that run on demand. | dbt |
+| **MARTS** | The finished product. dbt materializes these as real tables the dashboard queries. They're clean, deduplicated, and ready to display. "Mart" is short for "data mart" — a focused slice of the warehouse built for one specific use case (here, the dashboard). | dbt |
+
+`ANALYTICS.FCT_ANOMALIES` sits outside this layering — it's written directly by the anomaly detector, not produced by dbt.
+
+---
 
 ### Data flow, step by step
 
@@ -133,7 +147,7 @@ Snowflake (external cloud warehouse)
 | ML / Experiment tracking | MLflow 2.x + scikit-learn IsolationForest (runs under dedicated ml-venv on EC2) |
 | Container runtime | containerd (via K3S) |
 | Cloud | AWS EC2 t3.large, 100 GiB EBS gp3 (~$70–75/month total) |
-| Stock data | SEC EDGAR XBRL API (free, no API key) |
+| Stock data | SEC EDGAR XBRL API (free, no API key) — XBRL is the structured XML format the SEC requires companies to use in filings; CIK is the SEC's numeric company ID (e.g. `0000320193` for Apple) |
 | Weather data | Open-Meteo API (free, no API key) |
 
 ---
